@@ -193,7 +193,47 @@ namespace ReShade.Setup
 				}
 			}
 
+			// Start with neural rendering turned off unless the manifest opts out
+			if (manifest.GetString("Addon", "StartDisabled", "1") != "0")
+			{
+				SeedAddonStartDisabled();
+			}
+
 			InstallStep_Finish();
+		}
+
+		// Pre-seed the RenoDX DLSS5 add-on's "Enable DLSS Neural Rendering" setting to off in the
+		// game's ReShade.ini, so the mod starts disabled on first launch and the user opts in.
+		//
+		// RenoDX loads non-global settings from a preset sub-section and falls back to the add-on's
+		// built-in default when the key is absent, so the off value is written into every candidate
+		// section (global name, each preset, and the unnamed top section). Extra keys are harmless -
+		// the add-on only reads whichever section is actually active.
+		void SeedAddonStartDisabled()
+		{
+			if (string.IsNullOrEmpty(currentInfo.configPath))
+			{
+				return;
+			}
+
+			try
+			{
+				const string globalName = "RenoDX.DLSS5";
+				const string key = "DLSSNR.Enabled";
+
+				var config = new IniFile(currentInfo.configPath);
+
+				foreach (string section in new[] { string.Empty, globalName, globalName + "-preset1", globalName + "-preset2", globalName + "-preset3" })
+				{
+					config.SetValue(section, key, "0");
+				}
+
+				config.SaveFile();
+			}
+			catch (SystemException)
+			{
+				// Non-fatal: the mod would just start enabled, which the user can toggle in the overlay
+			}
 		}
 
 		void InstallStep_InstallDllPackage(string name, string url)
