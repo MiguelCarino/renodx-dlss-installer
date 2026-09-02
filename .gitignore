@@ -2,3 +2,21 @@ buildtools/
 release-assets/
 reshade/bin/
 reshade/intermediate/
+
+# --- linux/ ---
+# dlss5-gui.py is run as a script, but anything that imports it leaves bytecode.
+__pycache__/
+*.pyc
+
+# These belong beside the game binary, not here. They land here when someone
+# points --game-dir at this directory to try something out.
+.dlss5-linux.state
+OptiScaler.ini
+ReShade.ini
+ReShadePreset.ini
+*.log
+dlssnr-capture/
+
+# fetch() downloads to "$dest.part" and renames on success, so an interrupted
+# download leaves one behind. Normally under $XDG_CACHE_HOME/dlss5-linux.
+*.part

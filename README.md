@@ -34,3 +34,21 @@ in the DLL package.
 
 ⚠ This build of ReShade is intended for singleplayer games only and may cause bans in
 multiplayer games.
+
+## Linux
+
+`linux/` is a native Linux port of what this installer does, for Fedora and other
+distros running games through Proton. It is not a build of the Windows installer -
+the C# setup app has no Linux equivalent - but it performs the same file placement,
+plus the Proton wiring the Windows installer never had to do (NGX bridge, prefix
+DLL overrides, GE-Proton).
+
+```bash
+cd linux
+./dlss5-gui.py                                     # web GUI: scan, probe, install, launch
+./dlss5-linux.sh --game-dir=/path/to/game --probe   # or drive it from the shell
+```
+
+It adds a **probe** that reads a game folder and reports whether the neural pass can
+work there (`supported`, `partial`, `unsupported`, `blocked`, `unknown`), and it refuses to
+install into any game where it finds anti-cheat. See [linux/README.md](linux/README.md).
