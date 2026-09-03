@@ -114,14 +114,15 @@ back to XeSS even on a 4090. Forcing `dlss` sidesteps the detection.
 
 The editor is section-aware (`OptiScaler.ini` has seven different keys named
 `Enabled=`) and writes the file back with its CRLF endings and UTF-8 BOM intact,
-so in the normal case a change rewrites one line and leaves the other 1,600
-byte-identical.
+so a change rewrites one line and leaves the other 1,600 byte-identical.
 
-The BOM is read as an ordinary character, though, so it has one failure mode: if
-it sits on a line that is itself a section header, that header stops parsing as
-one and every key in the section becomes unreachable. The script prints
-`warn [DlssNr] Enabled not found` and exits 0, which the GUI reads as success.
-A comment or blank line ahead of the first `[Section]` avoids it.
+The BOM sits on line 0, which in `OptiScaler.ini` is a section header, so it is
+stripped before the header is matched — otherwise `[Upscalers]` would not parse
+as one and every key under it would be unreachable. It is written back intact.
+
+A key the editor cannot find is a failure, not a warning: `--configure` says
+`warn [DlssNr] Enabled not found` and exits 1, so the GUI reports it instead of
+showing a success it did not get.
 
 ## Probe
 
@@ -156,8 +157,13 @@ directory — `find` only descends, and Halo MCC keeps `EasyAntiCheat/` three
 levels above `MCC/Binaries/Win64`. The probe works the root out for itself
 rather than trusting the path you typed: it walks up from that path until the
 parent is a launcher's game container (`steamapps/common`, `compatdata`,
-`Heroic`, `GOG Games`, and so on), takes the directory it came from as the root,
-and scans five levels down from there.
+`Heroic`, `GOG Games`, `Program Files` and so on), takes the directory it came
+from as the root, and scans five levels down from there.
+
+`Program Files` has to be in that list for the same reason `drive_c` is in it:
+in a Wine prefix a game sits *under* `drive_c/Program Files/`, so stopping at
+`drive_c` would hand back `Program Files` itself and every game in the prefix
+would inherit its neighbours' anti-cheat.
 
 The walk is bounded, because one level too far lands in the container itself and
 the neighbouring game's anti-cheat would then read as this game's. It gives up
@@ -178,6 +184,13 @@ it at the game root yourself in that case.
 
 Switch engines with `--uninstall` then reinstall. Both write a
 `.dlss5-linux.state` file so uninstall knows which proxy DLL to remove.
+
+`--uninstall` resolves the game directory the same way installing does, so the
+game root works as well as the exact directory the files went into. A state file
+in the path you gave is taken at face value; otherwise it resolves. If that file
+exists but names no proxy DLL, uninstall stops and says so rather than reporting
+that it removed nothing — an empty name would otherwise resolve to the game
+directory itself. Under `--dry-run` it says *would remove*, because it did not.
 
 ## Requirements
 
