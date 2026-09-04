@@ -350,10 +350,44 @@ fetch() {
 # Port of FindActualGameExecutable() from MainWindow.Custom.cs: if the folder
 # holds only a launcher, look in the usual binary subdirectories for an exe that
 # actually imports a graphics API.
+pe_dll_names() {
+    objdump -p "$1" 2>/dev/null | sed -n 's/.*DLL Name: //p'
+}
+
+# An engine that lives in its own DLL imports no graphics API into the .exe.
+# Control is the clean example: Control_DX12.exe imports d3d_rmdwin10_f.dll and
+# nothing else that renders, and only that DLL imports d3d12.dll. So the
+# executable's imports are followed one level into DLLs sitting beside it.
+#
+# One level, and only siblings: it answers "what does this binary's own engine
+# use" without walking into the Windows import graph, and it stays cheap enough
+# to run over every .exe in a folder.
+pe_imports_deep() {
+    local exe="$1" dir names
+    dir=$(dirname "$exe")
+    names=$(pe_dll_names "$exe")
+
+    local dll
+    while IFS= read -r dll; do
+        [[ -n "$dll" ]] || continue
+        # Skip anything Windows ships; only the game's own DLLs are opened.
+        case "${dll,,}" in
+            kernel32.dll|user32.dll|advapi32.dll|version.dll|ole32.dll|shell32.dll|\
+            gdi32.dll|ws2_32.dll|msvcp*|vcruntime*|api-ms-*|ucrtbase.dll|ntdll.dll) continue ;;
+        esac
+        # Case-insensitively, because a PE import table's spelling and the
+        # filename on a case-sensitive filesystem often disagree.
+        local found
+        found=$(find "$dir" -maxdepth 1 -iname "$dll" -print -quit 2>/dev/null) || true
+        [[ -n "$found" ]] && names+=$'\n'$(pe_dll_names "$found")
+    done <<<"$names"
+
+    printf '%s\n' "$names"
+}
+
 pe_imports_graphics() {
-    objdump -p "$1" 2>/dev/null \
-        | grep -i 'DLL Name' \
-        | grep -qiE 'd3d1[12]|dxgi|vulkan-1|opengl32'
+    pe_imports_deep "$1" \
+        | grep -qixE 'd3d1[12]\.dll|d3d12core\.dll|d3d11_[0-9]\.dll|dxgi\.dll|vulkan-1\.dll|opengl32\.dll'
 }
 
 pe_imports_d3d12() {
@@ -677,7 +711,7 @@ do_uninstall() {
     local dir="$1"
     step "Uninstalling from $dir"
 
-    local hook="$HOOK_DLL"
+    local hook="$HOOK_DLL" engine=""
     if [[ -f "$dir/$STATE_FILE" ]]; then
         # pipefail turns a state file with no hook= line into a silent exit 1
         # that removes nothing, and an empty hook= makes "$dir/$hook" the game
@@ -688,22 +722,39 @@ do_uninstall() {
      and re-run --uninstall with the --hook=NAME you installed with, or remove
      the proxy DLL by hand."
         log "State file says the proxy is $hook"
+        engine=$(grep '^engine=' "$dir/$STATE_FILE" | cut -d= -f2 || true)
     fi
 
+    # Only names an engine of ours actually writes to the top level, which is
+    # the same split installed_by_us() makes - it is the removal loop that
+    # never asked. libxess*, libxell.dll and amd_fidelityfx_* were in here and
+    # are in no engine's output: the OptiScaler package keeps its runtime
+    # libraries in OptiScaler/ (OptiDllPath in OptiScaler.ini defaults to
+    # .\OptiScaler) and streamline.zip ships neither, so a copy at the top
+    # level is always the game's. Removing them cost Resident Evil Requiem
+    # four of re9.exe's static imports and left it exiting on c0000135
+    # before it drew a frame. The OptiScaler directory below clears ours.
     local -a targets=(
         "$hook" "$STATE_FILE"
         OptiScaler.ini OptiScaler.log OptiScaler.dll "nvngx.dll_dlssnr.dll"
         remove_optiscaler.sh setup_linux.sh "READ ME - DLSS Neural Rendering.txt"
         ReShade.ini ReShade.log ReShadePreset.ini
         renodx-dlss5.addon64
-        nvngx_dlssnr.dll nvngx_dlss.dll nvngx_dlssg.dll
-        sl.common.dll sl.dlss.dll sl.dlss_g.dll sl.dlss_nr.dll
-        sl.interposer.dll sl.nis.dll sl.pcl.dll sl.reflex.dll
-        nis.license.txt nvngx_dlss.license.txt reflex.license.txt
-        libxell.dll libxess.dll libxess_dx11.dll libxess_fg.dll
-        amd_fidelityfx_framegeneration_dx12.dll amd_fidelityfx_loader_dx12.dll
-        amd_fidelityfx_upscaler_dx12.dll amd_fidelityfx_vk.dll
+        nvngx_dlssnr.dll
     )
+
+    # install_reshade unpacks the whole streamline set to the top level;
+    # install_optiscaler takes only nvngx_dlssnr.dll out of it and leaves the
+    # rest. So these are ours under reshade and the game's under optiscaler -
+    # Control ships its own nvngx_dlss.dll and would lose it otherwise.
+    if [[ "$engine" == reshade ]]; then
+        targets+=(
+            nvngx_dlss.dll nvngx_dlssg.dll
+            sl.common.dll sl.dlss.dll sl.dlss_g.dll sl.dlss_nr.dll
+            sl.interposer.dll sl.nis.dll sl.pcl.dll sl.reflex.dll
+            nis.license.txt nvngx_dlss.license.txt reflex.license.txt
+        )
+    fi
 
     local t removed=0
     for t in "${targets[@]}"; do
@@ -838,62 +889,105 @@ declare -a P_REASONS=()
 # d3d12.dll through LoadLibrary and import nothing but dxgi (or nothing at all),
 # so fall back to scanning the executable for the loader strings.
 detect_api_for() {
-    local exe="$1" imports strs
-    imports=$(objdump -p "$exe" 2>/dev/null | grep -i 'DLL Name' || true)
+    local exe="$1" imports own strs
+    # Deep, so a game whose renderer sits in a companion DLL is read correctly.
+    # It also keeps the two binaries of a dual-API title apart: Control_DX12.exe
+    # reaches d3d12.dll through d3d_rmdwin10_f.dll while Control_DX11.exe reaches
+    # d3d11.dll through d3d_rmdwin7_f.dll, which scanning the folder would blur.
+    imports=$(pe_imports_deep "$exe" 2>/dev/null || true)
+    own=$(pe_dll_names "$exe" 2>/dev/null || true)
 
     # Only a Direct3D import is trustworthy on its own. An opengl32 or vulkan-1
     # import proves nothing - Ubisoft titles import opengl32 for the overlay
     # while rendering through D3D11 loaded via LoadLibrary - so the string scan
     # has to run before those are believed.
-    if grep -qiE 'd3d12' <<<"$imports"; then printf 'd3d12'; return; fi
-    if grep -qiE 'd3d11' <<<"$imports"; then printf 'd3d11'; return; fi
+    # Anchored, because the deep scan lists the game's own DLL names too and a
+    # substring test reads "d3d_rmdwin10_f.dll" or "d3d11on12.dll" as an answer.
+    # D3D12Core.dll is the Agility SDK runtime and means D3D12 just as plainly.
+    if grep -qixE 'd3d12\.dll|d3d12core\.dll' <<<"$imports"; then printf 'd3d12'; return; fi
 
     strs=$(strings -n 8 "$exe" 2>/dev/null \
         | grep -oiE 'D3D12CreateDevice|d3d12\.dll|D3D11CreateDevice|d3d11\.dll|vkCreateInstance' \
         | sort -u || true)
+
+    # A d3d11 import does NOT settle it, and this is where most of the wrong
+    # answers came from. Unreal imports d3d11.dll statically and reaches D3D12
+    # through LoadLibrary, and RE Engine does the same; both were reading as
+    # d3d11 and so as "partial" when they run D3D12 perfectly well.
+    #
+    # D3D12CreateDevice is the discriminator, not the string "d3d12": a renderer
+    # that actually creates a D3D12 device must resolve that symbol by name.
+    # Verified to be absent from genuinely D3D11 titles (Alien Isolation,
+    # Borderlands 2) and present in Palworld and Resident Evil 4.
+    if grep -qixE 'd3d11\.dll|d3d11_[0-9]\.dll' <<<"$imports"; then
+        grep -qi 'D3D12CreateDevice' <<<"$strs" && { printf 'd3d12'; return; }
+        printf 'd3d11'; return
+    fi
+
     if grep -qi 'd3d12' <<<"$strs"; then printf 'd3d12'; return; fi
     if grep -qi 'd3d11' <<<"$strs"; then printf 'd3d11'; return; fi
 
-    if grep -qiE 'vulkan-1' <<<"$imports" || grep -qi 'vkCreateInstance' <<<"$strs"; then
+    # These two are read from the executable's OWN imports, never the deep scan.
+    # A Direct3D import is worth believing wherever it is found, but OpenGL and
+    # Vulkan are not: Unity's stub launcher imports nothing at all while
+    # UnityPlayer.dll beside it imports OPENGL32, which had every Unity game in
+    # the library reporting "opengl" for a renderer that is really D3D11.
+    # Falling through to "unknown" is the honest answer for a stub like that.
+    if grep -qixE 'vulkan-1\.dll' <<<"$own" || grep -qi 'vkCreateInstance' <<<"$strs"; then
         printf 'vulkan'; return
     fi
-    if grep -qiE 'opengl32' <<<"$imports"; then printf 'opengl'; return; fi
-    if grep -qiE 'dxgi' <<<"$imports"; then printf 'd3d11'; return; fi
+    if grep -qixE 'opengl32\.dll' <<<"$own"; then printf 'opengl'; return; fi
+    if grep -qixE 'dxgi\.dll' <<<"$imports"; then printf 'd3d11'; return; fi
     printf 'unknown'
 }
 
-# nvngx_dlss.dll, the sl.* set, libxess*.dll and the FidelityFX DLLs are exactly
-# what install_optiscaler and install_reshade drop - the same names do_uninstall
-# removes - and are indistinguishable by name from what a game ships itself. So
-# they only count as ours when they sit beside a state file we wrote.
+# Whether an upscaler DLL found under the game root is one this script put
+# there. It has to be exact in both directions: counting a game's own DLL as
+# ours makes a supported game probe as unsupported, and counting ours as the
+# game's makes an unsupported game probe as supported once it has been
+# installed into.
+#
+# Two things decide it - which directory the file is in, and which engine the
+# state file says was installed.
 installed_by_us() {
-    local path="$1" dir base
-    dir=$(dirname "$path")
+    local path="$1" dir base engine owned=0
 
-    # The package scatters its DLLs through subdirectories it creates itself -
-    # OptiScaler/, OptiScaler/D3D12_OptiScaler/, DlssOverrides/ - so peel those
-    # off to get back to the directory the state file sits in. Only names the
-    # package owns are peeled, so a game's own deep DLL never resolves here.
+    dir=$(dirname "$path")
+    # Directories the package creates itself. Anything inside one is ours by
+    # construction, whatever it is called - the game did not put it there.
+    # Peeling them also gets back to the directory the state file sits in.
     while :; do
         case "$(basename "$dir")" in
             Licenses|OptiScaler|D3D12_OptiScaler|DlssOverrides|dlssnr-capture)
-                dir=$(dirname "$dir") ;;
+                owned=1; dir=$(dirname "$dir") ;;
             *) break ;;
         esac
     done
-    [[ -f "$dir/$STATE_FILE" ]] || return 1
 
-    # Exactly the names in do_uninstall's target list, nothing broader: a game
-    # DLL that merely looks similar must still count as the game's own.
+    [[ -f "$dir/$STATE_FILE" ]] || return 1
+    (( owned )) && return 0
+
+    # At the top level, only the names the installed engine actually drops
+    # there. The two engines differ: install_optiscaler takes nvngx_dlssnr.dll
+    # out of streamline.zip and leaves the rest of it, while install_reshade
+    # unpacks the whole set. Treating nvngx_dlss.dll as ours either way is what
+    # made Control - which ships its own, and was installed with the optiscaler
+    # engine - report "no upscaler runtime found" and probe as unsupported.
+    engine=$(grep '^engine=' "$dir/$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
     base=$(basename "${path,,}")
+
     case "$base" in
-        nvngx_dlss.dll|nvngx_dlssg.dll|nvngx_dlssnr.dll|nvngx.dll_dlssnr.dll) return 0 ;;
-        sl.common.dll|sl.dlss.dll|sl.dlss_g.dll|sl.dlss_nr.dll)               return 0 ;;
-        sl.interposer.dll|sl.nis.dll|sl.pcl.dll|sl.reflex.dll)                return 0 ;;
-        libxell.dll|libxess.dll|libxess_dx11.dll|libxess_fg.dll)              return 0 ;;
-        amd_fidelityfx_framegeneration_dx12.dll|amd_fidelityfx_loader_dx12.dll) return 0 ;;
-        amd_fidelityfx_upscaler_dx12.dll|amd_fidelityfx_vk.dll)               return 0 ;;
+        nvngx_dlssnr.dll|nvngx.dll_dlssnr.dll) return 0 ;;
     esac
+
+    if [[ "$engine" == reshade ]]; then
+        case "$base" in
+            nvngx_dlss.dll|nvngx_dlssg.dll) return 0 ;;
+            sl.common.dll|sl.dlss.dll|sl.dlss_g.dll|sl.dlss_nr.dll)  return 0 ;;
+            sl.interposer.dll|sl.nis.dll|sl.pcl.dll|sl.reflex.dll)   return 0 ;;
+        esac
+    fi
+
     return 1
 }
 
@@ -911,7 +1005,10 @@ probe_scan() {
     # Biggest executable that touches a graphics API is the game. Plenty of
     # titles import nothing and resolve everything through LoadLibrary, so keep
     # the biggest plausible executable as a fallback rather than giving up.
-    local exe best="" bestsize=0 fallback="" fallbacksize=0 sz any=0
+    # A title shipping both a D3D11 and a D3D12 binary is the case size alone
+    # gets wrong: Control's two differ by 512 bytes and only the D3D12 one can
+    # be ridden, so a D3D12 candidate outranks a larger D3D11 one outright.
+    local exe best="" bestsize=0 bestd3d12=0 fallback="" fallbacksize=0 sz any=0 is12
     while IFS= read -r -d '' exe; do
         any=1
         local base; base=$(basename "${exe,,}")
@@ -920,7 +1017,10 @@ probe_scan() {
         fi
         sz=$(stat -c%s "$exe" 2>/dev/null || echo 0)
         if pe_imports_graphics "$exe"; then
-            if (( sz > bestsize )); then best="$exe"; bestsize=$sz; fi
+            is12=0; [[ "$(detect_api_for "$exe")" == d3d12 ]] && is12=1
+            if (( is12 > bestd3d12 )) || { (( is12 == bestd3d12 )) && (( sz > bestsize )); }; then
+                best="$exe"; bestsize=$sz; bestd3d12=$is12
+            fi
         elif (( sz > fallbacksize )); then
             fallback="$exe"; fallbacksize=$sz
         fi
@@ -937,8 +1037,13 @@ probe_scan() {
         # No Windows executable anywhere: almost certainly a native Linux build.
         if find "$dir" -maxdepth 3 -iname '*.exe' -print -quit 2>/dev/null | grep -q .; then
             P_REASONS+=("No executable in this folder; the game binary may be in a subdirectory.")
-        else
+        elif find "$dir" -type f -print -quit 2>/dev/null | grep -q .; then
+            # Files, but no Windows executable anywhere: a native Linux build.
             P_API="native"
+        else
+            # Nothing at all. Steam leaves the directory behind after an
+            # uninstall, and calling that a native Linux build is just wrong.
+            P_REASONS+=("This folder is empty - the game does not look installed.")
         fi
     else
         P_REASONS+=("No usable executable found in this folder.")
@@ -952,7 +1057,17 @@ probe_scan() {
     while IFS= read -r path; do
         if installed_by_us "$path"; then ours=1; continue; fi
         hits+="$(basename "$path")"$'\n'
-    done < <(find "$root" -maxdepth 5 \( \
+    # No depth limit. Unreal buries upscalers as plugins, and the depth is not a
+    # number worth guessing at: Palworld's sits at
+    # Pal/Plugins/DLSS/Binaries/ThirdParty/Win64 (7 levels), Expedition 33 adds a
+    # vendor folder at Sandfall/Plugins/NVIDIA/DLSS/... (8), and a cap fitted to
+    # one is wrong for the next. Both probed as having no upscaler at all.
+    #
+    # It costs nothing to stop capping it. Modern games pack their assets into a
+    # handful of archives, so these trees are tiny: 181 files for Expedition 33,
+    # 123 for Red Dead Redemption 2, and an unbounded scan of the largest tree
+    # in the library (Left 4 Dead 2, 59,329 files) takes 0.05s.
+    done < <(find "$root" \( \
             -iname 'nvngx_dlss.dll' -o -iname 'sl.dlss.dll' -o -iname '*_DLSS*.dll' \
             -o -iname 'libxess.dll' -o -iname 'libxess_dx11.dll' \
             -o -iname 'ffx_fsr2*.dll' -o -iname 'amd_fidelityfx*.dll' -o -iname 'ffx_fsr3*.dll' \
@@ -1180,6 +1295,20 @@ main() {
         optiscaler) install_optiscaler "$GAME_DIR" ;;
         reshade)    install_reshade "$GAME_DIR" ;;
     esac
+
+    # OptiScaler decides what the GPU can do by probing NVAPI while it loads,
+    # and under Proton that probe runs before the game has loaded nvapi64.dll.
+    # It then records "Upscaler support - dlss: false" on a 4090 and quietly
+    # picks XeSS. Observed in Expedition 33: the probe failed at 21:09:10 and
+    # the game loaded nvapi64.dll at 21:09:15, five seconds too late.
+    #
+    # Nothing about that is recoverable at runtime, so the choice is written
+    # into the ini at install time instead. Only when the user did not ask for
+    # a specific upscaler, and only on NVIDIA, where dlss is the right answer.
+    if [[ -z "$UPSCALER" ]] && [[ "$GPU_NAME" == *NVIDIA* || "$GPU_NAME" == *GeForce* ]]; then
+        UPSCALER="dlss"
+        log "Forcing Dx12Upscaler=dlss (NVAPI is probed too early under Proton to detect it)"
+    fi
 
     apply_ini_settings "$GAME_DIR"
     print_launch_options

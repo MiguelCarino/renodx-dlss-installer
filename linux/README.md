@@ -69,6 +69,95 @@ GUI flags this: a launch that ends in under 15 seconds gets an explicit note.
 ./dlss5-gui.py --port 8777 --no-open
 ```
 
+### Games Steam does not list
+
+The list is Steam's libraries plus anything you add by hand, so a GOG, Heroic,
+Epic or loose Wine install is reachable too. Type the folder into the box above
+the list and press Add (or Enter); the × on its row forgets it again and deletes
+nothing. Added folders persist in `~/.config/dlss5-linux/folders.json`.
+
+Give it the **game root**, the same directory you would pass to `--game-dir` —
+the probe resolves the binary directory below it, and anti-cheat is scanned from
+the root down.
+
+Three folders are refused: one that does not exist, one already covered (a Steam
+game, or a subfolder of something added earlier), and `$HOME` or anything above
+it. The last matters because an added folder becomes a base for the containment
+checks that keep **Open folder** and log reading inside known game directories —
+a folder containing everything would be the end of them.
+
+An added game has no Steam appid, so `SteamAppId` and friends are not set for
+it — nothing to attach to — and it gets a Wine prefix of its own under
+`~/.local/share/dlss5-linux/prefixes/`, named after the folder and a digest of
+its path, rather than borrowing a `compatdata` directory it does not have.
+`STEAM_COMPAT_MOUNTS` points at the folder's own parent for the same reason.
+
+A folder that is later moved, deleted or left on an unmounted disk shows as
+`missing` instead of being probed, and drops out of the open/log allowlist until
+it is back.
+
+### Layout
+
+The detail pane was capped at 900px, which on a wide window left a third of it
+empty while the six fact tiles wrapped to a second row and every control stacked
+down the middle. Above 1200px it is now two columns: what you read on the left
+(status, facts, reasons, and the log under them), what you act on down the right
+(engine and Proton, install and launch, the ini settings, the launch string).
+Below 1200px it stacks in the original order.
+
+The log sits under the left column rather than under both, because the controls
+column is the taller of the two and leaving the log below everything put it past
+the fold with 400px of nothing above it.
+
+### Is it actually working
+
+Installed and working are different things, and the difference is only ever
+visible in `OptiScaler.log`: the injector can load, hook the game and still
+never dispatch the neural pass. The page reads that log and says which happened,
+in a banner above the facts:
+
+| | Meaning |
+|---|---|
+| ✓ **DLSS 5 neural rendering is running** | `DlssNr_Dx12::Dispatch` in the log, on the DLSS backend. This is the one you want. |
+| ! **Running, but on XeSS instead of DLSS** | The pass is dispatching, but OptiScaler fell back — usually the NVAPI race above. Set the DX12 upscaler to `dlss` and relaunch. |
+| ✗ **Injector loaded, neural pass never ran** | OptiScaler started and DLSS-NR was never dispatched. Neural rendering is off, or the game gave it nothing to hook. |
+| ✗ **OptiScaler never loaded** | A log with no startup banner. The proxy DLL was not loaded — check `WINEDLLOVERRIDES`. |
+
+A log with nothing running and no write for two minutes is labelled as the last
+session with its age, so an old success cannot be mistaken for a live one.
+
+### Changing settings while the game runs
+
+You cannot, from here — and the page now says so rather than saving a change
+that appears to do nothing.
+
+OptiScaler reads `OptiScaler.ini` **once, at startup**. It imports no file-watch
+API (`ReadDirectoryChangesW`, `FindFirstChangeNotification` — neither is in its
+import table) and exposes no reload action; its overlay offers *Save Settings*,
+never *Load*, and its own restart-required message is "Save INI and restart to
+apply the changes". So an edit made mid-session is real on disk and reaches the
+next launch, not the one already running.
+
+The live path is OptiScaler's own overlay — **Insert**, or **Home** on the
+reshade engine. Per the ini's documentation, everything under `[DlssNr]` is live
+there except `Preset`, which is baked in when the model is created.
+
+While a game is running, the note under the config controls says this and names
+the overlay key for the installed engine.
+
+### Knowing the game is running
+
+A pulsing dot marks a running game, in the list and in the banner. It does not
+matter how it was started: the check scans `/proc` for a process whose working
+directory is the game's folder, or whose command line names the executable, so a
+game launched from Steam, from Heroic or from a bare Proton call lights up the
+same as one launched from here. Polled every three seconds; one scan answers for
+every game at once.
+
+Crash handlers and launcher helpers are excluded by name. They matter because
+they outlive the game in the same directory — Sentry's `crashpad_handler.exe`
+kept Expedition 33 marked as running for minutes after it had closed.
+
 ### Folders and logs
 
 **Open folder** opens the resolved binary directory in your file manager — the
@@ -107,10 +196,22 @@ Rather than hunting through a 1,600-line ini or an overlay:
 The GUI exposes both as an "Enable Neural Rendering" checkbox and a "DX12
 upscaler" dropdown once the game is installed.
 
-`--upscaler` matters under Proton. OptiScaler probes NVAPI during startup to
-decide what the GPU can do, and that probe can run *before* the game loads
-`nvapi64.dll` — it then logs `Upscaler support - dlss: false` and quietly falls
-back to XeSS even on a 4090. Forcing `dlss` sidesteps the detection.
+`--upscaler` matters under Proton, and it is not a rare edge case — it happens
+on every launch. OptiScaler probes NVAPI during startup to decide what the GPU
+can do, and under Proton that probe runs *before* the game has loaded
+`nvapi64.dll`. From Expedition 33's log, five seconds apart:
+
+```
+21:09:10 [E] IdentifyGpu::queryNvapi Failed to init NvApi
+             Upscaler support - fsr4: false, dlss: false
+21:09:15 [I] LibraryLoadHooks::LoadLibraryCheckW nvapi64.dll call!
+```
+
+It had already concluded `dlss: false` on a 4090 and fallen back to XeSS
+(`TryCreateOptiFeature Creating XeSS upscaler feature`). Nothing recovers from
+that at runtime, so **installing on an NVIDIA GPU now writes `Dx12Upscaler=dlss`
+into the ini** rather than leaving it at `auto`. Pass `--upscaler` explicitly to
+override that.
 
 The editor is section-aware (`OptiScaler.ini` has seven different keys named
 `Enabled=`) and writes the file back with its CRLF endings and UTF-8 BOM intact,
@@ -150,7 +251,67 @@ Unreal shim launchers whose binary sits deeper, executables that import no
 graphics API at all and resolve D3D12 through `LoadLibrary` (Cyberpunk 2077),
 bundled redistributables larger than the game itself (Red Dead Redemption 2's
 Social Club installer), and titles shipping both a DX11 and a DX12 binary
-(The Witcher 3 next-gen, where only `bin/x64_dx12` is usable).
+(The Witcher 3 next-gen, where only `bin/x64_dx12` is usable). Where a title
+ships both, the D3D12 binary is preferred outright rather than the larger one —
+Control's two differ by 512 bytes.
+
+### Reading the graphics API
+
+An executable's own import table is often not where the renderer is. Three
+things are read, in this order:
+
+1. **The executable's imports, followed one level into DLLs beside it.** An
+   engine living in its own DLL imports no graphics API into the `.exe`:
+   `Control_DX12.exe` imports `d3d_rmdwin10_f.dll`, and only *that* imports
+   `d3d12.dll`. One level and siblings only — enough to answer "what does this
+   binary's engine use" without walking the whole Windows import graph. It also
+   keeps a dual-API title's two binaries apart, since `Control_DX11.exe` reaches
+   `d3d11.dll` through a different companion DLL.
+2. **`D3D12CreateDevice` in the binary,** if the imports said D3D11. A static
+   `d3d11.dll` import does not settle it — Unreal and RE Engine both import
+   D3D11 and reach D3D12 through `LoadLibrary`, which had Palworld, Resident
+   Evil 4 and Hellblade all reading as D3D11. The symbol is the discriminator,
+   not the string `d3d12`: a renderer that creates a D3D12 device must resolve
+   it by name. Genuinely D3D11 titles do not contain it.
+3. **OpenGL and Vulkan, from the executable's own imports only** — never from
+   the DLLs beside it. Unity's stub launcher imports nothing while
+   `UnityPlayer.dll` next to it imports `OPENGL32`, for a renderer that is
+   really D3D11. `unknown` is the honest answer for a stub like that.
+
+Matches are against whole DLL names, because the deep scan lists the game's own
+DLL names too and a substring test reads `d3d_rmdwin10_f.dll` as an answer.
+
+### Which DLLs count as the game's own
+
+An upscaler DLL under the game root is discounted only if this script put it
+there, and that has to be exact both ways: counting the game's own as ours makes
+a supported game read `unsupported`, and the reverse makes an unsupported game
+read `supported` the moment it has been installed into once.
+
+Two things decide it. Anything inside a directory the package creates —
+`OptiScaler/`, `DlssOverrides/`, `Licenses/` — is ours by construction. At the
+top level it depends on the engine named in the state file: `install_optiscaler`
+takes `nvngx_dlssnr.dll` out of `streamline.zip` and leaves the rest, while
+`install_reshade` unpacks all of it. Treating `nvngx_dlss.dll` as ours either
+way is what made Control — which ships its own, and was installed with the
+optiscaler engine — report "no upscaler runtime found".
+
+Upscalers are scanned seven levels below the game root, not five: Unreal ships
+them as plugins at `<Game>/Plugins/<Plugin>/Binaries/ThirdParty/Win64/`, exactly
+seven down, and at five Palworld's bundled DLSS was invisible. Anti-cheat is
+still scanned at five.
+
+An empty directory reports as not installed rather than as a native Linux
+build — Steam leaves the folder behind after an uninstall.
+
+Nothing limits how deep the upscaler scan goes. The depth is not a number worth
+guessing at — Palworld's plugin sits seven levels below the game root, Expedition
+33 adds a vendor folder and sits at eight — and a cap fitted to one game is wrong
+for the next; both probed as having no upscaler at all. It costs nothing to stop
+capping it: modern games pack their assets into a handful of archives, so these
+trees are tiny (181 files for Expedition 33, 123 for Red Dead Redemption 2), and
+an unbounded scan of the largest tree in a 161-game library takes 0.05s.
+Anti-cheat is still scanned to five levels.
 
 Anti-cheat is scanned from the **game root**, not from the resolved binary
 directory — `find` only descends, and Halo MCC keeps `EasyAntiCheat/` three
@@ -216,11 +377,23 @@ shipping `nvngx_dlssg.dll` as a PE DLL is direct evidence of that path.
 no `nvcuda.dll`. It takes the D3D12 device as a COM pointer, so there is no
 import-resolution wall under Wine.
 
-**The one genuine unknown:** under Proton that D3D12 device is vkd3d-proton, not
-real D3D12. NVIDIA's bridge plumbs the `dlss` / `dlssg` / `dlssd` features; the
-Neural Rendering feature ID is new and may not be wired through. This cannot be
-settled by reading code — only by running it. If it fails, the overlay states the
-reason under the enable checkbox, and `OptiScaler.log` has more.
+**This used to be the open question**, because under Proton that D3D12 device is
+vkd3d-proton, not real D3D12, and while NVIDIA's bridge plumbs `dlss` / `dlssg` /
+`dlssd`, the Neural Rendering feature ID is new. It could only be settled by
+running it.
+
+**It is settled: the neural pass runs.** Clair Obscur: Expedition 33 (GOG, via
+Heroic, GE-Proton11-3, RTX 4090) dispatched it 28 times across a 39-second
+session:
+
+```
+DlssNr_Dx12::Dispatch DLSS-NR running at 1920x1080, guides 1132x636
+                      (preset 0, intensity 1, style 0)
+```
+
+So NVIDIA's Wine NGX bridge does carry the Neural Rendering feature through
+vkd3d-proton. If it ever does fail, the overlay states the reason under the
+enable checkbox and `OptiScaler.log` has more.
 
 ## Launch options
 

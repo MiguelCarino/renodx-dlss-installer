@@ -19,6 +19,7 @@ would rather start the game the usual way.
 """
 
 import argparse
+import hashlib
 import hmac
 import json
 import os
@@ -27,6 +28,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import uuid
 import webbrowser
@@ -46,6 +48,14 @@ NON_GAME_APPIDS = {
     "1493710",  # Proton Experimental
 }
 NON_GAME_PREFIXES = ("Proton", "Steam Linux Runtime", "Steamworks", "SteamVR")
+
+# Games that are not in a Steam library - GOG, Heroic, a loose Wine install -
+# are remembered here between runs, and get a Wine prefix of our own because
+# they have no compatdata directory to borrow.
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+FOLDERS_FILE = CONFIG_HOME / "dlss5-linux" / "folders.json"
+PREFIX_DIR = DATA_HOME / "dlss5-linux" / "prefixes"
 
 TOKEN = secrets.token_urlsafe(24)
 JOBS = {}
@@ -173,6 +183,105 @@ def list_games():
 
     games.sort(key=lambda g: g["name"].lower())
     return games
+
+
+# --------------------------------------------------------------------------
+# Manually added game folders
+# --------------------------------------------------------------------------
+
+def read_folders():
+    """The folders added by hand, as they were stored (absolute, resolved)."""
+    try:
+        data = json.loads(FOLDERS_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return sorted({item for item in data if isinstance(item, str) and item})
+
+
+def write_folders(paths):
+    FOLDERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Written beside the target and renamed, so an interrupted write cannot
+    # leave a half-serialised list that read_folders() would then discard.
+    tmp = FOLDERS_FILE.with_name(FOLDERS_FILE.name + ".part")
+    tmp.write_text(json.dumps(sorted(paths), indent=2) + "\n")
+    tmp.replace(FOLDERS_FILE)
+
+
+def prefix_for(path):
+    """A Wine prefix of our own, for a game with no Steam compatdata.
+
+    Named after the folder so it is recognisable in a file manager, and
+    suffixed with a digest of the full path so two games called "Bin" in
+    different places do not end up sharing one prefix.
+    """
+    digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:12]
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(path).name).strip("-.") or "game"
+    return PREFIX_DIR / ("%s-%s" % (slug[:48], digest))
+
+
+def manual_games():
+    """Added folders in the same shape list_games() returns.
+
+    The appid is synthetic and only keys the UI's per-game state; `manual`
+    keeps it from reaching Proton as a real SteamAppId.
+    """
+    games = []
+    for raw in read_folders():
+        path = Path(raw)
+        games.append({
+            "appid": "manual:" + raw,
+            "name": path.name or raw,
+            "path": raw,
+            "compatdata": str(prefix_for(raw)),
+            "manual": True,
+            "missing": not path.is_dir(),
+        })
+    return games
+
+
+def add_folder(raw):
+    """Register a game folder Steam knows nothing about. Returns its real path."""
+    try:
+        path = Path(raw).expanduser().resolve()
+    except (OSError, ValueError):
+        raise BadRequest("Not a usable path: %s" % raw)
+
+    if not path.is_dir():
+        raise BadRequest("Not a directory: %s" % path)
+
+    # An added folder becomes a base for the containment checks that guard
+    # xdg-open and log reading, so one that contains everything would be the
+    # end of them. $HOME and anything above it are refused for that reason.
+    home = Path.home()
+    if path == path.parent or path == home or home.is_relative_to(path):
+        raise BadRequest("Too broad to add: %s. Pick the game's own folder." % path)
+
+    folders = read_folders()
+    if str(path) in folders:
+        raise BadRequest("Already added: %s" % path)
+    # Covers both a game Steam already lists and a subfolder of one added
+    # earlier, either of which would show up twice.
+    if under(path, game_roots()):
+        raise BadRequest("Already covered by a known game folder: %s" % path)
+
+    write_folders(folders + [str(path)])
+    return str(path)
+
+
+def remove_folder(raw):
+    """Forget an added folder. Nothing on disk is touched."""
+    folders = read_folders()
+    try:
+        resolved = str(Path(raw).expanduser().resolve())
+    except (OSError, ValueError):
+        resolved = raw
+
+    kept = [f for f in folders if f not in (raw, resolved)]
+    if len(kept) == len(folders):
+        raise BadRequest("Not an added folder: %s" % raw)
+    write_folders(kept)
 
 
 def list_protons():
@@ -322,11 +431,15 @@ CAPTURE_DIR = "dlssnr-capture"
 
 
 def game_roots():
-    """Every steamapps/common - the only places a game and its logs can live."""
+    """Every place a game we know about can live, and so the only places the
+    open and log-reading routes will touch: each steamapps/common, plus the
+    folders added by hand."""
+    roots = []
     root = steam_root()
-    if root is None:
-        return []
-    return [lib / "common" for lib in library_paths(root) if (lib / "common").is_dir()]
+    if root is not None:
+        roots += [lib / "common" for lib in library_paths(root) if (lib / "common").is_dir()]
+    roots += [path for path in map(Path, read_folders()) if path.is_dir()]
+    return roots
 
 
 def under(path, bases):
@@ -384,6 +497,151 @@ def game_logs(game_dir, engine=None):
 
     found.sort(key=lambda item: (not item["preferred"], -item["mtime"]))
     return found
+
+
+# What the injector's own log says actually happened. These are the lines
+# OptiScaler writes; the neural pass dispatching is the only proof that matters,
+# because everything upstream of it can succeed and still produce no effect.
+NR_DISPATCH = re.compile(r"DlssNr_\w+::Dispatch")
+NR_BACKEND = re.compile(r"TryCreateOptiFeature Creating (\w+) upscaler feature")
+NR_NVAPI_MISS = re.compile(r"Upscaler support[^\n]*\bdlss: false")
+NR_LOADED = re.compile(r"OptiScaler v[\d.]+")
+NR_TIMESTAMP = re.compile(r"^\[(\d\d):(\d\d):(\d\d)")
+
+
+def analyse_log(game_dir):
+    """Read OptiScaler.log and say whether the neural pass is actually running.
+
+    Returns None when there is no log to read. Everything else is a state the
+    UI shows verbatim, because "installed" and "working" are very different
+    things here and the difference is only ever visible in this file.
+    """
+    directory = Path(game_dir)
+    path = directory / "OptiScaler.log"
+    if not path.is_file():
+        return None
+
+    # The tail is enough and bounds the read: the interesting lines repeat every
+    # frame, and a long session's log is mostly dispatches.
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > 400_000:
+                fh.seek(-400_000, os.SEEK_END)
+            text = fh.read().decode("utf-8", errors="replace")
+    except OSError as exc:
+        return {"state": "unknown", "headline": "Could not read OptiScaler.log: %s" % exc}
+
+    dispatches = len(NR_DISPATCH.findall(text))
+    backends = NR_BACKEND.findall(text)
+    backend = backends[-1].lower() if backends else None
+    nvapi_missed = bool(NR_NVAPI_MISS.search(text))
+    loaded = bool(NR_LOADED.search(text))
+    age = time.time() - path.stat().st_mtime
+
+    info = {
+        "dispatches": dispatches,
+        "backend": backend,
+        "nvapi_missed": nvapi_missed,
+        "age": age,
+        "mtime": path.stat().st_mtime,
+    }
+
+    if not loaded:
+        info.update(state="bad", headline="OptiScaler never loaded",
+                    detail="The log exists but has no startup banner. The proxy DLL was "
+                           "probably not loaded - check WINEDLLOVERRIDES.")
+    elif not dispatches:
+        info.update(state="bad", headline="Injector loaded, neural pass never ran",
+                    detail="OptiScaler started but DLSS-NR was never dispatched. Either "
+                           "neural rendering is off, or the game gave it nothing to hook.")
+    elif backend and backend != "dlss":
+        info.update(
+            state="warn",
+            headline="Neural pass running, but on %s instead of DLSS" % backends[-1],
+            detail=("OptiScaler could not see DLSS support and fell back to %s. "
+                    % backends[-1]) +
+                   ("NVAPI was probed before the game loaded nvapi64.dll. " if nvapi_missed else "") +
+                   "Set the DX12 upscaler to 'dlss' below and relaunch.")
+    else:
+        info.update(state="ok", headline="DLSS 5 neural rendering is running",
+                    detail="%d dispatches recorded%s." % (
+                        dispatches, " on DLSS" if backend == "dlss" else ""))
+
+    return info
+
+
+# --------------------------------------------------------------------------
+# Is the game running - however it was started
+# --------------------------------------------------------------------------
+
+# Processes that live in a game folder without being the game. The crash
+# handler is the one that matters: Sentry's crashpad_handler.exe stays up with
+# the game folder as its working directory after the game itself has exited,
+# which kept Expedition 33 marked as running long after it closed.
+HELPER_PROCS = (
+    "crashpad_handler.exe", "crashreportclient.exe", "unitycrashhandler64.exe",
+    "unitycrashhandler32.exe", "epicwebhelper.exe", "steamwebhelper.exe",
+    "gameoverlayui.exe", "wineboot.exe", "winedevice.exe", "services.exe",
+    "plugplay.exe", "explorer.exe", "rpcss.exe", "svchost.exe", "conhost.exe",
+    "tabtip.exe", "start.exe", "winemenubuilder.exe",
+)
+
+
+def is_helper(cmdline):
+    """Whether a command line names one of the helpers above, not a game."""
+    first = cmdline.split("\0")[0].replace("\\", "/")
+    return first.rsplit("/", 1)[-1].strip().lower() in HELPER_PROCS
+
+
+def running_dirs(candidates):
+    """Which of `candidates` (game directories) have a live process.
+
+    Scans /proc once for all of them, so it stays cheap enough to poll. The
+    game does not have to have been started from here: Steam, Heroic and a bare
+    Proton call all produce a process whose command line names the executable
+    and whose working directory is the folder it was launched from.
+    """
+    wanted = {}
+    for path in candidates:
+        try:
+            wanted[str(Path(path).resolve())] = None
+        except (OSError, ValueError):
+            continue
+    if not wanted:
+        return {}
+
+    live = {}
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        pid = entry.name
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as fh:
+                cmdline = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        if not cmdline or is_helper(cmdline):
+            continue
+
+        # The working directory is the reliable half: Wine runs the game with
+        # its own folder as cwd whoever started it. The command line is the
+        # fallback for a launcher that sets cwd somewhere else.
+        try:
+            cwd = os.path.realpath("/proc/%s/cwd" % pid)
+        except OSError:
+            cwd = ""
+
+        lowered = cmdline.replace("\\", "/").lower()
+        for target in wanted:
+            if target in live:
+                continue
+            if cwd == target or cwd.startswith(target + os.sep):
+                live[target] = int(pid)
+            elif target.lower() in lowered:
+                live[target] = int(pid)
+
+    return live
 
 
 def read_log_tail(path, limit=160_000):
@@ -482,7 +740,9 @@ def start_launch(game, proton_path, hook):
     env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(root)
     env["STEAM_COMPAT_DATA_PATH"] = str(compatdata)
 
-    appid = str_field(game, "appid", "")
+    # A manual game's appid is our own synthetic key, not Steam's, so it must
+    # not reach Proton - a made-up SteamAppId is worse than none.
+    appid = "" if game.get("manual") else str_field(game, "appid", "")
     if appid:
         # Without these, steam_api64.dll cannot attach to the running Steam
         # client and many games exit within a second of starting - before they
@@ -493,7 +753,9 @@ def start_launch(game, proton_path, hook):
 
     # The library root, so Proton maps it to a drive letter instead of leaving
     # the game to reach itself through Z:\ (the whole-filesystem fallback).
-    library = compatdata.parent.parent
+    # A manual game has no library above it and its prefix is one of ours, off
+    # in ~/.local/share, so mount the folder's own parent instead.
+    library = game_dir.parent if game.get("manual") else compatdata.parent.parent
     if library.is_dir():
         env["STEAM_COMPAT_MOUNTS"] = str(library)
     env["STEAM_COMPAT_INSTALL_PATH"] = str(game_dir)
@@ -600,7 +862,9 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/preflight":
             self._json(preflight())
         elif url.path == "/api/games":
-            self._json({"games": list_games(), "protons": list_protons()})
+            games = sorted(list_games() + manual_games(), key=lambda g: g["name"].lower())
+            self._json({"games": games, "protons": list_protons(),
+                        "folders": read_folders()})
         elif url.path.startswith("/api/job/"):
             job_id = url.path.rsplit("/", 1)[-1]
             with JOBS_LOCK:
@@ -648,11 +912,34 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/api/launch-options":
                 self._json({"options": steam_launch_options(str_field(body, "hook", "dxgi.dll"))})
 
+            elif url.path == "/api/activity":
+                # One endpoint for the whole poll: which games are alive, and
+                # what the selected one's log says it is doing. Both are cheap
+                # and both change while the game runs, so they belong together
+                # rather than as two timers drifting apart.
+                paths = body.get("paths") or []
+                if not isinstance(paths, list):
+                    raise BadRequest("field 'paths' must be a list")
+                paths = [p for p in paths[:400] if isinstance(p, str) and p]
+
+                detail = str_field(body, "detail", "")
+                status = analyse_log(detail) if detail else None
+
+                self._json({"running": running_dirs(paths), "status": status})
+
+            elif url.path == "/api/folders/add":
+                self._json({"added": add_folder(str_field(body, "path")),
+                            "folders": read_folders()})
+
+            elif url.path == "/api/folders/remove":
+                remove_folder(str_field(body, "path"))
+                self._json({"folders": read_folders()})
+
             elif url.path == "/api/open":
                 # Token-gated, but nothing here has any business handing an
                 # arbitrary path to the desktop's handler.
                 target = contained(str_field(body, "path"), game_roots(),
-                                    "Path", "the Steam game libraries")
+                                    "Path", "the known game folders")
                 self._json({"opened": open_path(target)})
 
             elif url.path == "/api/config":
@@ -669,7 +956,7 @@ class Handler(BaseHTTPRequestHandler):
 
             elif url.path == "/api/gamelog":
                 directory = contained(str_field(body, "path"), game_roots(),
-                                       "Game folder", "the Steam game libraries")
+                                       "Game folder", "the known game folders")
                 logs = game_logs(directory, str_field(body, "engine", ""))
                 wanted = str_field(body, "log", "") or (logs[0]["path"] if logs else None)
 
@@ -760,6 +1047,44 @@ PAGE = r"""<!doctype html>
   #games li:hover { background:var(--info-bg); }
   #games li[aria-selected="true"] { background:var(--info-bg); outline:1px solid var(--accent); }
   #games .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #games .rm {
+    padding:0; width:20px; height:20px; line-height:1; flex:none; font-size:15px;
+    border:none; background:none; color:var(--muted); opacity:0; border-radius:5px;
+  }
+  #games li:hover .rm, #games li:focus-within .rm { opacity:1; }
+  #games .rm:hover { background:var(--bad-bg); color:var(--bad); opacity:1; }
+
+  /* Live status. The dot pulses only while a process is actually alive, so a
+     glance at the list says which game is running without reading anything. */
+  .live {
+    flex:none; width:8px; height:8px; border-radius:50%; background:var(--ok);
+    animation:pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.25 } }
+  @media (prefers-reduced-motion: reduce) { .live { animation:none } }
+
+  .status {
+    display:flex; gap:12px; align-items:flex-start; padding:13px 15px;
+    border-radius:10px; margin:14px 0; border:1px solid var(--line);
+    background:var(--info-bg);
+  }
+  .status.ok   { background:var(--ok-bg);   border-color:var(--ok);   }
+  .status.warn { background:var(--warn-bg); border-color:var(--warn); }
+  .status.bad  { background:var(--bad-bg);  border-color:var(--bad);  }
+  .status .mark { font-size:17px; line-height:1.3; flex:none; }
+  .status .hd { font-weight:650; }
+  .status.ok   .hd { color:var(--ok);   }
+  .status.warn .hd { color:var(--warn); }
+  .status.bad  .hd { color:var(--bad);  }
+  .status .dt { color:var(--muted); font-size:12.5px; margin-top:3px; }
+
+  .addbar { align-items:center; }
+  .addbar input {
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px;
+  }
+  .adderr {
+    padding:0 12px 10px; font-size:12px; color:var(--bad); border-bottom:1px solid var(--line);
+  }
 
   .badge {
     font-size:10.5px; font-weight:650; letter-spacing:.03em; text-transform:uppercase;
@@ -768,14 +1093,42 @@ PAGE = r"""<!doctype html>
   .badge.supported   { background:var(--ok-bg);   color:var(--ok); }
   .badge.partial     { background:var(--warn-bg); color:var(--warn); }
   .badge.blocked,
+  .badge.missing,
   .badge.unsupported { background:var(--bad-bg);  color:var(--bad); }
 
-  #detail { padding:20px 24px; max-width:900px; }
+  #detail { padding:20px 24px; }
+
+  /* The pane was capped at 900px, which left a third of a wide window empty
+     while the facts wrapped to a second row and every control stacked. Above
+     1200px the read-only half (status, facts, reasons) and the half you act on
+     (controls, config, launch string) sit side by side instead; below it they
+     stack exactly as before. The log stays full width under both. */
+  .panes { display:grid; gap:8px 26px; align-items:start; }
+  @media (min-width:1200px) {
+    /* min-content / 1fr, not auto / auto: the controls column spans both rows,
+       and with two auto rows the browser spreads its extra height over both,
+       leaving a gap between the reasons and the log. Pinning row 1 to the
+       left column's own height sends all of the slack to row 2. */
+    .panes { grid-template-columns:minmax(0,1fr) minmax(360px,440px);
+             grid-template-rows:min-content 1fr; }
+    /* The controls column is much taller than facts+reasons, so the log goes
+       under the left one rather than below both - otherwise the left column is
+       a blank 400px while the log is pushed past the fold. Stacked, DOM order
+       already gives facts, controls, log. */
+    .panes > .col-read  { grid-column:1; grid-row:1; }
+    .panes > .col-act   { grid-column:2; grid-row:1 / span 2; }
+    .panes > .logwrap   { grid-column:1; grid-row:2; }
+  }
+  .panes > .logwrap { margin-top:14px; min-width:0; }
   .empty { color:var(--muted); padding:40px 0; }
   h2 { margin:0 0 2px; font-size:19px; letter-spacing:-.01em; }
   .path { color:var(--muted); font-size:12px; word-break:break-all; margin-bottom:16px; }
 
-  .facts { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:14px 0; }
+  /* auto-fit stretched six tiles across the full width and left "Installed"
+     alone on a second row. Three columns divides six evenly at any width the
+     left pane actually takes. */
+  .facts { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin:14px 0; }
+  @media (max-width:560px) { .facts { grid-template-columns:repeat(2,minmax(0,1fr)); } }
   .fact { background:var(--panel); border:1px solid var(--line); border-radius:9px; padding:9px 11px; }
   .fact .k { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
   .fact .v { font-size:13.5px; margin-top:2px; word-break:break-word; }
@@ -839,6 +1192,12 @@ PAGE = r"""<!doctype html>
       <input id="filter" type="search" placeholder="Filter games" autocomplete="off">
       <button id="probeall" title="Probe every game (slow)">Probe all</button>
     </div>
+    <div class="listbar addbar">
+      <input id="addpath" type="text" spellcheck="false" autocomplete="off"
+             placeholder="/path/to/a/game not in Steam">
+      <button id="addfolder" title="Remember a game folder Steam does not list">Add</button>
+    </div>
+    <div id="adderr" class="adderr" hidden></div>
     <ul id="games"><li class="empty" style="padding:20px">Loading&hellip;</li></ul>
   </div>
 
@@ -848,6 +1207,7 @@ PAGE = r"""<!doctype html>
 <script>
 const TOKEN = "__TOKEN__";
 let GAMES = [], PROTONS = [], SELECTED = null;
+const ACTIVITY = { running: {}, status: null };   // refreshed by pollActivity()
 const RESULTS = {};   // appid -> probe result
 const CONFIG  = {};   // appid -> OptiScaler.ini values
 
@@ -885,6 +1245,10 @@ async function copyText(text) {
 }
 
 const fmtBytes = n => n < 1024 ? n + " B" : (n / 1024).toFixed(1) + " KB";
+const fmtAge = s => s < 90 ? Math.round(s) + "s"
+                  : s < 5400 ? Math.round(s / 60) + " min"
+                  : s < 172800 ? Math.round(s / 3600) + " h"
+                  : Math.round(s / 86400) + " days";
 
 function flash(btn, msg) {
   const original = btn.dataset.label || btn.textContent;
@@ -917,6 +1281,10 @@ async function loadPreflight() {
 
 // ---- game list -----------------------------------------------------------
 
+// The resolved binary directory when we have probed, the folder itself when we
+// have not. Everything runtime - the log, the process cwd - is in the former.
+const gameDir = g => (RESULTS[g.appid] || {}).dir || g.path;
+
 function renderList() {
   const needle = document.getElementById("filter").value.toLowerCase();
   const ul = document.getElementById("games");
@@ -924,16 +1292,27 @@ function renderList() {
 
   if (!shown.length) {
     ul.replaceChildren(el("li", { className: "empty", style: "padding:20px",
-      textContent: GAMES.length ? "No match." : "No Steam games found." }));
+      textContent: GAMES.length ? "No match."
+                                : "No games found. Add a folder above." }));
     return;
   }
 
   ul.replaceChildren(...shown.map(g => {
-    const verdict = RESULTS[g.appid]?.verdict;
+    // A folder that has since been deleted or unmounted is said so outright,
+    // rather than being probed so the script can fail on it.
+    const verdict = g.missing ? "missing" : RESULTS[g.appid]?.verdict;
+    const live = !!ACTIVITY.running[gameDir(g)];
     const li = el("li", { tabIndex: 0 }, [
       el("span", { className: "nm", textContent: g.name, title: g.path }),
+      ...(live ? [el("span", { className: "live", title: "Running now" })] : []),
       el("span", { className: "badge " + (verdict || ""), textContent: verdict || "?" }),
     ]);
+    if (g.manual) {
+      const rm = el("button", { className: "rm", textContent: "\u00d7",
+                                title: "Forget " + g.path + " (nothing is deleted)" });
+      rm.onclick = e => { e.stopPropagation(); removeFolder(g); };
+      li.append(rm);
+    }
     li.setAttribute("aria-selected", SELECTED?.appid === g.appid);
     li.onclick = () => select(g);
     li.onkeydown = e => { if (e.key === "Enter") select(g); };
@@ -944,10 +1323,16 @@ function renderList() {
 async function select(game) {
   SELECTED = game;
   stopFollowing();
+  if (game.missing) {
+    renderList();
+    renderDetail();
+    return;
+  }
   Object.assign(LOGS, { job: "", game: "", tab: "job", meta: "", file: null, files: [], captures: false });
 
   renderList();
   renderDetail();
+  pollActivity();
   if (!RESULTS[game.appid]) await probeOne(game);
 
   // Learn which logs exist so "Open log file" / "Open captures" reflect reality.
@@ -973,11 +1358,103 @@ async function probeOne(game) {
   if (SELECTED?.appid === game.appid) renderDetail();
 }
 
+// ---- live activity -------------------------------------------------------
+
+// One poll answers both questions: which games have a live process, and what
+// the selected game's log says it is doing. It runs whether or not the launch
+// came from here - Steam and Heroic produce the same process, so a game started
+// outside this page still lights up.
+let activityTimer = null;
+
+async function pollActivity() {
+  const paths = GAMES.filter(g => !g.missing).map(gameDir);
+  const detail = SELECTED && !SELECTED.missing ? gameDir(SELECTED) : "";
+
+  let data;
+  try {
+    data = await api("/api/activity", { paths, detail });
+  } catch (e) {
+    return;  // a poll that fails is not worth reporting; the next one will do
+  }
+  if (data.error) return;
+
+  const before = JSON.stringify(ACTIVITY);
+  ACTIVITY.running = data.running || {};
+  ACTIVITY.status = data.status || null;
+  if (JSON.stringify(ACTIVITY) === before) return;   // nothing moved, no repaint
+
+  renderList();
+  renderDetail();
+}
+
+function startActivity() {
+  if (activityTimer) clearInterval(activityTimer);
+  pollActivity();
+  // 3s: fast enough that starting a game from Steam shows up while you are
+  // still looking at the page, slow enough that a /proc scan costs nothing.
+  activityTimer = setInterval(pollActivity, 3000);
+}
+
+// ---- added folders -------------------------------------------------------
+
+function addError(message) {
+  const box = document.getElementById("adderr");
+  box.textContent = message || "";
+  box.hidden = !message;
+}
+
+async function loadGames() {
+  const data = await api("/api/games");
+  GAMES = data.games || [];
+  PROTONS = data.protons || [];
+  // The selected game object is replaced wholesale by a reload, so re-point
+  // SELECTED at the new one or the detail pane keeps rendering a stale copy.
+  if (SELECTED) SELECTED = GAMES.find(g => g.appid === SELECTED.appid) || null;
+  renderList();
+}
+
+async function addFolder() {
+  const input = document.getElementById("addpath");
+  const btn = document.getElementById("addfolder");
+  const path = input.value.trim();
+  if (!path) return;
+
+  btn.disabled = true;
+  const res = await api("/api/folders/add", { path });
+  btn.disabled = false;
+
+  if (res.error) { addError(res.error); input.focus(); return; }
+
+  addError("");
+  input.value = "";
+  await loadGames();
+
+  // Jump straight to it: adding a folder is only ever a prelude to probing it.
+  const added = GAMES.find(g => g.path === res.added);
+  if (added) {
+    document.getElementById("filter").value = "";
+    renderList();
+    select(added);
+  }
+}
+
+async function removeFolder(game) {
+  const res = await api("/api/folders/remove", { path: game.path });
+  if (res.error) { addError(res.error); return; }
+
+  delete RESULTS[game.appid];
+  delete CONFIG[game.appid];
+  if (SELECTED?.appid === game.appid) { SELECTED = null; stopFollowing(); }
+  addError("");
+  await loadGames();
+  renderDetail();
+}
+
 // Probe everything, a few at a time so the box stays responsive.
 async function probeAll() {
   const btn = document.getElementById("probeall");
   btn.disabled = true;
-  const queue = GAMES.filter(g => !RESULTS[g.appid]);
+  const queue = GAMES.filter(g => !g.missing && !RESULTS[g.appid]);
   const workers = Array.from({ length: 3 }, async () => {
     while (queue.length) await probeOne(queue.shift());
   });
@@ -995,6 +1472,16 @@ function renderDetail() {
   }
 
   const g = SELECTED;
+  if (g.missing) {
+    box.replaceChildren(el("div", { className: "empty" }, [
+      el("div", { textContent: "This folder is gone: " + g.path }),
+      el("div", { style: "margin-top:8px", textContent:
+        "It was added by hand and has since been moved, deleted or unmounted. " +
+        "Remove it with the \u00d7 in the list, or restore the folder and reload." }),
+    ]));
+    return;
+  }
+
   const r = RESULTS[g.appid] || {};
   const installed = r.installed;
   const blocked = r.verdict === "blocked";
@@ -1004,6 +1491,47 @@ function renderDetail() {
     el("div", { className: "k", textContent: k }),
     el("div", { className: "v", textContent: v }),
   ]);
+
+  // "Installed" and "working" are different things, and only the injector's own
+  // log can tell them apart: it can load, hook and still never dispatch the
+  // neural pass. This says which of those actually happened.
+  const statusBanner = () => {
+    const live = !!ACTIVITY.running[gameDir(g)];
+    const st = ACTIVITY.status;
+
+    if (!installed && !live) return null;
+    if (!st) {
+      return el("div", { className: "status" }, [
+        el("span", { className: "mark", textContent: live ? "\u25cf" : "\u25cb" }),
+        el("div", {}, [
+          el("div", { className: "hd", textContent: live
+            ? "Running - waiting for the injector to write its log"
+            : "Installed, never run" }),
+          el("div", { className: "dt", textContent: live
+            ? "The game is up. OptiScaler.log appears once it loads."
+            : "Launch the game and this will say whether the neural pass ran." }),
+        ]),
+      ]);
+    }
+
+    // A log older than a couple of minutes with nothing running describes the
+    // last session, not this moment, and saying so stops it reading as live.
+    const stale = !live && st.age > 120;
+    const when = stale ? " (last session, " + fmtAge(st.age) + " ago)" : "";
+
+    return el("div", { className: "status " + (stale ? "" : st.state) }, [
+      el("span", { className: "mark", textContent:
+        st.state === "ok" ? "\u2713" : st.state === "warn" ? "!" : "\u2717" }),
+      el("div", {}, [
+        el("div", { className: "hd" }, [
+          el("span", { textContent: st.headline + when }),
+          ...(live ? [el("span", { className: "live", style: "margin-left:8px" },
+                              [])] : []),
+        ]),
+        el("div", { className: "dt", textContent: st.detail || "" }),
+      ]),
+    ]);
+  };
 
   const engineSel = el("select", { id: "engine" }, [
     el("option", { value: "optiscaler", textContent: "OptiScaler (recommended)" }),
@@ -1093,6 +1621,7 @@ function renderDetail() {
   const cfg = CONFIG[g.appid];
   const nrOn = cfg && cfg.nr === "true";
 
+  const overlayKey = (installed?.engine === "reshade") ? "Home" : "Insert";
   const nrBox = el("input", { type: "checkbox", id: "nrbox", checked: !!nrOn, disabled: !cfg });
   nrBox.onchange = () => job("/api/configure", { path: dir, nr: nrBox.checked ? "on" : "off" });
 
@@ -1106,19 +1635,25 @@ function renderDetail() {
     el("h2", { textContent: g.name }),
     el("div", { className: "path", textContent: r.dir || g.path }),
 
-    el("div", { className: "facts" }, [
-      fact("Verdict", r.verdict || "not probed"),
-      fact("Executable", r.executable || "—"),
-      fact("Graphics API", r.api || "—"),
-      fact("Upscalers", (r.upscalers || []).join(", ") || "none detected"),
-      fact("Anti-cheat", (r.anticheat || []).join(", ") || "none detected"),
-      fact("Installed", installed ? installed.engine + " as " + installed.hook : "no"),
-    ]),
+    statusBanner() || "",
 
-    el("ul", { className: "reasons" }, (r.reasons || []).map(text =>
-      el("li", { className: blocked ? "bad" : r.verdict === "partial" ? "warn" : "", textContent: text }))),
+    el("div", { className: "panes" }, [
+     el("div", { className: "col-read" }, [
+      el("div", { className: "facts" }, [
+        fact("Verdict", r.verdict || "not probed"),
+        fact("Executable", r.executable || "—"),
+        fact("Graphics API", r.api || "—"),
+        fact("Upscalers", (r.upscalers || []).join(", ") || "none detected"),
+        fact("Anti-cheat", (r.anticheat || []).join(", ") || "none detected"),
+        fact("Installed", installed ? installed.engine + " as " + installed.hook : "no"),
+      ]),
 
-    el("div", { className: "controls" }, [
+      el("ul", { className: "reasons" }, (r.reasons || []).map(text =>
+        el("li", { className: blocked ? "bad" : r.verdict === "partial" ? "warn" : "", textContent: text }))),
+     ]),
+
+     el("div", { className: "col-act" }, [
+      el("div", { className: "controls", style: "border-top:0;padding-top:0" }, [
       el("label", { className: "f" }, ["Engine", engineSel]),
       el("label", { className: "f" }, ["Proxy DLL", hookSel]),
       el("label", { className: "f" }, ["Proton", protonSel]),
@@ -1133,9 +1668,19 @@ function renderDetail() {
         [nrBox, "Enable Neural Rendering"]),
       el("label", { className: "f" }, ["DX12 upscaler", upSel]),
       el("span", { className: "note", style: "margin:0;flex-basis:100%" }, [
-        cfg ? "Written straight into OptiScaler.ini, so it is the state the game starts in \u2014 no overlay needed. "
-            + "Force 'dlss' if OptiScaler mis-detects the GPU under Proton and falls back to XeSS."
-            : "Install first to configure OptiScaler.ini."
+        !cfg ? "Install first to configure OptiScaler.ini."
+        : !!ACTIVITY.running[gameDir(g)]
+          // OptiScaler reads the ini once, at startup - it imports no file-watch
+          // API and has no reload action - so a change made now is real on disk
+          // and simply will not reach the session that is already running.
+          ? "The game is running. OptiScaler reads OptiScaler.ini only at startup, so a change "
+            + "here is saved but does not reach this session \u2014 it applies the next time the "
+            + "game starts. To change it now, press " + overlayKey + " in the game for the "
+            + "OptiScaler overlay; everything under DLSS Neural Rendering is live there except "
+            + "Preset, which is baked in when the model is created."
+          : "Written straight into OptiScaler.ini, so it is the state the game starts in \u2014 no "
+            + "overlay needed. Force 'dlss' if OptiScaler mis-detects the GPU under Proton and "
+            + "falls back to XeSS."
       ]),
     ]),
 
@@ -1147,14 +1692,16 @@ function renderDetail() {
       el("div", { className: "note", textContent:
         "\"Launch with overrides\" runs the game through Proton directly and applies these itself. " +
         "Use the copied string instead if you would rather start the game from Steam." }),
-    ]),
+      ]),
+     ]),
 
-    el("div", { className: "logwrap" }, [
+     el("div", { className: "logwrap" }, [
       el("div", { className: "logtabs" }, [
         tabJob, tabGame, fileSel, bRefresh, bCopyLog,
         el("span", { className: "logmeta", id: "logmeta" }),
       ]),
       el("pre", { id: "log" }),
+     ]),
     ]),
   );
 
@@ -1250,7 +1797,14 @@ async function job(path, body) {
     if (j.status === "running") return;
 
     clearInterval(poll);
-    LOGS.job += "\n[" + j.status + ", exit " + j.rc + "]";
+    // A game exits nonzero all the time - alt-F4, a quit button, a shutdown
+    // path that never calls exit(0) - so "failed" is the wrong word for a
+    // launch, and it sent us hunting for a launch failure that never happened
+    // after Expedition 33 ran for 39 seconds and rendered the whole time.
+    // Whether it worked is a question for the game log, not the exit code.
+    LOGS.job += isLaunch
+      ? "\n[game exited, code " + j.rc + "]"
+      : "\n[" + j.status + ", exit " + j.rc + "]";
 
     if (isLaunch) {
       // A game that dies this fast never reached D3D12, so the injector is not
@@ -1263,6 +1817,10 @@ async function job(path, body) {
           "injector failing. Games with Steam DRM or Denuvo usually refuse to start\n" +
           "unless Steam launched them. Copy the launch options above into Steam\n" +
           "(Properties > General > Launch Options) and start it from Steam instead.";
+      } else {
+        LOGS.job += "\n\nThe game ran for " + secs.toFixed(0) + "s, so it started fine - " +
+          "a nonzero exit code on quit is normal.\nSwitch to the Game log tab to see what " +
+          "the injector actually did.";
       }
       stopFollowing();
       if (dir) refreshGameLog(dir, engine);
@@ -1282,12 +1840,14 @@ async function job(path, body) {
 
 (async () => {
   loadPreflight();
-  const data = await api("/api/games");
-  GAMES = data.games;
-  PROTONS = data.protons;
-  renderList();
+  await loadGames();
   document.getElementById("filter").oninput = renderList;
   document.getElementById("probeall").onclick = probeAll;
+  document.getElementById("addfolder").onclick = addFolder;
+  document.getElementById("addpath").onkeydown = e => {
+    if (e.key === "Enter") addFolder();
+  };
+  startActivity();
 })();
 </script>
 </body>
