@@ -16,13 +16,20 @@
 # The neural pass reads the depth + motion vectors the game hands to DLSS each
 # frame; with no DLSS to intercept, it does nothing.
 #
+# Two more cover what those two cannot:
+#
+#   feeder      DLSS5-Feeder + OptiScaler DLSS-NR, for games with no DLSS.
+#   amd         RedDukeDev/dlss5-nr-amd-custom: NVIDIA's network on AMD RDNA
+#               GPUs through ZLUDA and ROCm. Experimental, and the only engine
+#               an AMD GPU can use - the other three need NVIDIA's NGX driver.
+#
 # nvngx_dlssnr.dll is not distributed with this script; it is downloaded at run
 # time from a third-party GitHub release. It is leaked pre-release NVIDIA code.
 # Single-player only, never with anti-cheat.
 
 set -euo pipefail
 
-readonly VERSION="0.0.1"
+readonly VERSION="0.0.2"
 readonly CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/dlss5-linux"
 readonly STATE_FILE=".dlss5-linux.state"
 
@@ -48,9 +55,29 @@ readonly RESHADE_HEADERS_URL="https://raw.githubusercontent.com/crosire/reshade-
 readonly D3DCOMPILER_URL="https://raw.githubusercontent.com/mozilla/fxc2/master/dll/d3dcompiler_47.dll"
 readonly D3DCOMPILER_SHA256="4432bbd1a390874f3f0a503d45cc48d346abc3a8c0213c289f4b615bf0ee84f3"
 readonly GE_API="https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest"
+# The amd engine. One zip holds everything: OptiScaler built with the dlss5nr
+# plugin, NVIDIA's own nvngx_dlssnr.dll 310.8.0.0 (unpatched - ZLUDA translates
+# its CUDA, which a patched copy would defeat), ZLUDA, a 347 MB translation
+# cache and the Linux HIP bridge. Pinned by hash: the account publishing it is
+# new, and the binaries in it are closed and not ours to vouch for.
+readonly AMD_VERSION="1.1.0"
+readonly AMD_URL="https://github.com/RedDukeDev/dlss5-nr-amd-custom/releases/download/${AMD_VERSION}/dlss5-nr-amd-custom.zip"
+readonly AMD_SHA256="502624e01487b485d71b503e45205678ef65b65163160a90feed55ddc7718595"
+readonly AMD_ZIP="dlss5-nr-amd-custom-${AMD_VERSION}.zip"
+readonly AMD_TOP="dlss5-nr-amd-custom"      # the zip's one top-level folder
+# The GPU targets that release's cache holds, as its coverage.txt lists them.
+# Only the fallback: once the zip is cached, its own coverage.txt is read.
+readonly AMD_COVERAGE_PINNED="gfx10-3-generic gfx11-generic gfx1100 gfx1101 gfx12-generic"
+# The package's linux/ folder, minus the DLL that has to sit beside the exe,
+# goes here inside the game folder; the launch option points into it.
+readonly AMD_LINUX_DIR="dlss5nr-linux"
+readonly AMD_STAGE=".dlss5-amd-staging"
+# Game files that sat under a name the amd engine needs, put back by uninstall.
+readonly BACKUP_DIR=".dlss5-linux-backup"
 
 # --- Defaults -----------------------------------------------------------------
 ENGINE="optiscaler"
+ENGINE_SET=0
 GAME_DIR=""
 HOOK_DLL="dxgi.dll"
 DO_UNINSTALL=0
@@ -108,36 +135,46 @@ usage() {
     local name="${DLSS5_PROG:-dlss5-linux.sh}"
     name="${name//\\/\\\\}"; name="${name//&/\\&}"; name="${name//|/\\|}"
     cat <<'USAGE' | sed "s|dlss5-linux\.sh|$name|g"
-dlss5-linux.sh - DLSS 5 Neural Rendering on Linux/Proton for RTX 40 (Ada)
+dlss5-linux.sh - DLSS 5 Neural Rendering on Linux/Proton for RTX 40 (Ada),
+experimentally on AMD RDNA2/3/4
 
 Usage:
   dlss5-linux.sh --game-dir=PATH [options]
   dlss5-linux.sh --game-dir=PATH --probe [--json]
   dlss5-linux.sh --game-dir=PATH --uninstall
   dlss5-linux.sh --game-dir=PATH --configure --nr=on --upscaler=dlss
+  dlss5-linux.sh --game-dir=PATH --launch-options [--json]
   dlss5-linux.sh --install-proton
-  dlss5-linux.sh --check
+  dlss5-linux.sh --check [--json]
 
 Options:
   --game-dir=PATH     Folder holding the game's .exe. For Unreal titles this is
                       <Game>/Binaries/Win64; for Cyberpunk 2077 it is bin/x64.
                       The script auto-corrects if you point it at a launcher.
-  --engine=NAME       optiscaler (default) | reshade | feeder
+  --engine=NAME       optiscaler (default) | reshade | feeder | amd
                       feeder: for D3D11/D3D12 games with no DLSS of their own
                       (ReShade + DLSS5-Feeder + OptiScaler DLSS-NR)
+                      amd: experimental, AMD RDNA2/3/4 with ROCm 7, D3D12
+                      games only (RedDukeDev/dlss5-nr-amd-custom, 365 MB)
   --hook=NAME         DLL name to masquerade as: dxgi.dll (default), d3d12.dll,
                       version.dll, winmm.dll, dbghelp.dll, wininet.dll, winhttp.dll
   --install-proton    Fetch the latest GE-Proton into compatibilitytools.d
   --uninstall         Remove everything this script installed from --game-dir
   --probe             Report whether a game qualifies. Reads only, changes
-                      nothing. Verdicts: supported / partial / unsupported /
-                      blocked (anti-cheat) / unknown
-  --json              Machine-readable output (used by the web GUI)
+                      nothing. Verdicts: supported / partial / feeder /
+                      amd / unsupported / blocked (anti-cheat) / unknown
+  --launch-options    Print the Steam launch options for the install in
+                      --game-dir and exit
+  --json              Machine-readable output of --probe, --check and
+                      --launch-options (the first two used by the web GUI)
   --check             Run preflight checks only and exit
   --dry-run           Print what would happen, change nothing
-  --force             Install even if anti-cheat is detected (ban risk)
-  --nr=on|off         Set [DlssNr] Enabled in OptiScaler.ini. Neural
-                      rendering ships off; this is the toggle.
+  --force             Install even if anti-cheat is detected (ban risk), or
+                      when the GPU or the game's graphics API rules the
+                      engine out
+  --nr=on|off         Set [DlssNr] Enabled in OptiScaler.ini ([NeuralRendering]
+                      on the amd engine). Neural rendering ships off; this is
+                      the toggle.
   --upscaler=NAME     Set [Upscalers] Dx12Upscaler: dlss, xess, fsr21,
                       fsr22, ffx, auto. Force dlss if OptiScaler
                       mis-detects the GPU and falls back to XeSS.
@@ -148,6 +185,7 @@ Options:
   --toggle-key=KEY    Bind [DlssNr] ToggleKey, which switches the neural
                       pass on and off in game with the overlay off: F1-F12,
                       none, or a hex virtual-key code. Installs default to F9.
+                      Not on the amd engine, whose OptiScaler has no such key.
   --configure         Apply --nr / --upscaler / --overlay / --toggle-key
                       to an existing install
                       and exit, without reinstalling
@@ -155,7 +193,8 @@ Options:
   -h, --help          This message
 
 Notes:
-  Both engines require a D3D12 game that already runs DLSS.
+  optiscaler and reshade require a D3D12 game that already runs DLSS, and
+  they, like feeder, an NVIDIA GPU. On AMD only --engine=amd installs.
   Switch engines by running --uninstall first, then reinstalling.
 USAGE
     exit 0
@@ -165,11 +204,12 @@ USAGE
 for arg in "$@"; do
     case "$arg" in
         --game-dir=*)     GAME_DIR="${arg#*=}" ;;
-        --engine=*)       ENGINE="${arg#*=}" ;;
+        --engine=*)       ENGINE="${arg#*=}"; ENGINE_SET=1 ;;
         --hook=*)         HOOK_DLL="${arg#*=}" ;;
         --install-proton) DO_INSTALL_PROTON=1 ;;
         --uninstall)      DO_UNINSTALL=1 ;;
         --probe)          DO_PROBE=1 ;;
+        --launch-options) DO_LAUNCH_OPTS=1 ;;
         --json)           JSON_OUT=1 ;;
         --check)          CHECK_ONLY=1 ;;
         --dry-run)        DRY_RUN=1 ;;
@@ -186,11 +226,12 @@ for arg in "$@"; do
 done
 CHECK_ONLY="${CHECK_ONLY:-0}"
 DO_PROBE="${DO_PROBE:-0}"
+DO_LAUNCH_OPTS="${DO_LAUNCH_OPTS:-0}"
 JSON_OUT="${JSON_OUT:-0}"
 
 case "$ENGINE" in
-    optiscaler|reshade|feeder) ;;
-    *) die "--engine must be 'optiscaler', 'reshade' or 'feeder', got '$ENGINE'" ;;
+    optiscaler|reshade|feeder|amd) ;;
+    *) die "--engine must be 'optiscaler', 'reshade', 'feeder' or 'amd', got '$ENGINE'" ;;
 esac
 
 # on/off is what a user types; true/false is what OptiScaler.ini wants.
@@ -236,6 +277,14 @@ if [[ "$ENGINE" == reshade && ( -n "$NR_SET" || -n "$UPSCALER" || -n "$OVERLAY_S
      (Home > Add-ons > RenoDX DLSS5) and there is no upscaler to select."
 fi
 
+# The amd engine's OptiScaler reads [NeuralRendering], which has no key to
+# switch the pass in game. Writing one in would do nothing.
+if [[ "$ENGINE" == amd && -n "$TOGGLE_KEY" ]]; then
+    die "--toggle-key does not apply to --engine=amd: its OptiScaler has no
+     neural rendering toggle key. Use --nr=on|off, or --overlay=on and the
+     Neural Rendering tab of OptiScaler's menu (Insert)."
+fi
+
 # --- Preflight ----------------------------------------------------------------
 
 require_tools() {
@@ -252,23 +301,372 @@ require_tools() {
     fi
 }
 
+# --- GPU detection ------------------------------------------------------------
+#
+# Which vendor's GPU is in the machine decides which engine can work at all, so
+# it is read from sysfs, which every driver fills in, rather than asked of
+# nvidia-smi, which only NVIDIA's driver brings. /sys/class/drm/cardN is one
+# GPU; cardN-DP-1 and the like are its connectors and are skipped.
+#
+# DLSS5_SYSFS_ROOT is for testing only: it is prefixed to every /sys path read
+# here, so a test can stand up a fake tree - an AMD gfx1100, a laptop's Intel
+# iGPU beside an NVIDIA dGPU - on a machine that has neither. With it set, the
+# tools that read the real /sys (lspci) are not asked.
+SYSFS_ROOT="${DLSS5_SYSFS_ROOT:-}"
+
+GPU_VENDOR=""   # nvidia | amd | intel | none, once detect_gpu has run
+GPU_ID=""       # PCI vendor:device, e.g. 1002:744c
+GPU_GFX=""      # AMD: the gfx target, e.g. gfx1100
+GPU_GEN=""      # AMD: RDNA2 / RDNA3 / RDNA4 / RDNA1 / GCN
+GPU_IGPU=0      # AMD: 1 for an APU's integrated GPU
+GPU_DRIVER=""; GPU_CC=""
+declare -a GPU_ALL=()   # every GPU found: "vendor|name|id|gfx|igpu"
+AMD_COVERAGE=""
+
+# The kfd topology encodes a target as major*10000 + minor*100 + stepping, the
+# last two as single hex digits of the name: 110001 is gfx1101, 90012 gfx90c.
+gfx_name() {
+    local v="$1"
+    printf 'gfx%d%x%x' $(( v / 10000 )) $(( v / 100 % 100 )) $(( v % 100 ))
+}
+
+amd_generation() {
+    case "$1" in
+        gfx103*)          printf 'RDNA2' ;;
+        gfx110*|gfx115*)  printf 'RDNA3' ;;   # 115x is RDNA 3.5, in the same cache target
+        gfx120*)          printf 'RDNA4' ;;
+        gfx101*)          printf 'RDNA1' ;;
+        gfx[6-9]*)        printf 'GCN' ;;
+    esac
+}
+
+# "gfx_target_version cpu_cores_count" of the kfd node behind DRM render node
+# $1. CPU nodes report a target of 0 and are skipped; an APU's GPU node also
+# counts CPU cores, which is how an integrated GPU is told from a discrete one.
+# When no node names the render minor, a lone GPU node is still unambiguous,
+# and so are several that all report the same target.
+kfd_node_for() {
+    local want="$1" props v minor cores only="" count=0 same=1
+    for props in "$SYSFS_ROOT"/sys/class/kfd/kfd/topology/nodes/*/properties; do
+        [[ -r "$props" ]] || continue
+        read -r v minor cores < <(awk '
+            $1 == "gfx_target_version" { v = $2 }
+            $1 == "drm_render_minor"   { m = $2 }
+            $1 == "cpu_cores_count"    { c = $2 }
+            END { print v + 0, (m == "" ? "-" : m), c + 0 }' "$props")
+        (( v )) || continue
+        if [[ -n "$want" && "$minor" == "$want" ]]; then
+            printf '%s %s' "$v" "$cores"
+            return 0
+        fi
+        [[ -n "$only" && "${only% *}" != "$v" ]] && same=0
+        [[ -n "$only" ]] || only="$v $cores"
+        count=$(( count + 1 ))
+    done
+    (( count == 1 || (count > 1 && same) )) && printf '%s' "$only"
+    return 0
+}
+
+# What to call a GPU: the board name the driver exposes, else lspci's, else the
+# PCI id. nvidia-smi's name replaces it later for the GPU in use.
+gpu_label() {
+    local dev="$1" vtag="$2" slot="$3" id="$4" name=""
+    [[ -r "$dev/product_name" ]] && name=$(tr -d '\n' < "$dev/product_name" 2>/dev/null || true)
+    if [[ -z "$name" && -z "$SYSFS_ROOT" && -n "$slot" ]] && command -v lspci >/dev/null 2>&1; then
+        name=$(lspci -vmm -s "$slot" 2>/dev/null | sed -n 's/^Device:[[:space:]]*//p' | head -1 || true)
+    fi
+    local vendor
+    case "$vtag" in nvidia) vendor="NVIDIA" ;; amd) vendor="AMD" ;; *) vendor="Intel" ;; esac
+    # AMD's product_name already reads "AMD Radeon RX ...".
+    [[ "${name,,}" == "${vendor,,} "* ]] && vendor=""
+    printf '%s%s' "${vendor:+$vendor }" "${name:-GPU [$id]}"
+}
+
+# Sets the GPU_* globals once. With several GPUs (a laptop's iGPU and dGPU) the
+# one games should render on wins: NVIDIA, then a discrete AMD, then an AMD
+# APU, then Intel. Between two AMD GPUs of one kind, one the amd engine's
+# cache covers beats one it does not, then the newer family, and any known
+# target an unknown one. All of them are kept in GPU_ALL for the report.
+detect_gpu() {
+    [[ -n "$GPU_VENDOR" ]] && return 0
+    local card dev vendor device vtag id slot name rank best=0 r render node gfx igpu
+    for card in "$SYSFS_ROOT"/sys/class/drm/card*; do
+        [[ "${card##*/}" =~ ^card[0-9]+$ ]] || continue
+        dev="$card/device"
+        [[ -r "$dev/vendor" ]] || continue
+        vendor=$(cat "$dev/vendor" 2>/dev/null || true)
+        device=$(cat "$dev/device" 2>/dev/null || true)
+        case "$vendor" in
+            0x10de) vtag=nvidia; rank=400 ;;
+            0x1002) vtag=amd;    rank=300 ;;
+            0x8086) vtag=intel;  rank=100 ;;
+            *) continue ;;
+        esac
+        id="${vendor#0x}:${device#0x}"
+        slot=$(sed -n 's/^PCI_SLOT_NAME=//p' "$dev/uevent" 2>/dev/null || true)
+        gfx=""; igpu=0
+        if [[ "$vtag" == amd ]]; then
+            render=""
+            for r in "$dev"/drm/renderD*; do [[ -e "$r" ]] && render="${r##*renderD}"; done
+            node=$(kfd_node_for "$render")
+            if [[ -n "$node" ]]; then
+                gfx=$(gfx_name "${node% *}")
+                (( ${node#* } > 0 )) && { igpu=1; rank=200; }
+                # Covered first, then the newer family (gfx12 over gfx11).
+                amd_gfx_covered "$gfx" && rank=$(( rank + 50 ))
+                rank=$(( rank + ${node% *} / 10000 ))
+            fi
+        fi
+        name=$(gpu_label "$dev" "$vtag" "$slot" "$id")
+        GPU_ALL+=("$vtag|$name|$id|$gfx|$igpu")
+        if (( rank > best )); then
+            best=$rank
+            GPU_VENDOR="$vtag"; GPU_NAME="$name"; GPU_ID="$id"
+            GPU_GFX="$gfx"; GPU_IGPU=$igpu
+        fi
+    done
+
+    # A /sys this cannot read (a sandbox) still has a working driver to ask.
+    if [[ -z "$GPU_VENDOR" && -z "$SYSFS_ROOT" ]] && nvidia-smi -L >/dev/null 2>&1; then
+        GPU_VENDOR=nvidia
+    fi
+    : "${GPU_VENDOR:=none}"
+
+    if [[ "$GPU_VENDOR" == nvidia ]] && command -v nvidia-smi >/dev/null 2>&1; then
+        # One call: every probe runs this, and nvidia-smi is not quick to start.
+        local smi="" sname
+        smi=$(nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader 2>/dev/null \
+            | head -1 || true)
+        # Drivers before compute_cap existed reject the whole query.
+        [[ -n "$smi" ]] || smi=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader \
+            2>/dev/null | head -1 || true)
+        IFS=',' read -r sname GPU_DRIVER GPU_CC <<< "$smi"
+        GPU_DRIVER="${GPU_DRIVER# }"; GPU_CC="${GPU_CC// /}"
+        [[ -n "$sname" ]] && GPU_NAME="$sname"
+        (( ${#GPU_ALL[@]} )) || GPU_ALL+=("nvidia|$GPU_NAME|||0")
+    fi
+    if [[ "$GPU_VENDOR" == amd ]]; then
+        GPU_GEN=$(amd_generation "$GPU_GFX")
+        load_amd_coverage
+    fi
+    return 0
+}
+
+# The targets the amd engine's translation cache holds. The runtime refuses a
+# GPU the cache does not cover rather than translate the network in game, so
+# this is the real requirement, read from the cached package when there is one.
+load_amd_coverage() {
+    [[ -n "$AMD_COVERAGE" ]] && return 0
+    local from=""
+    if amd_zip_trusted && command -v unzip >/dev/null 2>&1; then
+        from=$(unzip -p "$CACHE_DIR/$AMD_ZIP" \
+                "$AMD_TOP/OptiScaler/dlss5nr/cache/ComputeCache/coverage.txt" 2>/dev/null \
+            | tr -d '\r' | sed -n 's/^target[[:space:]]\{1,\}//p' | tr '\n' ' ' || true)
+    fi
+    from="${from% }"
+    AMD_COVERAGE="${from:-$AMD_COVERAGE_PINNED}"
+}
+
+# Whether the cached package is the pinned one. Only then may its coverage.txt
+# decide anything: a bad zip would refuse the GPU before install_amd's hash
+# check ever got to delete it. Hashing 365 MB on every probe is too slow, so a
+# match is remembered beside the zip as its size and mtime.
+amd_zip_trusted() {
+    local zip="$CACHE_DIR/$AMD_ZIP" stamp="$CACHE_DIR/$AMD_ZIP.sha256-ok" now
+    [[ -s "$zip" ]] || return 1
+    now=$(stat -c '%s %Y' "$zip" 2>/dev/null) || return 1
+    [[ -f "$stamp" && "$(cat "$stamp" 2>/dev/null)" == "$now" ]] && return 0
+    [[ "$(sha256sum "$zip" 2>/dev/null | cut -d' ' -f1)" == "$AMD_SHA256" ]] || return 1
+    printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+    return 0
+}
+
+# A generic target covers its family: gfx11-generic every gfx11xx, gfx10-3-generic
+# every gfx103x. Anything else must match exactly.
+amd_gfx_covered() {
+    local gfx="$1" t p
+    load_amd_coverage
+    local -a targets
+    read -r -a targets <<< "$AMD_COVERAGE"
+    for t in "${targets[@]}"; do
+        [[ "$t" == "$gfx" ]] && return 0
+        if [[ "$t" == *-generic ]]; then
+            p="${t%-generic}"; p="${p//-/}"
+            [[ "$gfx" == "$p"* ]] && return 0
+        fi
+    done
+    return 1
+}
+
+# Why ENGINE cannot work on this machine's GPU; nothing when it can. The one
+# source for the install refusal, the probe's verdict and --check --json.
+engine_refusal() {
+    local engine="$1"
+    detect_gpu
+    case "$GPU_VENDOR:$engine" in
+        nvidia:amd)
+            printf '%s' "The amd engine runs NVIDIA's network on AMD GPUs through ZLUDA and ROCm. This GPU is NVIDIA ($GPU_NAME): use --engine=optiscaler." ;;
+        nvidia:*)
+            command -v nvidia-smi >/dev/null 2>&1 \
+                || printf '%s' "nvidia-smi not found; is the NVIDIA driver installed? The $engine engine needs its NGX runtime." ;;
+        amd:amd)
+            if [[ -n "$GPU_GFX" ]] && ! amd_gfx_covered "$GPU_GFX"; then
+                printf '%s' "$GPU_NAME ($GPU_GFX${GPU_GEN:+, $GPU_GEN}) is not covered by the amd engine's translation cache ($AMD_COVERAGE). It needs an RDNA2, RDNA3 or RDNA4 GPU."
+            fi ;;
+        amd:*)
+            printf '%s' "The $engine engine needs NVIDIA's NGX driver, which an AMD GPU does not have. On AMD, neural rendering is possible only with the experimental engine: --engine=amd." ;;
+        intel:*)
+            printf '%s' "Intel GPUs are not supported yet. The one community proof of concept, on Arc Xe2, runs at 3-5 fps on Windows only; there is nothing to install." ;;
+        *)
+            printf '%s' "No GPU found under /sys/class/drm. Is a graphics driver loaded?" ;;
+    esac
+}
+
+# The engines this machine's GPU can run, space-separated.
+gpu_engines() {
+    local e out=""
+    for e in optiscaler reshade feeder amd; do
+        [[ -z "$(engine_refusal "$e")" ]] && out+="$e "
+    done
+    printf '%s' "${out% }"
+}
+
+# Fatal for --check and installs, a warning for --uninstall and --configure,
+# which touch only files and must work whatever GPU is in the machine now.
+gpu_fatal() {
+    if (( DO_UNINSTALL || CONFIG_ONLY )); then
+        warn "$1"
+    else
+        die "$1"
+    fi
+}
+
 # The Ada-patched nvngx_dlssnr.dll contains sm_89 cubins only. Confirm the GPU
 # actually is Ada, because the patched model will not run on anything else.
+# Any other vendor gets told plainly what, if anything, can run on it.
 check_gpu() {
-    command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found; is the NVIDIA driver installed?"
+    detect_gpu
 
-    local name driver cc
-    name=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
-    driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
-    cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
+    if (( ${#GPU_ALL[@]} > 1 )); then
+        local g names=""
+        for g in "${GPU_ALL[@]}"; do
+            IFS='|' read -r _ gname gid _ _ <<< "$g"
+            [[ "$gname" == *"[$gid]"* ]] && gid=""
+            names+="${names:+, }$gname${gid:+ [$gid]}"
+        done
+        log "GPUs found: $names"
+        log "Using $GPU_NAME"
+    fi
 
-    ok "GPU: $name (driver $driver, compute capability ${cc:-unknown})"
-    GPU_NAME="$name"   # verify_dlssnr names the GPU when the model will not run
+    case "$GPU_VENDOR" in
+        nvidia)
+            command -v nvidia-smi >/dev/null 2>&1 \
+                || { gpu_fatal "nvidia-smi not found; is the NVIDIA driver installed?"; return 0; }
+            ok "GPU: $GPU_NAME (driver $GPU_DRIVER, compute capability ${GPU_CC:-unknown})"
+            if [[ "$GPU_CC" != "8.9" ]]; then
+                warn "The nvngx_dlssnr.dll this downloads is Ada-patched (sm_89 cubins only)."
+                warn "Compute capability ${GPU_CC:-unknown} is not 8.9 - the model will fail to initialise."
+                warn "On Blackwell (12.0) use the driver's own nvngx_dlssnr.dll instead."
+            fi
+            ;;
+        amd)
+            check_amd
+            ;;
+        intel)
+            warn "GPU: $GPU_NAME"
+            warn "$(engine_refusal optiscaler)"
+            ;;
+        *)
+            gpu_fatal "$(engine_refusal optiscaler)"
+            ;;
+    esac
+}
 
-    if [[ "$cc" != "8.9" ]]; then
-        warn "The nvngx_dlssnr.dll this downloads is Ada-patched (sm_89 cubins only)."
-        warn "Compute capability $cc is not 8.9 - the model will fail to initialise."
-        warn "On Blackwell (12.0) use the driver's own nvngx_dlssnr.dll instead."
+check_amd() {
+    local desc="$GPU_NAME" igpu=""
+    (( GPU_IGPU )) && igpu=", integrated"
+    [[ -n "$GPU_GFX" ]] && desc+=" ($GPU_GFX${GPU_GEN:+, $GPU_GEN}$igpu)"
+
+    if [[ -z "$GPU_GFX" ]]; then
+        warn "GPU: $desc - its gfx target could not be read (no GPU node under /sys/class/kfd matches it; is amdgpu loaded?), so the amd engine's coverage of it is unchecked"
+        warn "Neural rendering on AMD is possible only with the experimental --engine=amd, on RDNA2/3/4."
+    elif ! amd_gfx_covered "$GPU_GFX"; then
+        warn "GPU: $desc"
+        warn "$(engine_refusal amd)"
+        return 0
+    else
+        ok "GPU: $desc"
+        case "$GPU_GEN" in
+            RDNA2)
+                warn "Neural rendering on AMD is possible only with the experimental engine: --engine=amd."
+                warn "On RDNA2 upstream reports a huge performance cost and too many artifacts to enjoy." ;;
+            RDNA4)
+                ok "Neural rendering on AMD is possible only with the experimental engine: --engine=amd"
+                log "Upstream tested on RDNA3; RDNA4 should work but has seen less use." ;;
+            *)
+                ok "Neural rendering on AMD is possible only with the experimental engine: --engine=amd" ;;
+        esac
+    fi
+    (( GPU_IGPU )) && warn "This is an APU's integrated GPU; expect the network to be very slow on it."
+    check_rocm
+}
+
+# launch.sh looks for libamdhip64.so.7 in exactly these places, in this order,
+# unless DLSSNR_HIP_LIB names it. Not finding it here means not finding it there.
+ROCM_LIB=""
+detect_rocm() {
+    ROCM_LIB=""
+    if [[ -n "${DLSSNR_HIP_LIB:-}" ]]; then
+        [[ -e "$DLSSNR_HIP_LIB" ]] && ROCM_LIB="$DLSSNR_HIP_LIB"
+        return 0
+    fi
+    local d
+    for d in /opt/rocm/core/lib /opt/rocm/lib /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu; do
+        if [[ -e "$d/libamdhip64.so.7" ]]; then
+            ROCM_LIB="$d/libamdhip64.so.7"
+            return 0
+        fi
+    done
+}
+
+# Steam runs Proton inside its runtime container (pressure-vessel), which
+# reserves /usr and the /lib folders for itself: the host's are only under
+# /run/host there, and launch.sh asking to show /usr/lib64 is refused. A ROCm
+# installed into them (Fedora's rocm-hip) is found here and very likely not
+# there. Untested on AMD hardware; upstream only ever ran ROCm from /opt/rocm.
+rocm_hidden_in_container() {
+    case "$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")" in
+        /usr/*|/lib/*|/lib32/*|/lib64/*|/bin/*|/sbin/*|/etc/*) return 0 ;;
+    esac
+    return 1
+}
+
+# A warning, never fatal: the files install fine without ROCm, and it can be
+# added afterwards. Without it the plugin's log says "cuInit failed: 801".
+check_rocm() {
+    detect_rocm
+    if [[ -n "$ROCM_LIB" ]] && rocm_hidden_in_container "$ROCM_LIB"; then
+        # One line each: the GUI makes a chip of every line.
+        warn "ROCm 7: $ROCM_LIB - but Steam's runtime container keeps /usr to itself, so a game started by Steam most likely cannot load it (\"cuInit failed: 801\")."
+        warn "Install ROCm 7 from AMD's packages, into /opt/rocm, the layout upstream tested: https://rocm.docs.amd.com/projects/install-on-linux/"
+    elif [[ -n "$ROCM_LIB" ]]; then
+        ok "ROCm 7: $ROCM_LIB"
+        [[ -n "${DLSSNR_HIP_LIB:-}" ]] \
+            && log "Found through DLSSNR_HIP_LIB; the install records it for the launch options."
+    else
+        if [[ -n "${DLSSNR_HIP_LIB:-}" ]]; then
+            warn "DLSSNR_HIP_LIB=$DLSSNR_HIP_LIB does not exist."
+        fi
+        warn "ROCm 7 not found (no libamdhip64.so.7 where launch.sh looks): the amd engine installs, but neural rendering fails to start until it is there."
+        warn "Install ROCm 7 from AMD's packages, into /opt/rocm, the layout upstream tested: https://rocm.docs.amd.com/projects/install-on-linux/ (Fedora's rocm-hip goes into /usr/lib64, which Steam's container cannot see)."
+    fi
+    # Only the real /dev: a fake sysfs has no device node to go with it.
+    if [[ -z "$SYSFS_ROOT" ]]; then
+        if [[ ! -e /dev/kfd ]]; then
+            warn "/dev/kfd is missing: amdgpu's compute interface, which ROCm needs, is not there."
+        elif [[ ! -r /dev/kfd || ! -w /dev/kfd ]]; then
+            warn "No access to /dev/kfd. Add yourself to the render group: sudo usermod -aG render,video \$USER, then log in again."
+        fi
     fi
 }
 
@@ -570,6 +968,11 @@ check_game_preconditions() {
     local dir="$1"
     local has_d3d12=0 has_dlss=0 exe
 
+    if [[ "$ENGINE" == amd ]]; then
+        check_game_amd
+        return 0
+    fi
+
     while IFS= read -r -d '' exe; do
         pe_imports_d3d12 "$exe" && has_d3d12=1
     done < <(find "$dir" -maxdepth 1 -iname '*.exe' -print0 2>/dev/null)
@@ -589,6 +992,34 @@ check_game_preconditions() {
         ok "No DLSS of its own - the feeder engine supplies the DLSS request"
     else
         warn "No nvngx_dlss*.dll found. If the game has no DLSS, the neural pass has nothing to hook - see --engine=feeder."
+    fi
+}
+
+# The amd engine asks less of a game and more of its API: no DLSS needed, any
+# upscaler helps, but its Neural Rendering tab is Direct3D 12 only. Reads the
+# probe_scan main() has just run.
+check_game_amd() {
+    case "$P_API" in
+        d3d12)
+            ok "Game uses Direct3D 12" ;;
+        unknown)
+            warn "Could not tell the game's graphics API. The amd engine is Direct3D 12 only." ;;
+        *)
+            if (( FORCE )); then
+                warn "The amd engine is Direct3D 12 only and this game reads as $P_API - installing anyway (--force)."
+            else
+                die "The amd engine is Direct3D 12 only, and this game reads as $P_API.
+     Override with --force if the probe has the API wrong."
+            fi ;;
+    esac
+    # The upstream README: with an upscaler OptiScaler hands the network the
+    # game's depth and motion vectors; without one it runs on the finished
+    # image, trailing behind motion and enhancing the HUD along with it.
+    if [[ -n "$P_UPSCALERS" ]]; then
+        ok "Game ships an upscaler ($P_UPSCALERS) - turn it on in game; it feeds the network depth and motion vectors"
+    else
+        warn "No upscaler DLL found. The amd engine then runs on the finished image: it trails"
+        warn "behind motion and processes the HUD too. An engine-integrated FSR shows no DLL - turn it on if the game has one."
     fi
 }
 
@@ -851,7 +1282,207 @@ INI
     ok "Wrote ReShade.ini with neural rendering starting off"
 }
 
+# --- Engine: AMD (RedDukeDev/dlss5-nr-amd-custom) ------------------------------
+#
+# NVIDIA's own network on an AMD GPU: OptiScaler built with the dlss5nr plugin
+# hands each frame to a runtime that drives nvngx_dlssnr.dll, whose CUDA runs
+# on ZLUDA, whose HIP calls go through amdhip64_7.dll and a preloaded native
+# bridge to ROCm. Under Proton the bridge needs launch.sh in the launch options.
+#
+# The package's setup_linux.sh is not run - this engine never executes anything
+# from the zip. What it does is replicated here: OptiScaler.dll renamed to the
+# proxy name, linux/amdhip64_7.dll beside the executable (Wine looks for it
+# there, not beside zluda_real.dll). The rest of linux/ - launch.sh, the bridge
+# .so and its README - goes into dlss5nr-linux/ instead of a folder plainly
+# named linux/, which a game could have.
+#
+# Asked by main() before the reinstall question, not by install_amd: answered
+# "no" after a reinstall's uninstall, it would leave nothing installed and the
+# settings snapshot unrestored.
+confirm_amd() {
+    step "dlss5-nr-amd-custom $AMD_VERSION (experimental, AMD)"
+    warn "Experimental, and untested by this script on real AMD hardware."
+    warn "Downloads 365 MB and unpacks ~820 MB into the game folder (347 MB of it a translation cache)."
+    warn "It bundles NVIDIA's leaked nvngx_dlssnr.dll 310.8.0.0, ZLUDA and other closed"
+    warn "binaries, published by a new GitHub account (RedDukeDev). Pinned by SHA-256."
+    warn "Single-player only, never with anti-cheat."
+    if (( ! DRY_RUN )); then
+        confirm "Download and install it?" || die "Cancelled."
+    fi
+}
+
+# Every top-level name it creates is recorded in ours= before anything moves,
+# so even an install that dies halfway uninstalls cleanly. A game file in the
+# way of a name we need is set aside in .dlss5-linux-backup and put back.
+install_amd() {
+    local dir="$1"
+    step "Installing dlss5-nr-amd-custom $AMD_VERSION (experimental, AMD) into $dir"
+
+    # main() offered to uninstall an earlier install first. Declined, its files
+    # would read as the game's below and be "restored" over the game's own.
+    if [[ -f "$dir/$STATE_FILE" ]] && (( ! DRY_RUN )); then
+        die "An earlier install is still in $dir. Run --uninstall first."
+    fi
+    # The whole OptiScaler folder is ours by construction on uninstall, so one
+    # that is already here - a hand-installed OptiScaler - cannot be merged into.
+    # A dry run's reinstall removed nothing, so the earlier install's folders
+    # are still here; they are its own, not a hand-installed OptiScaler.
+    local d
+    for d in OptiScaler "$AMD_LINUX_DIR"; do
+        (( DRY_RUN )) && [[ -f "$dir/$STATE_FILE" ]] && break
+        [[ -e "$dir/$d" ]] && die "$dir/$d already exists and is not from this script (another
+     OptiScaler install?). Remove it first; the amd engine brings its own."
+    done
+
+    if (( ! DRY_RUN )); then
+        local free_kb
+        free_kb=$(df -Pk "$dir" 2>/dev/null | awk 'NR == 2 { print $4 }' || true)
+        if [[ -n "$free_kb" ]] && (( free_kb < 1000000 )); then
+            die "Only $(( free_kb / 1024 )) MB free under $dir; the amd engine needs ~820 MB there."
+        fi
+    fi
+
+    fetch "$AMD_URL" "$CACHE_DIR/$AMD_ZIP"
+    if (( ! DRY_RUN )); then
+        check_sha256 "$CACHE_DIR/$AMD_ZIP" "$AMD_SHA256"
+        stat -c '%s %Y' "$CACHE_DIR/$AMD_ZIP" > "$CACHE_DIR/$AMD_ZIP.sha256-ok" 2>/dev/null || true
+    fi
+
+    if (( DRY_RUN )); then
+        printf '     [dry-run] would unpack %s into %s: %s as %s, OptiScaler/, Licenses/,\n' \
+            "$AMD_ZIP" "$dir" OptiScaler.dll "$HOOK_DLL"
+        printf '     [dry-run] OptiScaler.ini, amdhip64_7.dll, and %s/{launch.sh,libdlss5nr_hip_bridge.so,README.txt}\n' \
+            "$AMD_LINUX_DIR"
+        INSTALLED_HOOKS="$HOOK_DLL"
+        return 0
+    fi
+
+    local stage="$dir/$AMD_STAGE"
+    rm -rf "$stage"
+    # Unpacked beside the game rather than in the cache: the same filesystem, so
+    # the 820 MB is moved into place, never copied twice.
+    trap 'rm -rf "$stage"' EXIT
+    log "Unpacking the package ..."
+    mkdir -p "$stage"
+    unzip -q -o "$CACHE_DIR/$AMD_ZIP" -d "$stage" || die "Could not unpack $AMD_ZIP."
+    local src="$stage/$AMD_TOP" f
+    for f in OptiScaler.dll OptiScaler.ini OptiScaler/dlss5nr/nvngx_dlssnr.dll \
+             linux/amdhip64_7.dll linux/launch.sh linux/libdlss5nr_hip_bridge.so; do
+        [[ -e "$src/$f" ]] || die "The package has no $f - not the release this script pins?"
+    done
+
+    # What to remove later, decided before anything moves. Runtime files that
+    # predate this install (a hand-run OptiScaler's log) are kept by uninstall;
+    # Licenses/ is merged into file by file when the game has one.
+    local ours="OptiScaler.ini,OptiScaler,amdhip64_7.dll,$AMD_LINUX_DIR" keep="" backup="" name
+    local -a names
+    if [[ -d "$dir/Licenses" ]]; then
+        for f in "$src"/Licenses/*; do
+            name=$(basename "$f")
+            [[ -e "$dir/Licenses/$name" ]] || ours+=",Licenses/$name"
+        done
+    else
+        ours+=",Licenses"
+    fi
+    for name in OptiScaler.log DlssOverrides D3D12_OptiScaler dlssnr-capture; do
+        [[ -e "$dir/$name" ]] && keep+="${keep:+,}$name"
+    done
+    if [[ -e "$dir/$BACKUP_DIR" && ! -d "$dir/$BACKUP_DIR" ]]; then
+        die "$dir/$BACKUP_DIR is not a folder; game files could not be set aside there."
+    fi
+    for name in "$HOOK_DLL" OptiScaler.ini amdhip64_7.dll; do
+        [[ -e "$dir/$name" ]] || continue
+        [[ -e "$dir/$BACKUP_DIR/$name" ]] && die "$dir/$BACKUP_DIR/$name already exists - an earlier
+     install's backup of the game's own $name. Put it back by hand first."
+        backup+="${backup:+,}$name"
+    done
+
+    write_state "$dir" amd "$HOOK_DLL" "$ours"
+    printf 'keep=%s\nbackup=%s\npackage=%s\n' "$keep" "$backup" "$AMD_VERSION" >> "$dir/$STATE_FILE"
+    # The launch options carry it from here, not from whatever environment
+    # --launch-options or the GUI happens to run in later.
+    local hip_lib="${DLSSNR_HIP_LIB:-$SAVED_HIP_LIB}"
+    if [[ -n "$hip_lib" && -f "$hip_lib" ]]; then
+        printf 'hip_lib=%s\n' "$hip_lib" >> "$dir/$STATE_FILE"
+    fi
+
+    if [[ -n "$backup" ]]; then
+        mkdir -p "$dir/$BACKUP_DIR"
+        IFS=',' read -r -a names <<< "$backup"
+        for name in "${names[@]}"; do
+            mv "$dir/$name" "$dir/$BACKUP_DIR/$name"
+            warn "Set aside the game's own $name in $BACKUP_DIR (--uninstall puts it back)"
+        done
+    fi
+
+    mv "$src/OptiScaler.dll" "$dir/$HOOK_DLL"
+    mv "$src/OptiScaler.ini" "$dir/OptiScaler.ini"
+    mv "$src/OptiScaler" "$dir/OptiScaler"
+    mv "$src/linux/amdhip64_7.dll" "$dir/amdhip64_7.dll"
+    mkdir "$dir/$AMD_LINUX_DIR"
+    for f in launch.sh libdlss5nr_hip_bridge.so README.txt; do
+        [[ -e "$src/linux/$f" ]] && mv "$src/linux/$f" "$dir/$AMD_LINUX_DIR/$f"
+    done
+    # Steam answers a launcher without its executable bit with exit code 126.
+    chmod +x "$dir/$AMD_LINUX_DIR/launch.sh"
+    # The package's README describes its own layout (linux/launch.sh, its
+    # setup and remove scripts). Say up front where this install differs.
+    if [[ -f "$dir/$AMD_LINUX_DIR/README.txt" ]]; then
+        local readme="$dir/$AMD_LINUX_DIR/README.txt"
+        {
+            cat <<EOF
+NOTE from dlss5-linux.sh: this copy was installed by dlss5-linux.sh, not by
+setup_linux.sh. launch.sh is in this folder (dlss5nr-linux/), not in linux/,
+so the launch option is:
+
+  $(launch_options_line amd "$HOOK_DLL" "$dir")
+
+setup_linux.sh and remove_optiscaler.sh are not here: dlss5-linux.sh
+--uninstall removes all of it. Below is the package's own README.
+
+EOF
+            cat "$readme"
+        } > "$readme.new" && mv "$readme.new" "$readme"
+    fi
+    if [[ ",$ours," == *",Licenses,"* ]]; then
+        mv "$src/Licenses" "$dir/Licenses"
+    else
+        for f in "$src"/Licenses/*; do
+            name=$(basename "$f")
+            [[ ",$ours," == *",Licenses/$name,"* ]] && mv "$f" "$dir/Licenses/$name"
+        done
+    fi
+    rm -rf "$stage"
+    trap - EXIT
+    ok "OptiScaler with dlss5nr installed as $HOOK_DLL, HIP bridge as amdhip64_7.dll"
+    ok "Launcher in $AMD_LINUX_DIR/launch.sh"
+
+    # The coverage that matters is the one now in the game folder.
+    AMD_COVERAGE=$(tr -d '\r' < "$dir/OptiScaler/dlss5nr/cache/ComputeCache/coverage.txt" 2>/dev/null \
+        | sed -n 's/^target[[:space:]]\{1,\}//p' | tr '\n' ' ' || true)
+    AMD_COVERAGE="${AMD_COVERAGE% }"
+    [[ -n "$AMD_COVERAGE" ]] || AMD_COVERAGE="$AMD_COVERAGE_PINNED"
+    if [[ -n "$GPU_GFX" ]] && ! amd_gfx_covered "$GPU_GFX"; then
+        warn "The installed cache covers $AMD_COVERAGE, not $GPU_GFX: the network will report 'failed'."
+    fi
+
+    restore_settings "$dir"
+    INSTALLED_HOOKS="$HOOK_DLL"
+}
+
 # --- Shared helpers -----------------------------------------------------------
+
+# A pinned download that does not match is deleted, so the next run fetches it
+# again instead of failing on the same bad file forever.
+check_sha256() {
+    local f="$1" want="$2" sum
+    sum=$(sha256sum "$f" | cut -d' ' -f1)
+    if [[ "$sum" != "$want" ]]; then
+        rm -f "$f"
+        die "$(basename "$f") does not match its pinned SHA-256 ($sum, expected $want). Deleted; try again."
+    fi
+    ok "$(basename "$f") matches its pinned SHA-256"
+}
 
 # Confirms the downloaded model really is the Ada-patched build before the user
 # spends an hour wondering why the overlay says "the model would not initialise".
@@ -879,7 +1510,9 @@ verify_dlssnr() {
 # hook= is the proxy DLL, or for the feeder engine a comma list of both
 # (ReShade's and OptiScaler's): uninstall removes every one and the launch
 # options override every one. ours= lists extra top-level files that engine
-# put down and that a game might otherwise ship itself.
+# put down and that a game might otherwise ship itself; for the amd engine it
+# is everything it put down, folders included, and install_amd adds keep=
+# (runtime files that predate it), backup= (game files set aside) and package=.
 write_state() {
     (( DRY_RUN )) && return 0
     printf 'engine=%s\nhook=%s\ninstalled=%s\n' \
@@ -898,19 +1531,68 @@ dll_overrides() {
     printf '%s' "$out"
 }
 
+# A path inside the double quotes of a Steam launch option: Steam hands the
+# line to a shell, so \ " $ and ` would otherwise be read rather than kept.
+shell_dquote() {
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//\$/\\\$}"; s="${s//\`/\\\`}"
+    printf '"%s"' "$s"
+}
+
+# The environment an engine needs, as NAME=VALUE lines. One source for the
+# printed options and for --launch-options (the web GUI mirrors it in Python:
+# launch_env there). The amd engine also needs its wrapper in front of the
+# game: launch_options_line and do_launch_options add that.
+launch_env() {
+    local engine="$1" hooks="$2" dir="${3:-}" overrides hip=""
+    overrides=$(dll_overrides "$hooks")
+    if [[ "$engine" == amd ]]; then
+        # Nothing NVIDIA here: launch.sh sets PROTON_DISABLE_NVAPI=1 and
+        # nvcuda=n itself, and PROTON_ENABLE_NVAPI=1 would put Wine's nvcuda
+        # back in front of the plugin's.
+        printf 'WINEDLLOVERRIDES=%s\n' "$overrides"
+        # launch.sh honours DLSSNR_HIP_LIB only if Steam hands it over. The
+        # install recorded it; a library since removed is left out.
+        [[ -n "$dir" && -f "$dir/$STATE_FILE" ]] \
+            && hip=$(grep '^hip_lib=' "$dir/$STATE_FILE" | cut -d= -f2- || true)
+        [[ -n "$hip" && -f "$hip" ]] && printf 'DLSSNR_HIP_LIB=%s\n' "$hip"
+        return 0
+    fi
+    # The feeder engine's ReShade needs Microsoft's compiler, not Wine's.
+    [[ "$engine" == feeder ]] && overrides+=";d3dcompiler_47=n,b"
+    printf '%s\n' "WINEDLLOVERRIDES=$overrides" PROTON_ENABLE_NVAPI=1 PROTON_ENABLE_NGX_UPDATER=1 \
+        VKD3D_CONFIG=dxr11 PROTON_HIDE_NVIDIA_GPU=0
+}
+
+# The one-line Steam launch option for an engine's install in $3.
+launch_options_line() {
+    local engine="$1" hooks="$2" dir="$3" line="" kv
+    while IFS= read -r kv; do
+        [[ -n "$kv" ]] || continue
+        case "${kv%%=*}" in
+            WINEDLLOVERRIDES|DLSSNR_HIP_LIB) line+="${kv%%=*}=$(shell_dquote "${kv#*=}") " ;;
+            *) line+="$kv " ;;
+        esac
+    done < <(launch_env "$engine" "$hooks" "$dir")
+    [[ "$engine" == amd ]] && line+="$(shell_dquote "$dir/$AMD_LINUX_DIR/launch.sh") "
+    printf '%s%%command%%' "$line"
+}
+
 print_launch_options() {
     local hooks="${INSTALLED_HOOKS:-$HOOK_DLL}"
-    local hook="${hooks//.dll/}" overrides
-    overrides=$(dll_overrides "$hooks")
-    # The feeder engine's ReShade needs Microsoft's compiler, not Wine's.
-    [[ "$ENGINE" == feeder ]] && overrides+=";d3dcompiler_47=n,b"
+    local hook="${hooks//.dll/}"
+
+    if [[ "$ENGINE" == amd ]]; then
+        print_launch_options_amd "$hooks"
+        return 0
+    fi
 
     step "Steam launch options"
     cat <<EOF
 
 Set these under the game's Properties > General > Launch Options:
 
-  ${C_BLD}WINEDLLOVERRIDES="${overrides}" PROTON_ENABLE_NVAPI=1 PROTON_ENABLE_NGX_UPDATER=1 VKD3D_CONFIG=dxr11 PROTON_HIDE_NVIDIA_GPU=0 %command%${C_RST}
+  ${C_BLD}$(launch_options_line "$ENGINE" "$hooks" "$GAME_DIR")${C_RST}
 
 What each one does:
   WINEDLLOVERRIDES  load '${hook}' (our proxy DLL) before the builtin. Required.
@@ -949,6 +1631,134 @@ EOF
     fi
 }
 
+print_launch_options_amd() {
+    local hook="${1//.dll/}"
+    step "Steam launch options"
+    cat <<EOF
+
+Set these under the game's Properties > General > Launch Options:
+
+  ${C_BLD}$(launch_options_line amd "$1" "$GAME_DIR")${C_RST}
+
+What each part does:
+  WINEDLLOVERRIDES  load '${hook}' (OptiScaler with dlss5nr) before the builtin. Required.
+  launch.sh         RedDukeDev's wrapper: preloads the HIP bridge, finds ROCm's
+                    libamdhip64.so.7 and shows it to Steam's container, and sets
+                    PROTON_DISABLE_NVAPI=1 and nvcuda=n so the plugin's CUDA
+                    driver (ZLUDA) is the one loaded. Do not add
+                    PROTON_ENABLE_NVAPI=1: it swaps Wine's nvcuda back in.
+
+Also set Compatibility to a modern Proton. Upstream tested GE-Proton11-7 and
+Proton Experimental.
+
+Neural rendering starts as OptiScaler.ini says ([NeuralRendering] Enabled):
+--configure --nr=on, or the checkbox in dlss5-gui.py. There is no toggle key on
+this engine. The overlay (Insert) is off by default - on some Proton versions it
+turns the screen black. Want it anyway: --configure --overlay=on, then the
+Neural Rendering tab. The network loads from the shipped cache a few seconds
+after start; the game runs without the effect meanwhile.
+Its log: OptiScaler/dlss5nr/cache/dlss5nr.log beside the game's executable.
+A reinstall keeps every setting you changed in OptiScaler.ini.
+EOF
+}
+
+# Prints the launch options of the install in --game-dir, alone, or with
+# --json everything a launcher needs to start the game the same way.
+do_launch_options() {
+    local dir="$1" engine hooks
+    [[ -f "$dir/$STATE_FILE" ]] || dir="$(resolve_game_dir "$dir" 2>/dev/null)"
+    [[ -f "$dir/$STATE_FILE" ]] || die "No install by this script in $dir"
+    engine=$(grep '^engine=' "$dir/$STATE_FILE" | cut -d= -f2 || true)
+    hooks=$(grep '^hook=' "$dir/$STATE_FILE" | cut -d= -f2 || true)
+    [[ -n "$engine" && -n "$hooks" ]] || die "$dir/$STATE_FILE names no engine or hook."
+
+    local line env wrapper=""
+    line=$(launch_options_line "$engine" "$hooks" "$dir")
+    if (( ! JSON_OUT )); then
+        printf '%s\n' "$line"
+        return 0
+    fi
+    env=$(launch_env "$engine" "$hooks" "$dir")
+    [[ "$engine" == amd ]] && wrapper="$dir/$AMD_LINUX_DIR/launch.sh"
+    python3 - "$dir" "$engine" "$hooks" "$line" "$wrapper" "$env" <<'PY'
+import json, sys
+d, engine, hooks, line, wrapper, env = sys.argv[1:7]
+print(json.dumps({
+    "dir":     d,
+    "engine":  engine,
+    "hook":    hooks,
+    "options": line,
+    "env":     dict(kv.split("=", 1) for kv in env.splitlines() if "=" in kv),
+    "wrapper": wrapper or None,
+}, indent=2))
+PY
+}
+
+# The amd engine removes exactly what its state file lists, and puts back what
+# it set aside. The shared list in do_uninstall is not used: it names files
+# (ReShade.ini, setup_linux.sh, ...) this engine never wrote, and a game or
+# the user's own mods could have.
+uninstall_amd() {
+    local dir="$1" hook="$2" ours keep backup
+    ours=$(grep '^ours=' "$dir/$STATE_FILE" | cut -d= -f2- || true)
+    keep=$(grep '^keep=' "$dir/$STATE_FILE" | cut -d= -f2- || true)
+    backup=$(grep '^backup=' "$dir/$STATE_FILE" | cut -d= -f2- || true)
+
+    local -a targets=() list=()
+    IFS=',' read -r -a list <<< "$hook";  targets+=("${list[@]}")
+    IFS=',' read -r -a list <<< "$ours";  targets+=("${list[@]}")
+    # What OptiScaler and the plugin write at run time, unless it predates us.
+    local t
+    for t in OptiScaler.log DlssOverrides D3D12_OptiScaler dlssnr-capture; do
+        [[ ",$keep," == *",$t,"* ]] || targets+=("$t")
+    done
+    targets+=("$AMD_STAGE")
+
+    local removed=0
+    for t in "${targets[@]}"; do
+        [[ -n "$t" ]] || continue
+        # A state file is plain text in a game folder. Nothing in it may name a
+        # path outside the folder, or the folder itself.
+        if [[ "$t" == /* || "$t" == *..* || "$t" == . ]]; then
+            warn "Ignoring unsafe entry '$t' in $STATE_FILE"
+            continue
+        fi
+        # Listed as set aside but not in the backup: the install died before
+        # moving it, so the file there is still the game's own.
+        if [[ ",$backup," == *",$t,"* && ! -e "$dir/$BACKUP_DIR/$t" ]]; then
+            warn "Keeping $t: the install never set it aside, so it is still the game's."
+            continue
+        fi
+        if [[ -e "$dir/$t" || -L "$dir/$t" ]]; then
+            run rm -rf "${dir:?}/$t"
+            (( ++removed ))
+        fi
+    done
+
+    local restored=0
+    IFS=',' read -r -a list <<< "$backup"
+    for t in "${list[@]}"; do
+        [[ -n "$t" && "$t" != */* && "$t" != *..* ]] || continue
+        if [[ -e "$dir/$BACKUP_DIR/$t" ]]; then
+            run mv -f "$dir/$BACKUP_DIR/$t" "$dir/$t"
+            (( ++restored ))
+        fi
+    done
+    if [[ -d "$dir/$BACKUP_DIR" ]] && (( ! DRY_RUN )); then
+        rmdir "$dir/$BACKUP_DIR" 2>/dev/null \
+            || warn "$BACKUP_DIR is not empty; left it in place."
+    fi
+    run rm -f "$dir/$STATE_FILE"
+
+    if (( DRY_RUN )); then
+        ok "Would remove $removed items and put back $restored."
+    elif (( restored )); then
+        ok "Removed $removed items and put back $restored of the game's own. Clear the Steam launch options too."
+    else
+        ok "Removed $removed items. Clear the Steam launch options too."
+    fi
+}
+
 do_uninstall() {
     local dir="$1"
     step "Uninstalling from $dir"
@@ -965,6 +1775,11 @@ do_uninstall() {
      the proxy DLL by hand."
         log "State file says the proxy is $hook"
         engine=$(grep '^engine=' "$dir/$STATE_FILE" | cut -d= -f2 || true)
+    fi
+
+    if [[ "$engine" == amd ]]; then
+        uninstall_amd "$dir" "$hook"
+        return 0
     fi
 
     # Only names an engine of ours actually writes to the top level, which is
@@ -1126,15 +1941,39 @@ PY
 # user moved off "auto" before anything is touched - before the pre-install
 # uninstall too, which deletes the file - and the engines write it back here.
 SAVED_INI=""
+SAVED_ENGINE=""
+SAVED_HIP_LIB=""
 snapshot_settings() {
     local ini="$1/OptiScaler.ini"
+    # The ROCm path an earlier amd install recorded, kept for a reinstall that
+    # runs without DLSSNR_HIP_LIB set (the GUI's does).
+    SAVED_HIP_LIB=$(grep '^hip_lib=' "$1/$STATE_FILE" 2>/dev/null | cut -d= -f2- || true)
     [[ -f "$ini" ]] && (( ! DRY_RUN )) || return 0
     SAVED_INI="$(mktemp)"
     ini_snapshot "$ini" > "$SAVED_INI"
+    SAVED_ENGINE=$(grep '^engine=' "$1/$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
+}
+
+# The amd engine's OptiScaler fork switches the pass in [NeuralRendering], the
+# others in [DlssNr]. A snapshot from the other side of a GPU swap has its
+# switch renamed, and the upscaler it chose dropped where the new GPU cannot
+# run it: dlss on AMD, and on NVIDIA anything the amd install picked, so the
+# forced dlss in main() applies again.
+remap_settings() {
+    local to=nvidia
+    [[ "$ENGINE" == amd ]] && to=amd
+    [[ "$to" == amd || "$SAVED_ENGINE" == amd ]] || return 0
+    awk -F'\t' -v OFS='\t' -v to="$to" '
+        to == "amd" && $1 == "DlssNr" && $2 == "Enabled" { $1 = "NeuralRendering" }
+        to == "amd" && $1 == "Upscalers" && $2 == "Dx12Upscaler" && tolower($3) == "dlss" { next }
+        to != "amd" && $1 == "NeuralRendering" && $2 == "Enabled" { $1 = "DlssNr" }
+        to != "amd" && $1 == "Upscalers" && $2 == "Dx12Upscaler" && tolower($3) != "dlss" { next }
+        { print }' "$SAVED_INI" > "$SAVED_INI.$to" && mv "$SAVED_INI.$to" "$SAVED_INI"
 }
 
 restore_settings() {
     [[ -n "$SAVED_INI" && -f "$SAVED_INI" && -f "$1/OptiScaler.ini" ]] || return 0
+    remap_settings
     ini_restore "$1/OptiScaler.ini" "$SAVED_INI"
     rm -f "$SAVED_INI"
     SAVED_INI=""
@@ -1145,7 +1984,9 @@ ini_restore() {
     local ini="$1" saved="$2" section key value count=0
     while IFS=$'\t' read -r section key value; do
         [[ -n "$key" ]] || continue
-        if ini_set "$ini" "$section" "$key" "$value" >/dev/null; then
+        # 2>/dev/null: after a switch of engine, sections the other engine's
+        # ini had and this one lacks are expected misses, not news.
+        if ini_set "$ini" "$section" "$key" "$value" >/dev/null 2>&1; then
             PRESERVED+="$section.$key "
             count=$(( count + 1 ))
         fi
@@ -1175,9 +2016,15 @@ apply_ini_settings() {
         die "No OptiScaler.ini in $dir - install the optiscaler engine first."
     fi
 
+    # The amd engine's OptiScaler reads the switch from [NeuralRendering] and
+    # has no toggle key; the others read both from [DlssNr].
+    local engine nr_section=DlssNr
+    engine=$(grep '^engine=' "$dir/$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
+    [[ "${engine:-$ENGINE}" == amd ]] && nr_section=NeuralRendering
+
     local rc=0
     if [[ -n "$NR_SET" ]]; then
-        ini_set "$ini" DlssNr Enabled "$NR_SET" || rc=1
+        ini_set "$ini" "$nr_section" Enabled "$NR_SET" || rc=1
     fi
     if [[ -n "$UPSCALER" ]]; then
         # OptiScaler falls back to XeSS whenever it decides the GPU cannot do
@@ -1189,7 +2036,12 @@ apply_ini_settings() {
         ini_set "$ini" Menu OverlayMenu "$OVERLAY_SET" || rc=1
     fi
     if [[ -n "$TOGGLE_KEY" ]]; then
-        ini_set "$ini" DlssNr ToggleKey "$TOGGLE_KEY" || rc=1
+        if [[ "$nr_section" == NeuralRendering ]]; then
+            warn "The amd engine has no neural rendering toggle key; --toggle-key not applied."
+            rc=1
+        else
+            ini_set "$ini" DlssNr ToggleKey "$TOGGLE_KEY" || rc=1
+        fi
     fi
     return $rc
 }
@@ -1203,6 +2055,7 @@ apply_ini_settings() {
 
 P_DIR=""; P_EXE=""; P_API="unknown"; P_UPSCALERS=""; P_ANTICHEAT=""
 P_ENGINE=""; P_HOOK=""; P_VERDICT=""; P_HINT=""
+P_NV_VERDICT=""; P_ENGINE_HINT=""
 declare -a P_REASONS=()
 
 # Import tables are the reliable signal, but plenty of modern titles resolve
@@ -1270,7 +2123,20 @@ detect_api_for() {
 # Two things decide it - which directory the file is in, and which engine the
 # state file says was installed.
 installed_by_us() {
-    local path="$1" dir base engine owned=0
+    local path="$1" dir base engine owned=0 up i
+
+    # The amd engine's OptiScaler folder nests deeper than one level
+    # (OptiScaler/dlss5nr/nvngx_dlssnr.dll, .../dlss5nr/zluda/nvngx.dll), and
+    # the peeling below stops at the first folder it does not know. Anything
+    # anywhere under an OptiScaler folder that sits beside a state file is ours.
+    up=$(dirname "$path")
+    for (( i = 0; i < 6; i++ )); do
+        if [[ "$(basename "$up")" == OptiScaler && -f "$(dirname "$up")/$STATE_FILE" ]]; then
+            return 0
+        fi
+        [[ "$up" == / ]] && break
+        up=$(dirname "$up")
+    done
 
     dir=$(dirname "$path")
     # Directories the package creates itself. Anything inside one is ours by
@@ -1278,7 +2144,8 @@ installed_by_us() {
     # Peeling them also gets back to the directory the state file sits in.
     while :; do
         case "$(basename "$dir")" in
-            Licenses|OptiScaler|D3D12_OptiScaler|DlssOverrides|dlssnr-capture)
+            Licenses|OptiScaler|D3D12_OptiScaler|DlssOverrides|dlssnr-capture|\
+            "$AMD_LINUX_DIR"|"$AMD_STAGE"|"$AMD_TOP")
                 owned=1; dir=$(dirname "$dir") ;;
             *) break ;;
         esac
@@ -1437,7 +2304,81 @@ probe_scan() {
     probe_verdict
 }
 
+# The verdict for this machine. probe_game_verdict answers for the NVIDIA
+# engines, which is what every verdict meant before other GPUs were looked at;
+# on any other GPU that answer is kept as nvidia_verdict and replaced by one
+# for the engine this GPU can actually run, if any.
 probe_verdict() {
+    local scan_reasons=${#P_REASONS[@]}
+    probe_game_verdict
+    P_NV_VERDICT="$P_VERDICT"
+    P_ENGINE_HINT=""
+
+    detect_gpu
+    if [[ "$GPU_VENDOR" == nvidia ]]; then
+        case "$P_VERDICT" in
+            supported|partial|unknown) P_ENGINE_HINT=optiscaler ;;
+            feeder)                    P_ENGINE_HINT=feeder ;;
+        esac
+        return 0
+    fi
+
+    # The game-verdict reasons speak of NVIDIA engines; keep only what the
+    # scan itself found (a dxgi.dll in the way, an empty folder, ...).
+    P_REASONS=("${P_REASONS[@]:0:scan_reasons}")
+    if [[ "$P_VERDICT" == blocked ]]; then
+        P_REASONS+=("Anti-cheat present ($P_ANTICHEAT). Injecting a proxy DLL risks a ban.")
+        return 0
+    fi
+    if [[ "$P_API" == native ]]; then
+        P_VERDICT="unsupported"
+        P_REASONS+=("This is a native Linux build - there is no Windows executable to inject a proxy DLL into.")
+        return 0
+    fi
+
+    local why
+    why=$(engine_refusal amd)
+    if [[ -n "$why" ]]; then
+        P_VERDICT="unsupported"
+        if [[ "$GPU_VENDOR" == amd ]]; then
+            P_REASONS+=("$why")
+        else
+            P_REASONS+=("$(engine_refusal optiscaler)")
+        fi
+        return 0
+    fi
+
+    case "$P_API" in
+        d3d12)
+            P_VERDICT="amd"; P_ENGINE_HINT=amd
+            if [[ -n "$P_UPSCALERS" ]]; then
+                P_REASONS+=("D3D12 with $P_UPSCALERS - the experimental amd engine can run here. Turn the game's upscaler on: it hands the network depth and motion vectors.")
+            else
+                P_REASONS+=("D3D12, no upscaler DLL found - the experimental amd engine still runs, on the finished image: it trails behind motion and processes the HUD too. An engine-integrated FSR shows no DLL; turn it on if the game has one.")
+            fi
+            if [[ "$GPU_GEN" == RDNA2 ]]; then
+                P_REASONS+=("On RDNA2 upstream reports a huge performance cost and too many artifacts to enjoy.")
+            fi
+            ;;
+        unknown)
+            # With an upscaler DLL it is very likely a modern D3D12 game the
+            # scan could not read; with none, as on NVIDIA, most likely not.
+            if [[ -n "$P_UPSCALERS" ]]; then
+                P_VERDICT="unknown"; P_ENGINE_HINT=amd
+                P_REASONS+=("Could not determine the graphics API, but it ships $P_UPSCALERS. The amd engine is Direct3D 12 only - install with --engine=amd and see.")
+            else
+                P_VERDICT="unsupported"
+                P_REASONS+=("Could not determine the graphics API, and no upscaler DLL was found: most likely not a Direct3D 12 game, which the amd engine needs. If you know it is one, installing anyway may work.")
+            fi
+            ;;
+        *)
+            P_VERDICT="unsupported"
+            P_REASONS+=("The amd engine is Direct3D 12 only, and this game is $P_API.")
+            ;;
+    esac
+}
+
+probe_game_verdict() {
     if [[ -n "$P_ANTICHEAT" ]]; then
         P_VERDICT="blocked"
         P_REASONS+=("Anti-cheat present ($P_ANTICHEAT). Injecting a proxy DLL risks a ban.")
@@ -1491,6 +2432,7 @@ probe_report_text() {
         supported)   badge="${C_GRN}SUPPORTED${C_RST}" ;;
         partial)     badge="${C_YEL}PARTIAL${C_RST}" ;;
         feeder)      badge="${C_YEL}FEEDER (no DLSS - use --engine=feeder)${C_RST}" ;;
+        amd)         badge="${C_YEL}AMD (experimental - use --engine=amd)${C_RST}" ;;
         blocked)     badge="${C_RED}BLOCKED${C_RST}" ;;
         unsupported) badge="${C_RED}UNSUPPORTED${C_RST}" ;;
         *)           badge="${C_YEL}UNKNOWN${C_RST}" ;;
@@ -1508,6 +2450,9 @@ probe_report_text() {
         printf '  installed  no\n'
     fi
     printf '  hook       %s\n' "$P_HINT"
+    printf '  gpu        %s\n' "$(gpu_summary)"
+    printf '  engine     %s\n' "${P_ENGINE_HINT:-none}"
+    [[ "$P_NV_VERDICT" != "$P_VERDICT" ]] && printf '  on NVIDIA  %s\n' "$P_NV_VERDICT"
 
     printf '\n'
     local r
@@ -1519,20 +2464,60 @@ probe_report_text() {
 
 probe_report_json() {
     python3 - "$P_DIR" "$P_EXE" "$P_API" "$P_UPSCALERS" "$P_ANTICHEAT" \
-                "$P_ENGINE" "$P_HOOK" "$P_VERDICT" "$P_HINT" "${P_REASONS[@]}" <<'PY'
+                "$P_ENGINE" "$P_HOOK" "$P_VERDICT" "$P_HINT" \
+                "$P_NV_VERDICT" "$P_ENGINE_HINT" "$(gpu_json)" "${P_REASONS[@]}" <<'PY'
 import json, sys
 a = sys.argv[1:]
 print(json.dumps({
-    "dir":        a[0],
-    "executable": a[1] or None,
-    "api":        a[2],
-    "upscalers":  a[3].split() if a[3] else [],
-    "anticheat":  a[4].split(",") if a[4] else [],
-    "installed":  {"engine": a[5], "hook": a[6]} if a[5] else None,
-    "verdict":    a[7],
-    "hook":       a[8],
-    "reasons":    a[9:],
+    "dir":            a[0],
+    "executable":     a[1] or None,
+    "api":            a[2],
+    "upscalers":      a[3].split() if a[3] else [],
+    "anticheat":      a[4].split(",") if a[4] else [],
+    "installed":      {"engine": a[5], "hook": a[6]} if a[5] else None,
+    "verdict":        a[7],
+    "hook":           a[8],
+    "nvidia_verdict": a[9],
+    "engine_hint":    a[10] or None,
+    "gpu":            json.loads(a[11]),
+    "reasons":        a[12:],
 }, indent=2))
+PY
+}
+
+# "AMD Radeon RX 7900 XTX (gfx1100, RDNA3)" - one line for the reports.
+gpu_summary() {
+    detect_gpu
+    local out="${GPU_NAME:-none found}"
+    [[ -n "$GPU_GFX" ]] && out+=" ($GPU_GFX${GPU_GEN:+, $GPU_GEN})"
+    printf '%s' "$out"
+}
+
+# The GPU as JSON, shared by --probe --json and --check --json.
+gpu_json() {
+    detect_gpu
+    python3 - "$GPU_VENDOR" "$GPU_NAME" "$GPU_ID" "$GPU_GFX" "$GPU_GEN" "$GPU_IGPU" \
+              "$GPU_DRIVER" "$GPU_CC" "$(gpu_engines)" "$AMD_COVERAGE" "${GPU_ALL[@]}" <<'PY'
+import json, sys
+a = sys.argv[1:]
+gpus = []
+for g in a[10:]:
+    vendor, name, pci, gfx, igpu = (g.split("|") + [""] * 5)[:5]
+    gpus.append({"vendor": vendor, "name": name, "id": pci or None,
+                 "gfx": gfx or None, "integrated": igpu == "1"})
+print(json.dumps({
+    "vendor":     a[0],
+    "name":       a[1] or None,
+    "id":         a[2] or None,
+    "gfx":        a[3] or None,
+    "generation": a[4] or None,
+    "integrated": a[5] == "1",
+    "driver":     a[6] or None,
+    "compute_cap": a[7] or None,
+    "engines":    a[8].split(),
+    "coverage":   a[9].split() if a[0] == "amd" else None,
+    "all":        gpus,
+}))
 PY
 }
 
@@ -1547,6 +2532,79 @@ do_probe() {
     fi
 }
 
+# The preflight as JSON: the GPU, what it can run, ROCm on AMD, and the same
+# ok/warn/err lines the text form prints, for the GUI's chips. Exits non-zero
+# exactly when the text form would die.
+check_json() {
+    C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_BLD=""; C_RST=""
+    detect_gpu
+    detect_rocm
+    local out rc=0
+    out=$( {
+        check_gpu
+        [[ "$GPU_VENDOR" == nvidia ]] && check_ngx_bridge
+        check_proton
+    } 2>&1 ) || rc=$?
+
+    local -a refusals=()
+    local e
+    for e in optiscaler reshade feeder amd; do
+        refusals+=("$e" "$(engine_refusal "$e")")
+    done
+    local seen=0
+    [[ -n "$ROCM_LIB" ]] && ! rocm_hidden_in_container "$ROCM_LIB" && seen=1
+    python3 - "$rc" "$VERSION" "$(gpu_json)" "$GPU_VENDOR" "$ROCM_LIB" "$seen" "$out" "${refusals[@]}" <<'PY'
+import json, sys
+rc, version, gpu, vendor, rocm, rocm_seen, out = sys.argv[1:8]
+pairs = sys.argv[8:]
+lines = []
+for raw in out.splitlines():
+    if not raw.strip():
+        continue
+    # die() continues a message on lines indented five spaces.
+    if raw.startswith("     ") and lines:
+        lines[-1]["text"] += " " + raw.strip()
+        continue
+    text = raw.lstrip(" ")
+    for marker, kind in (("ok ", "ok"), ("warn ", "warn"), ("err ", "bad"), ("==> ", "info")):
+        if text.startswith(marker):
+            lines.append({"kind": kind, "text": text[len(marker):]})
+            break
+    else:
+        lines.append({"kind": "info", "text": text})
+print(json.dumps({
+    "ok":      rc == "0",
+    "version": version,
+    "gpu":     json.loads(gpu),
+    "rocm":    {"found": bool(rocm), "path": rocm or None, "package": "rocm-hip",
+                "container_visible": rocm_seen == "1"}
+               if vendor == "amd" else None,
+    "engines": {pairs[i]: {"ok": not pairs[i + 1], "reason": pairs[i + 1] or None}
+                for i in range(0, len(pairs), 2)},
+    "lines":   lines,
+}, indent=2))
+PY
+    return "$rc"
+}
+
+# An install refuses an engine the GPU cannot run, before anything is fetched:
+# the NVIDIA engines need NGX, which no other vendor's driver has, and the amd
+# engine needs an AMD GPU its translation cache covers. --force overrides, for
+# a detection that has it wrong.
+gate_engine_gpu() {
+    local why
+    why=$(engine_refusal "$ENGINE")
+    [[ -z "$why" ]] && return 0
+    (( ENGINE_SET )) || why="No --engine given, so the default ($ENGINE) was checked. $why"
+    if (( FORCE )); then
+        warn "$why"
+        warn "--force: installing the $ENGINE engine anyway."
+        return 0
+    fi
+    die "$why
+     Override with --force only if the GPU detection is wrong."
+}
+
 # --- Main ---------------------------------------------------------------------
 
 main() {
@@ -1557,6 +2615,19 @@ main() {
         [[ -n "$GAME_DIR" ]] || die "--probe needs --game-dir"
         GAME_DIR="$(cd "$GAME_DIR" 2>/dev/null && pwd)" || die "Cannot resolve --game-dir"
         do_probe "$GAME_DIR"
+        exit 0
+    fi
+
+    if (( CHECK_ONLY && JSON_OUT )); then
+        check_json || exit 1
+        exit 0
+    fi
+
+    if (( DO_LAUNCH_OPTS )); then
+        (( JSON_OUT )) && { C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_BLD=""; C_RST=""; }
+        [[ -n "$GAME_DIR" ]] || die "--launch-options needs --game-dir"
+        GAME_DIR="$(cd "$GAME_DIR" 2>/dev/null && pwd)" || die "Cannot resolve --game-dir"
+        do_launch_options "$GAME_DIR"
         exit 0
     fi
 
@@ -1573,7 +2644,7 @@ main() {
 
     step "Preflight"
     check_gpu
-    check_ngx_bridge
+    [[ "$GPU_VENDOR" == nvidia ]] && check_ngx_bridge
     check_proton
 
     if (( CHECK_ONLY )); then
@@ -1601,6 +2672,8 @@ main() {
         exit 0
     fi
 
+    gate_engine_gpu
+
     step "Resolving game directory"
     local game_root="$GAME_DIR"
     GAME_DIR="$(resolve_game_dir "$GAME_DIR")"
@@ -1621,6 +2694,8 @@ main() {
 
     check_game_preconditions "$GAME_DIR"
 
+    [[ "$ENGINE" == amd ]] && confirm_amd
+
     snapshot_settings "$GAME_DIR"
 
     if [[ -f "$GAME_DIR/$STATE_FILE" ]]; then
@@ -1632,6 +2707,7 @@ main() {
         optiscaler) install_optiscaler "$GAME_DIR" ;;
         reshade)    install_reshade "$GAME_DIR" ;;
         feeder)     install_feeder "$GAME_DIR" ;;
+        amd)        install_amd "$GAME_DIR" ;;
     esac
 
     # OptiScaler decides what the GPU can do by probing NVAPI while it loads,
@@ -1644,7 +2720,7 @@ main() {
     # into the ini at install time instead. Only when the user did not ask for
     # a specific upscaler, and only on NVIDIA, where dlss is the right answer.
     if [[ -z "$UPSCALER" && "$PRESERVED" != *" Upscalers.Dx12Upscaler "* ]] \
-       && [[ "$GPU_NAME" == *NVIDIA* || "$GPU_NAME" == *GeForce* ]]; then
+       && [[ "$GPU_VENDOR" == nvidia ]]; then
         UPSCALER="dlss"
         log "Forcing Dx12Upscaler=dlss (NVAPI is probed too early under Proton to detect it)"
     fi
@@ -1655,7 +2731,9 @@ main() {
     # Dragon Gaiden on a black window; with the menu off the same controller
     # connected mid-game without trouble. Nothing the neural pass needs lives in
     # the menu - [DlssNr] and the upscaler are ini settings the GUI writes - so
-    # a fresh install leaves it off unless --overlay=on asks otherwise.
+    # a fresh install leaves it off unless --overlay=on asks otherwise. The amd
+    # engine has a reason of its own: upstream saw the Vulkan-drawn menu turn
+    # the screen black under GE-Proton11-7.
     if [[ "$ENGINE" != reshade && -z "$OVERLAY_SET" && "$PRESERVED" != *" Menu.OverlayMenu "* ]]; then
         OVERLAY_SET="false"
         log "Disabling the OptiScaler overlay menu (--overlay=on to keep it)"
@@ -1664,7 +2742,9 @@ main() {
     # With the overlay off, this key is the only way to switch the pass in game.
     # It works without the menu: F9 toggled it in Like a Dragon Gaiden with
     # OverlayMenu=false, once the key sat in [DlssNr] where OptiScaler reads it.
-    if [[ "$ENGINE" != reshade && -z "$TOGGLE_KEY" && "$PRESERVED" != *" DlssNr.ToggleKey "* ]]; then
+    # The amd engine's OptiScaler has no such key.
+    if [[ ( "$ENGINE" == optiscaler || "$ENGINE" == feeder ) && -z "$TOGGLE_KEY" \
+          && "$PRESERVED" != *" DlssNr.ToggleKey "* ]]; then
         TOGGLE_KEY="0x78"
         log "Binding F9 to switch neural rendering in game (--toggle-key to change)"
     fi

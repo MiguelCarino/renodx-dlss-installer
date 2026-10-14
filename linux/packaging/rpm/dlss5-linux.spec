@@ -109,6 +109,10 @@ python3 -c 'import sys; [compile(open(f).read(), f, "exec") for f in sys.argv[1:
 %{_metainfodir}/%{app_id}.metainfo.xml
 
 %changelog
+* Wed Oct 14 2026 MiguelCarino <miguel.carino1994@outlook.com> - 0.0.2-1
+- Detect the GPU vendor from sysfs; clear messages on AMD and Intel.
+- Experimental AMD engine (--engine=amd) using RedDukeDev/dlss5-nr-amd-custom.
+
 * Wed Oct 14 2026 MiguelCarino <miguel.carino1994@outlook.com> - 0.0.1-1
 - First package: CLI (dlss5-linux), native desktop app (dlss5-linux-gui),
   desktop entry, icon and AppStream metadata.

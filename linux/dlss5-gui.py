@@ -496,6 +496,33 @@ def probe(path):
 
 
 def preflight():
+    """The script's --check, as chips, plus what the GPU can run.
+
+    --check --json carries the same lines as the text form, and with them the
+    detected GPU, ROCm on AMD and which engines this GPU can install - which
+    the engine selector needs. The text parse below is the fallback for a
+    script that answers without JSON, so the chips never go missing.
+    """
+    try:
+        rc, out, err = run_script(["--check", "--json"], timeout=60)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "lines": [{"kind": "bad", "text": "Preflight timed out."}]}
+
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("lines"), list):
+        ok = rc == 0 and bool(data.get("ok"))
+        return {
+            "ok": ok,
+            # The text form ends on this line, and the JSON form leaves it out.
+            "lines": data["lines"] + ([{"kind": "ok", "text": "Preflight complete."}] if ok else []),
+            "gpu": data.get("gpu"),
+            "rocm": data.get("rocm"),
+            "engines": data.get("engines"),
+        }
+
     try:
         rc, out, err = run_script(["--check"], timeout=60)
     except subprocess.TimeoutExpired:
@@ -584,9 +611,13 @@ def start_job(argv, env=None, cwd=None, folder=None):
 # --------------------------------------------------------------------------
 
 # OptiScaler ships LogToFile=true at LogLevel=2, so the log exists after a run
-# without the user configuring anything. ReShade writes its own alongside.
-LOG_NAMES = ("OptiScaler.log", "dlss5-feed.log", "ReShade.log")
+# without the user configuring anything. ReShade writes its own alongside. The
+# amd engine's plugin logs in its cache folder, below the game's executable.
+AMD_LOG = "OptiScaler/dlss5nr/cache/dlss5nr.log"
+LOG_NAMES = ("OptiScaler.log", "dlss5-feed.log", "ReShade.log", AMD_LOG)
 CAPTURE_DIR = "dlssnr-capture"
+# Where install_amd puts RedDukeDev's launch.sh, relative to the executable.
+AMD_LINUX_DIR = "dlss5nr-linux"
 
 
 def game_roots():
@@ -646,12 +677,16 @@ def game_logs(game_dir, engine=None):
         if not path.is_file():
             continue
         stat = path.stat()
+        # The amd engine's own log says more than OptiScaler's: whether the
+        # network loaded, and why not.
+        preferred = (name == AMD_LOG) if engine == "amd" else (
+            bool(engine) and name.lower().startswith(engine[:4].lower()))
         found.append({
             "name": name,
             "path": str(path),
             "size": stat.st_size,
             "mtime": stat.st_mtime,
-            "preferred": bool(engine) and name.lower().startswith(engine[:4].lower()),
+            "preferred": preferred,
         })
 
     found.sort(key=lambda item: (not item["preferred"], -item["mtime"]))
@@ -676,6 +711,26 @@ NR_DX12 = re.compile(r"D3D12CreateDevice|ID3D12CommandQueue created|Dx12 swapcha
 # Streamline titles log their callback table (sl.common:slEvaluateFeature)
 # at startup, long before any frame is upscaled.
 NR_UPSCALER_CALL = re.compile(r"TryCreateOptiFeature|IFeature::SetInitParameters")
+
+# The amd engine's plugin (dlss5nr_runtime.dll) logs to AMD_LOG. A session
+# begins with "runtime starting"; "network loaded on <GPU>" is its proof that
+# the network is up. The failures are the ones RedDukeDev's package README
+# names, each with a different fix.
+AMD_SESSION = "runtime starting:"
+AMD_LOADED = re.compile(r"network loaded on ([^,\n]+)")
+AMD_NO_ROCM = re.compile(r"cuInit\w* failed: 801")
+AMD_NO_PRELOAD = re.compile(r"no handle file holds this process's tag")
+AMD_WINE_NVCUDA = re.compile(r"could not load [^\n]*nvcuda\.dll|does not export cuInit"
+                             r"|CUDA driver does not export")
+AMD_NO_COVERAGE = re.compile(r"has no translation in the shipped cache(?:, which covers ([^\n]*))?")
+# Every fatal line dlss5nr_runtime.dll 1.1.0 can write, read from its strings.
+AMD_FAILED = re.compile(r"(?:could not load the network|the network could not be loaded"
+                        r"|the network failed|evaluation failed"
+                        r"|the compute passes could not be built"
+                        r"|the translation cache (?:is missing|has no coverage\.txt)"
+                        r"|the translation cache's coverage\.txt names no GPU target"
+                        r"|could not create the runtime's buffers)"
+                        r":?[^\n]*")
 
 
 def installed_engine(directory):
@@ -705,6 +760,49 @@ def feeder_reason(directory):
             "dlss5-feed.log says whether its NGX calls reached OptiScaler DLSS-NR.")
 
 
+def amd_reason(text, directory):
+    """(headline, detail) for an amd-engine session whose network never loaded.
+
+    `text` is the plugin's log, from the last session on. The checks follow
+    the order things happen in: the launch option must go through launch.sh
+    (or nothing below it matters), then ROCm must load, then the cache must
+    cover the GPU.
+    """
+    stuck = "Injector loaded, neural network never started"
+    if AMD_NO_PRELOAD.search(text):
+        return (stuck, "The HIP bridge was not preloaded: the launch option does not go "
+                       "through dlss5nr-linux/launch.sh. Copy the launch options below "
+                       "into Steam again, whole.")
+    if AMD_WINE_NVCUDA.search(text):
+        return (stuck, "Wine's own nvcuda.dll answered instead of the plugin's: launch.sh "
+                       "was not used, or NVAPI is on for this game. Use the launch options "
+                       "below as they are, with no PROTON_ENABLE_NVAPI.")
+    if AMD_NO_ROCM.search(text):
+        return (stuck, "cuInit failed: 801 - ROCm 7's libamdhip64.so.7 was not found or "
+                       "is not visible in Steam's container. Install ROCm 7 from AMD's "
+                       "packages into /opt/rocm, the layout upstream tested: a ROCm in "
+                       "/usr/lib64 (Fedora's rocm-hip) is hidden by that container.")
+    coverage = AMD_NO_COVERAGE.search(text)
+    if coverage:
+        covers = (coverage.group(1) or "").strip().rstrip(".")
+        return ("This GPU is not covered by the amd engine",
+                "The plugin's translation cache has nothing for this GPU"
+                + (" (it covers %s)" % covers if covers else "")
+                + ": the amd engine needs an RDNA2, RDNA3 or RDNA4 GPU.")
+    failed = AMD_FAILED.findall(text)
+    if failed:
+        return (stuck, "The plugin says: " + failed[-1].strip()
+                       + ". dlss5nr.log in the Game log tab has the rest.")
+    config = read_optiscaler_config(directory) or {}
+    # A plugin that logged its start was switched on, whatever the ini says now.
+    if AMD_SESSION not in text and config.get("nr", "").lower() != "true":
+        return (stuck, "Neural rendering is switched off ([NeuralRendering] Enabled). "
+                       "Tick 'Enable Neural Rendering' below and relaunch.")
+    return (stuck, "The plugin started but has not loaded the network yet. It takes a few "
+                   "seconds after the start; if it never does, dlss5nr.log in the Game "
+                   "log tab says why.")
+
+
 def never_ran_reason(text, directory):
     """(headline, detail) naming why OptiScaler loaded but DLSS-NR never ran.
 
@@ -724,6 +822,11 @@ def never_ran_reason(text, directory):
              "before NVAPI was up. Set the DX12 upscaler to 'dlss' below first."
              ) if NR_NVAPI_MISS.search(text) and config.get("upscaler", "auto") == "auto" else ""
     stuck = "Injector loaded, neural pass never ran"
+
+    # The amd engine has a log of its own, and none of the NVIDIA causes
+    # below - NVAPI, the DLSS upscaler - apply to it.
+    if installed_engine(directory) == "amd":
+        return amd_reason(text, directory)
 
     # The feeder builds the upscaler call the game lacks, so "D3D11, no
     # upscaler" is its normal state rather than a dead end.
@@ -752,6 +855,88 @@ def never_ran_reason(text, directory):
                    "errors." + nvapi)
 
 
+def read_tail(path, limit=400_000):
+    """The tail is enough and bounds the read: the interesting lines repeat
+    every frame, and a long session's log is mostly dispatches."""
+    size = path.stat().st_size
+    with path.open("rb") as fh:
+        if size > limit:
+            fh.seek(-limit, os.SEEK_END)
+        return fh.read().decode("utf-8", errors="replace")
+
+
+def analyse_amd_log(directory):
+    """analyse_log() for the amd engine, from its plugin's dlss5nr.log.
+
+    OptiScaler.log alone cannot say much here: the network runs inside the
+    plugin, which never logs OptiScaler's DlssNr dispatches. No plugin log
+    with an OptiScaler.log beside it means OptiScaler loaded and the plugin
+    did not start; with neither, the game has not run.
+    """
+    path = directory / AMD_LOG
+    opti = directory / "OptiScaler.log"
+    if not path.is_file() and not opti.is_file():
+        return None
+
+    try:
+        text = read_tail(path) if path.is_file() else ""
+    except OSError as exc:
+        return {"state": "unknown", "headline": "Could not read dlss5nr.log: %s" % exc}
+    # Only the last session: an old failure must not outlive its fix.
+    if AMD_SESSION in text:
+        text = text[text.rindex(AMD_SESSION):]
+
+    newest = max(p.stat().st_mtime for p in (path, opti) if p.is_file())
+    loaded = AMD_LOADED.findall(text)
+    info = {
+        "dispatches": 0,
+        "backend": "amd",
+        "nvapi_missed": False,
+        "age": time.time() - newest,
+        "mtime": newest,
+    }
+
+    if not path.is_file():
+        try:
+            opti_text = read_tail(opti)
+        except OSError:
+            opti_text = ""
+        if not NR_LOADED.search(opti_text):
+            info.update(state="bad", headline="OptiScaler never loaded",
+                        detail="OptiScaler.log has no startup banner. The proxy DLL was "
+                               "probably not loaded - check the launch options.")
+        else:
+            info.update(state="bad", headline="Injector loaded, neural network never started",
+                        detail="OptiScaler loaded but the dlss5nr plugin wrote no log. Tick "
+                               "'Enable Neural Rendering' below, and check the game is "
+                               "Direct3D 12." + (" It is Direct3D 11 - the amd engine "
+                               "cannot run here." if NR_DX11.search(opti_text)
+                               and not NR_DX12.search(opti_text) else ""))
+    elif loaded:
+        failed = AMD_FAILED.findall(text[text.rindex("network loaded on"):])
+        if failed:
+            info.update(state="bad", headline="The neural network loaded, then failed",
+                        detail="The plugin says: %s. dlss5nr.log in the Game log tab has "
+                               "the rest." % failed[-1].strip())
+        else:
+            info.update(state="ok", headline="Neural rendering is running (AMD engine)",
+                        detail="The network loaded on %s. It refreshes the image every few "
+                               "frames; its result follows the scene in between."
+                               % loaded[-1].strip())
+    elif AMD_SESSION in text and not any(rx.search(text) for rx in (
+            AMD_NO_PRELOAD, AMD_WINE_NVCUDA, AMD_NO_ROCM, AMD_NO_COVERAGE, AMD_FAILED)):
+        # Loading takes a few seconds from the shipped cache; until then this
+        # is a wait, not a failure.
+        headline, detail = never_ran_reason(text, directory)
+        info.update(state="warn", headline="Plugin started, network not loaded yet",
+                    detail=detail)
+    else:
+        headline, detail = never_ran_reason(text, directory)
+        info.update(state="bad", headline=headline, detail=detail)
+
+    return info
+
+
 def analyse_log(game_dir):
     """Read OptiScaler.log and say whether the neural pass is actually running.
 
@@ -760,18 +945,15 @@ def analyse_log(game_dir):
     things here and the difference is only ever visible in this file.
     """
     directory = Path(game_dir)
+    if installed_engine(directory) == "amd":
+        return analyse_amd_log(directory)
+
     path = directory / "OptiScaler.log"
     if not path.is_file():
         return None
 
-    # The tail is enough and bounds the read: the interesting lines repeat every
-    # frame, and a long session's log is mostly dispatches.
     try:
-        size = path.stat().st_size
-        with path.open("rb") as fh:
-            if size > 400_000:
-                fh.seek(-400_000, os.SEEK_END)
-            text = fh.read().decode("utf-8", errors="replace")
+        text = read_tail(path)
     except OSError as exc:
         return {"state": "unknown", "headline": "Could not read OptiScaler.log: %s" % exc}
 
@@ -992,20 +1174,25 @@ def read_log_tail(path, limit=160_000):
 
 
 def read_optiscaler_config(game_dir):
-    """[DlssNr] Enabled, [Upscalers] Dx12Upscaler and [Menu] OverlayMenu, or None."""
+    """[DlssNr] Enabled, [Upscalers] Dx12Upscaler and [Menu] OverlayMenu, or None.
+
+    The amd engine's OptiScaler reads the switch from [NeuralRendering]
+    instead, and has no toggle key, so "toggle" stays "auto" there.
+    """
     ini = Path(game_dir) / "OptiScaler.ini"
     if not ini.is_file():
         return None
 
+    nr_section = "NeuralRendering" if installed_engine(game_dir) == "amd" else "DlssNr"
     current, found = None, {"nr": "auto", "upscaler": "auto", "overlay": "auto", "toggle": "auto"}
     for line in ini.read_text(encoding="utf-8", errors="replace").splitlines():
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
             current = stripped[1:-1]
             continue
-        if current == "DlssNr" and stripped.startswith("Enabled="):
+        if current == nr_section and stripped.startswith("Enabled="):
             found["nr"] = stripped.split("=", 1)[1]
-        elif current == "DlssNr" and stripped.startswith("ToggleKey="):
+        elif current == nr_section == "DlssNr" and stripped.startswith("ToggleKey="):
             found["toggle"] = stripped.split("=", 1)[1]
         elif current == "Upscalers" and stripped.startswith("Dx12Upscaler="):
             found["upscaler"] = stripped.split("=", 1)[1]
@@ -1015,11 +1202,35 @@ def read_optiscaler_config(game_dir):
     return found
 
 
-def launch_env(hook, extra=None):
-    """The Proton environment the injector needs. Mirrors print_launch_options()."""
+def installed_hip_lib(directory):
+    """The DLSSNR_HIP_LIB an amd install recorded (hip_lib=), if it still exists."""
+    if not directory:
+        return None
+    try:
+        for line in (Path(directory) / ".dlss5-linux.state").read_text().splitlines():
+            if line.startswith("hip_lib="):
+                path = line.split("=", 1)[1].strip()
+                return path if path and Path(path).is_file() else None
+    except OSError:
+        pass
+    return None
+
+
+def launch_env(hook, extra=None, engine=None, directory=None):
+    """The Proton environment the injector needs. Mirrors the script's launch_env()."""
     # A feeder install has two proxies, recorded as "dxgi.dll,dbghelp.dll".
     overrides = ";".join("%s=n,b" % h.strip().removesuffix(".dll")
                          for h in hook.split(",") if h.strip())
+    if engine == "amd":
+        # Nothing NVIDIA: launch.sh turns NVAPI off and sets nvcuda=n itself,
+        # and PROTON_ENABLE_NVAPI=1 would put Wine's nvcuda back in front of
+        # the plugin's. DLSSNR_HIP_LIB reaches launch.sh only if handed over;
+        # the install's state file says which, not this process's environment.
+        env = {"WINEDLLOVERRIDES": overrides}
+        hip = installed_hip_lib(directory)
+        if hip:
+            env["DLSSNR_HIP_LIB"] = hip
+        return env
     env = {
         "WINEDLLOVERRIDES": overrides,
         "PROTON_ENABLE_NVAPI": "1",
@@ -1032,8 +1243,31 @@ def launch_env(hook, extra=None):
     return env
 
 
-def steam_launch_options(hook):
-    env = launch_env(hook)
+def shell_dquote(text):
+    """A value inside the double quotes of a Steam launch option. Mirrors the
+    script's shell_dquote(): Steam hands the line to a shell, so \\ " $ and `
+    would otherwise be read rather than kept."""
+    for ch in ("\\", '"', "$", "`"):
+        text = text.replace(ch, "\\" + ch)
+    return '"%s"' % text
+
+
+def amd_wrapper(directory):
+    """RedDukeDev's launch.sh, which every amd-engine launch must go through."""
+    return Path(directory) / AMD_LINUX_DIR / "launch.sh"
+
+
+def steam_launch_options(hook, engine=None, directory=None):
+    env = launch_env(hook, engine=engine, directory=directory)
+    if engine == "amd":
+        # The wrapper goes in front of %command%, so it is the folder the
+        # install is (or will be) in that decides the line. Mirrors
+        # launch_options_line() in the script.
+        if not directory:
+            raise BadRequest("The amd engine's launch options need the game folder.")
+        parts = ["%s=%s" % (k, shell_dquote(v)) for k, v in env.items()]
+        parts.append(shell_dquote(str(amd_wrapper(directory))))
+        return " ".join(parts) + " %command%"
     parts = ['WINEDLLOVERRIDES="%s"' % env.pop("WINEDLLOVERRIDES")]
     parts += ["%s=%s" % (k, v) for k, v in env.items()]
     return " ".join(parts) + " %command%"
@@ -1065,11 +1299,26 @@ def start_launch(game, proton_path, hook):
             raise BadRequest("Could not find %s under %s" % (exe, game_dir))
         target = matches[0]
 
+    # The state file, not the page, says which engine is in the folder: the
+    # amd engine has to start through its wrapper or it cannot work at all.
+    engine = installed_engine(target.parent) or installed_engine(game_dir)
+    state_dir = target.parent if installed_engine(target.parent) else game_dir
+    prefix = []
+    if engine == "amd":
+        wrapper = amd_wrapper(state_dir)
+        if not wrapper.is_file():
+            raise BadRequest("%s is missing. Reinstall the amd engine." % wrapper)
+        prefix = [str(wrapper)]
+
     compatdata = Path(str_field(game, "compatdata"))
     compatdata.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
-    env.update(launch_env(hook))
+    if engine == "amd":
+        # Set in the user's environment it would still undo launch.sh's
+        # nvcuda=n, so it goes whatever its value.
+        env.pop("PROTON_ENABLE_NVAPI", None)
+    env.update(launch_env(hook, engine=engine, directory=state_dir))
     env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(root)
     env["STEAM_COMPAT_DATA_PATH"] = str(compatdata)
 
@@ -1093,7 +1342,8 @@ def start_launch(game, proton_path, hook):
         env["STEAM_COMPAT_MOUNTS"] = str(library)
     env["STEAM_COMPAT_INSTALL_PATH"] = str(game_dir)
 
-    return start_job([str(proton), "run", str(target)],
+    # launch.sh ends in exec "$@", so the job is still Proton's own process.
+    return start_job(prefix + [str(proton), "run", str(target)],
                      env=env, cwd=str(target.parent), folder=str(target.parent))
 
 
@@ -1263,7 +1513,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"job": job})
 
             elif url.path == "/api/launch-options":
-                self._json({"options": steam_launch_options(str_field(body, "hook", "dxgi.dll"))})
+                # An install's own engine wins over the selector's, which is
+                # only a preview of what an install would need.
+                path = str_field(body, "path", "")
+                engine = (installed_engine(path) if path else None) or str_field(body, "engine", "")
+                self._json({"options": steam_launch_options(str_field(body, "hook", "dxgi.dll"),
+                                                            engine, path)})
 
             elif url.path == "/api/activity":
                 # One endpoint for the whole poll: which games are alive, and
@@ -1315,6 +1570,10 @@ class Handler(BaseHTTPRequestHandler):
                 if str_field(body, "overlay", ""):
                     args.append("--overlay=" + str_field(body, "overlay"))
                 if str_field(body, "toggle", ""):
+                    # The script would refuse it after the job started; saying
+                    # so here keeps the other settings' job from failing too.
+                    if installed_engine(path) == "amd":
+                        raise BadRequest("The amd engine has no neural rendering toggle key.")
                     args.append("--toggle-key=" + str_field(body, "toggle"))
                 self._json({"job": start_job([str(SCRIPT)] + args, folder=path)})
 
@@ -1446,7 +1705,7 @@ PAGE = r"""<!doctype html>
     position:absolute; left:0; right:0; bottom:0; border-radius:0; text-align:center;
     font-size:8.5px; letter-spacing:.02em; padding:2px 0; white-space:nowrap;
   }
-  #games .cv .badge:not(.supported):not(.installed):not(.partial):not(.blocked):not(.missing):not(.unsupported) {
+  #games .cv .badge:not(.supported):not(.installed):not(.partial):not(.amd):not(.blocked):not(.missing):not(.unsupported) {
     background:rgba(20,23,26,.72); color:#e8eaed;
   }
   #games .cv .live { position:absolute; right:6px; top:6px; box-shadow:0 0 0 2px rgba(0,0,0,.5); }
@@ -1509,6 +1768,7 @@ PAGE = r"""<!doctype html>
   .badge.installed   { background:var(--ok);      color:var(--ok-bg); }
   .badge.partial     { background:var(--warn-bg); color:var(--warn); }
   .badge.feeder      { background:var(--info-bg); color:var(--accent); }
+  .badge.amd         { background:var(--warn-bg); color:var(--warn); }
   .badge.blocked,
   .badge.missing,
   .badge.unsupported { background:var(--bad-bg);  color:var(--bad); }
@@ -1605,6 +1865,7 @@ PAGE = r"""<!doctype html>
   .livenote { min-height:4.6em; }
   .fact .sub:empty::before { content:"\00a0"; }
   .note { color:var(--muted); font-size:12px; margin-top:10px; }
+  .note.warn { color:var(--warn); }
 </style>
 </head>
 <body>
@@ -1643,6 +1904,11 @@ const ACTIVITY = { running: {}, status: null };   // refreshed by pollActivity()
 const RESULTS = {};   // appid -> probe result (seeded from the stored ones)
 const CONFIG  = {};   // appid -> OptiScaler.ini values
 const FRESH   = new Set();   // appids actually probed during this session
+// --check --json: the GPU and which engines it can run. Null until it answers,
+// and then nothing is gated - the script refuses for itself either way.
+let PREFLIGHT = null;
+const ENGINE_LABEL = { optiscaler: "OptiScaler", reshade: "ReShade + RenoDX",
+                       feeder: "DLSS5-Feeder", amd: "AMD (experimental)" };
 
 // Log panel state lives outside the DOM so it survives the re-render that
 // follows every job (a job finishing triggers a re-probe, which repaints).
@@ -1713,8 +1979,49 @@ const el = (tag, props = {}, kids = []) => {
 async function loadPreflight() {
   const data = await api("/api/preflight");
   const box = document.getElementById("preflight");
-  const chips = (data.lines || []).map(l =>
+  // ROCm gets one short chip of its own below; the script's two long lines
+  // about it are that chip's tooltip.
+  // Only where the amd engine can install: on a GPU it refuses, ROCm is moot.
+  const rocm = data.rocm && data.engines?.amd?.ok ? data.rocm : null;
+  const lines = (data.lines || []).filter(l => !(rocm
+    && (l.text.startsWith("ROCm 7") || l.text.startsWith("Install ROCm 7"))));
+  const chips = lines.map(l =>
     el("span", { className: "chip " + l.kind, textContent: l.text, title: l.text }));
+
+  // The GPU leads: it decides which engine, if any, can install. The script's
+  // own "GPU: ..." line is that chip, moved to the front; the tooltip adds
+  // every GPU found and what this one can run. With no such line the chip is
+  // made from the JSON instead; with no GPU at all the script's own error
+  // chip already says so.
+  const gpu = data.gpu;
+  if (gpu && gpu.vendor !== "none") {
+    const engines = gpu.engines || [];
+    const all = (gpu.all || []).map(x => x.name + (x.gfx ? " (" + x.gfx + ")" : "")).join("\n");
+    const tip = (all ? "GPUs found:\n" + all + "\n\n" : "") + "Engines this GPU can install: "
+              + (engines.length ? engines.map(e => ENGINE_LABEL[e] || e).join(", ") : "none");
+    const at = lines.findIndex(l => l.text.startsWith("GPU: "));
+    const chip = at >= 0 ? chips.splice(at, 1)[0]
+      : el("span", { className: "chip", textContent: gpu.name || gpu.vendor.toUpperCase() });
+    if (!engines.length) chip.className = "chip bad";
+    chip.title = chip.textContent + "\n\n" + tip;
+    chips.unshift(chip);
+  }
+  // On AMD, ROCm 7 is the one thing outside the game folder the engine needs.
+  // A ROCm in /usr (Fedora's rocm-hip) is found, but Steam's container keeps
+  // /usr to itself, so launch.sh most likely cannot show it to the game.
+  const hidden = rocm && rocm.found && rocm.container_visible === false;
+  const getRocm = "Install ROCm 7 from AMD's packages, into /opt/rocm, the layout upstream "
+    + "tested: https://rocm.docs.amd.com/projects/install-on-linux/";
+  if (rocm) chips.splice(gpu && gpu.vendor !== "none" ? 1 : 0, 0, el("span", {
+    className: "chip " + (rocm.found && !hidden ? "ok" : "warn"),
+    textContent: hidden ? "ROCm 7 in /usr" : rocm.found ? "ROCm 7 found" : "ROCm 7 missing",
+    title: hidden
+      ? rocm.path + ": Steam's runtime container keeps /usr to itself, so a game started "
+        + "by Steam most likely cannot load it (\"cuInit failed: 801\"). " + getRocm
+      : rocm.found ? rocm.path
+      : "No libamdhip64.so.7 where launch.sh looks. The amd engine installs, but neural "
+        + "rendering fails to start (\"cuInit failed: 801\") until it is there. " + getRocm
+        + " (Fedora's rocm-hip goes into /usr/lib64, which Steam's container cannot see.)" }));
 
   // A non-zero exit means nothing downstream will work. Saying so up front beats
   // leaving the reason to be read out of one grey chip among a dozen.
@@ -1722,6 +2029,18 @@ async function loadPreflight() {
     textContent: "Preflight failed", title: "dlss5-linux.sh --check exited non-zero" }));
 
   box.replaceChildren(...chips);
+
+  // The engine selector depends on this, and a game may have been selected
+  // while the check ran.
+  PREFLIGHT = data;
+  // Tiles whose verdict came from another GPU turn to "?", and a game
+  // selected before the check answered is re-probed now that it can tell.
+  if (GAMES.length) renderList();
+  if (SELECTED) {
+    renderDetail();
+    const r = RESULTS[SELECTED.appid];
+    if (r && otherGpu(r) && !FRESH.has(SELECTED.appid)) probeOne(SELECTED, true);
+  }
 }
 
 // ---- game list -----------------------------------------------------------
@@ -1781,9 +2100,12 @@ function renderList() {
     // one thing worth spotting at a glance in a long list. The verdict is still
     // in the tooltip and the detail pane.
     const r = RESULTS[g.appid];
-    const verdict = g.missing ? "missing" : r?.installed ? "installed" : r?.verdict;
+    // A verdict reached on another GPU is no verdict here: "?" until re-probed.
+    const otherCard = !!r && !FRESH.has(g.appid) && otherGpu(r);
+    const verdict = g.missing ? "missing" : r?.installed ? "installed" : otherCard ? "" : r?.verdict;
     const live = !!ACTIVITY.running[gameDir(g)];
-    const age = probeAge(r) || "Not probed yet";
+    const age = otherCard ? "Probed on another GPU - select it or Probe all to check again"
+                          : probeAge(r) || "Not probed yet";
     const cover = el("div", { className: "cv" }, [
       el("span", { className: "ini", textContent: initials(g.name) }),
       ...coverImg(g),
@@ -1828,7 +2150,8 @@ async function select(game) {
   // and only re-run when the folder has changed under it since - a game update,
   // or an install done outside this page.
   if (!RESULTS[game.appid]) await probeOne(game);
-  else if (RESULTS[game.appid].stale && !FRESH.has(game.appid)) probeOne(game, true);
+  else if ((RESULTS[game.appid].stale || otherGpu(RESULTS[game.appid])) && !FRESH.has(game.appid))
+    probeOne(game, true);
 
   // Learn which logs exist so "Open log file" / "Open captures" reflect reality.
   const r = RESULTS[game.appid] || {};
@@ -1841,6 +2164,17 @@ async function select(game) {
   if (cfgRes.config) CONFIG[game.appid] = cfgRes.config; else delete CONFIG[game.appid];
 
   renderDetail();
+}
+
+// A remembered verdict reached on another GPU - a card swapped, or a verdict
+// from before the probe looked at GPUs at all, which meant NVIDIA - says
+// nothing about this one. The folder has not changed, so the signature
+// cannot catch it.
+function otherGpu(r) {
+  const now = PREFLIGHT?.gpu;
+  if (!now || !r || r.verdict === "\u2026") return false;
+  const then = r.gpu || { vendor: "nvidia" };
+  return then.vendor !== now.vendor || (then.gfx || null) !== (now.gfx || null);
 }
 
 // `keep` re-runs a probe without throwing away the verdict already on screen,
@@ -2044,8 +2378,12 @@ function settingsNote(g) {
   const ctx = DETAIL_CTX;
   if (!ctx.cfg) return "Install first to configure OptiScaler.ini.";
   if (!ACTIVITY.running[gameDir(g)])
-    return "Written straight into OptiScaler.ini, so it is the state the game starts in. "
-         + "Force 'dlss' if OptiScaler mis-detects the GPU under Proton and falls back to XeSS.";
+    return ctx.amd
+      ? "Written straight into OptiScaler.ini ([NeuralRendering]), so it is the state the "
+        + "game starts in. Turn the game's own upscaler on if it has one: the network follows "
+        + "the scene with its motion vectors."
+      : "Written straight into OptiScaler.ini, so it is the state the game starts in. "
+        + "Force 'dlss' if OptiScaler mis-detects the GPU under Proton and falls back to XeSS.";
   // OptiScaler reads the ini once, at startup - it imports no file-watch API
   // and has no reload action - so a change made now waits for the next launch.
   return "Running: changes here apply at the next launch."
@@ -2107,15 +2445,37 @@ function renderDetail() {
     ...(sub ? [el("div", { className: "sub", textContent: sub })] : []),
   ]);
 
+  // Which engines this GPU can run, from the preflight. An engine it cannot is
+  // disabled and says why, rather than hidden: an NVIDIA user should still
+  // learn that an AMD engine exists, and the reverse. The installed engine
+  // stays selectable whatever the GPU, so the selector never lies about it.
+  const gate = PREFLIGHT?.engines || null;
+  const refused = e => gate && gate[e] && !gate[e].ok ? (gate[e].reason || "Not on this GPU.") : "";
+  const engineOpt = (value, title) => {
+    const why = installed?.engine === value ? "" : refused(value);
+    return el("option", { value, disabled: !!why,
+      textContent: ENGINE_LABEL[value] + (why ? " – not on this GPU" : ""),
+      title: why || title });
+  };
   const engineSel = el("select", { id: "engine" }, [
-    el("option", { value: "optiscaler", textContent: "OptiScaler", title: "Recommended" }),
-    el("option", { value: "reshade", textContent: "ReShade + RenoDX" }),
-    el("option", { value: "feeder", textContent: "DLSS5-Feeder",
-                   title: "For games with no DLSS: builds the DLSS request from ReShade's depth "
-                        + "and estimated motion" }),
+    engineOpt("optiscaler", "Recommended on NVIDIA RTX 40"),
+    engineOpt("reshade", ""),
+    engineOpt("feeder", "For games with no DLSS: builds the DLSS request from ReShade's depth "
+                      + "and estimated motion"),
+    engineOpt("amd", "Experimental, AMD RDNA2/3/4 with ROCm 7, Direct3D 12 games: "
+                   + "RedDukeDev/dlss5-nr-amd-custom"),
   ]);
+  const usable = [...engineSel.options].filter(o => !o.disabled).map(o => o.value);
   if (installed) engineSel.value = installed.engine;
-  else if (r.verdict === "feeder") engineSel.value = "feeder";
+  else if (r.engine_hint && usable.includes(r.engine_hint)) engineSel.value = r.engine_hint;
+  else if (r.verdict === "feeder" && usable.includes("feeder")) engineSel.value = "feeder";
+  // On AMD that is the amd engine, the only one it can install.
+  else if (usable.length) engineSel.value = usable[0];
+  // No engine at all (Intel, no GPU): why, for the Install button and its note.
+  // On AMD the amd engine's reason is the one that applies.
+  const noEngine = gate && !usable.length
+    ? ((PREFLIGHT.gpu?.vendor === "amd" ? gate.amd : gate.optiscaler)?.reason
+       || "No engine supports this GPU.") : "";
 
   const hookSel = el("select", { id: "hook" },
     ["dxgi.dll", "d3d12.dll", "version.dll", "winmm.dll", "dbghelp.dll", "wininet.dll", "winhttp.dll"]
@@ -2128,6 +2488,11 @@ function renderDetail() {
   const runHooks = () => installed
     ? installed.hook + (installed.engine === "feeder" ? ",d3dcompiler_47.dll" : "")
     : hookSel.value;
+  // What the launch options are for: the install's engine, else the one an
+  // install would use. The folder matters to the amd engine, whose wrapper
+  // sits in it.
+  const optsBody = () => ({ hook: runHooks(), engine: installed?.engine || engineSel.value,
+                            path: r.dir || g.path });
 
   const protonSel = el("select", { id: "proton" },
     PROTONS.map(p => el("option", { value: p.path, textContent: p.name })));
@@ -2162,9 +2527,6 @@ function renderDetail() {
     pollActivity();
   });
 
-  bInstall.disabled = blocked;
-  bInstall.title = blocked ? "Anti-cheat detected - refusing to inject." : "";
-
   bProbe.onclick   = () => probeOne(g);
   // Install gets the game ROOT, not r.dir. dlss5-linux.sh resolves the binary
   // directory itself, and it scans for anti-cheat from the path we hand it -
@@ -2176,11 +2538,45 @@ function renderDetail() {
   // installs. No modal: it would block the page's own polling.
   const doInstall = () => job("/api/install", {
     path: g.path, engine: engineSel.value, hook: hookSel.value });
-  if (r.verdict === "unsupported") {
-    bInstall.title = "The probe found nothing for the pass to hook. Click twice to install anyway.";
-    armable(bInstall, "install:" + g.appid, "Install anyway?", doInstall);
-  } else
-    bInstall.onclick = doInstall;
+  // The amd engine is always a two-click install, whatever the verdict: it
+  // is a 365 MB download of closed binaries and a leaked NVIDIA DLL, and the
+  // note under the buttons says so before the first click.
+  const engineNote = el("div", { className: "note", id: "enginenote" });
+  const wireInstall = () => {
+    const engine = engineSel.value;
+    // The installed engine stays selectable to show what is there, but this
+    // GPU refusing it still means a reinstall would only fail.
+    const why = noEngine || refused(engine) || (engine === "amd" && r.api
+      && !["d3d12", "unknown"].includes(r.api) && !blocked
+      ? "The amd engine is Direct3D 12 only, and this game is " + r.api + "." : "");
+    bInstall.disabled = blocked || !!why;
+    bInstall.onclick = null;
+    bInstall.classList.remove("armed");
+    bInstall.textContent = installed ? "Reinstall" : "Install";
+    bInstall.title = blocked ? "Anti-cheat detected - refusing to inject." : why;
+    engineNote.className = "note" + (why ? " warn" : engine === "amd" ? " warn" : "");
+    engineNote.textContent = why
+      ? (noEngine ? "No engine supports this GPU. " : "") + why
+      : engine === "amd"
+        ? "Experimental, untested by this installer on real AMD hardware. Downloads 365 MB "
+          + "(once, then cached) and unpacks ~820 MB into the game folder. It bundles "
+          + "NVIDIA's leaked nvngx_dlssnr.dll, ZLUDA and other closed binaries from a new "
+          + "GitHub account (RedDukeDev). Direct3D 12, single-player only. Needs ROCm 7. "
+          + "Click " + (installed ? "Reinstall" : "Install") + " twice."
+        : "";
+    if (bInstall.disabled) return;
+    if (engine === "amd") {
+      bInstall.title = "Installs 365 MB of closed binaries, including a leaked NVIDIA DLL. "
+                     + "Click twice to " + (installed ? "reinstall." : "install.");
+      armable(bInstall, "install:amd:" + g.appid,
+              installed ? "Confirm reinstall" : "Confirm install", doInstall);
+    } else if (r.verdict === "unsupported") {
+      bInstall.title = "The probe found nothing for the pass to hook. Click twice to install anyway.";
+      armable(bInstall, "install:" + g.appid, "Install anyway?", doInstall);
+    } else
+      bInstall.onclick = doInstall;
+  };
+  wireInstall();
   // Uninstall stays on r.dir: it has no anti-cheat refusal to protect, and
   // dlss5-linux.sh --uninstall deletes from the path it is handed without
   // resolving it, so the root would remove nothing at all.
@@ -2192,9 +2588,15 @@ function renderDetail() {
     proton: protonSel.value, hook: runHooks() });
 
   const opts = el("textarea", { readOnly: true, id: "optsbox", value: "" });
-  api("/api/launch-options", { hook: runHooks() }).then(d => { opts.value = d.options; });
-  hookSel.onchange = () =>
-    api("/api/launch-options", { hook: runHooks() }).then(d => { opts.value = d.options; });
+  // With no engine for this GPU there is no launch option to show, and the
+  // selector's value would be a disabled NVIDIA engine's.
+  const refreshOpts = () => !installed && noEngine
+    ? Promise.resolve(opts.value = "No launch options: " + noEngine)
+    : api("/api/launch-options", optsBody())
+      .then(d => { opts.value = d.options || d.error || ""; });
+  refreshOpts();
+  hookSel.onchange = refreshOpts;
+  engineSel.onchange = () => { wireInstall(); refreshOpts(); };
 
   const bCopy = el("button", { textContent: "Copy" });
   bCopy.onclick = async () => flash(bCopy, (await copyText(opts.value)) ? "Copied" : "Copy failed");
@@ -2239,6 +2641,9 @@ function renderDetail() {
   // --- OptiScaler.ini settings (only meaningful once installed) ---
   const cfg = CONFIG[g.appid];
   const nrOn = cfg && cfg.nr === "true";
+  // The amd engine's OptiScaler: [NeuralRendering] for the switch, no toggle
+  // key, and no DLSS for the upscaler to pick on an AMD GPU.
+  const amd = installed?.engine === "amd";
 
   const overlayKey = (installed?.engine === "reshade") ? "Home" : "Insert";
   const nrBox = el("input", { type: "checkbox", id: "nrbox", checked: !!nrOn, disabled: !cfg });
@@ -2246,6 +2651,7 @@ function renderDetail() {
 
   const upSel = el("select", { id: "upscaler", disabled: !cfg },
     ["auto", "dlss", "xess", "fsr21", "fsr22", "ffx"]
+      .filter(v => !(amd && v === "dlss" && cfg?.upscaler !== "dlss"))
       .map(v => el("option", { value: v, textContent: v })));
   if (cfg) upSel.value = cfg.upscaler;
   upSel.onchange = () => job("/api/configure", { path: dir, upscaler: upSel.value });
@@ -2263,14 +2669,14 @@ function renderDetail() {
     return n >= 1 && n <= 12 ? "F" + n : null;
   };
   const toggleNow = cfg && cfg.toggle && cfg.toggle !== "auto" ? (fkey(cfg.toggle) || cfg.toggle) : "none";
-  const keySel = el("select", { id: "togglekey", disabled: !cfg },
+  const keySel = el("select", { id: "togglekey", disabled: !cfg || amd },
     ["none", "F5", "F6", "F7", "F8", "F9", "F10", "F11"]
       .concat(["none", "F5", "F6", "F7", "F8", "F9", "F10", "F11"].includes(toggleNow) ? [] : [toggleNow])
       .map(v => el("option", { value: v, textContent: v })));
   keySel.value = toggleNow;
   keySel.onchange = () => job("/api/configure", { path: dir, toggle: keySel.value });
 
-  DETAIL_CTX = { cfg, overlayOn, overlayKey, toggleNow, live: !!ACTIVITY.running[gameDir(g)] };
+  DETAIL_CTX = { cfg, amd, overlayOn, overlayKey, toggleNow, live: !!ACTIVITY.running[gameDir(g)] };
 
   box.replaceChildren(
     el("h2", { textContent: g.name }),
@@ -2289,7 +2695,8 @@ function renderDetail() {
         fact("Graphics API", r.api || "—"),
         fact("Upscalers", (r.upscalers || []).join(", ") || "none detected"),
         fact("Anti-cheat", (r.anticheat || []).join(", ") || "none detected"),
-        fact("Installed", installed ? installed.engine + " as " + installed.hook : "no"),
+        fact("Installed", installed
+          ? (ENGINE_LABEL[installed.engine] || installed.engine) + " as " + installed.hook : "no"),
       ]),
 
       el("ul", { className: "reasons" }, (r.reasons || []).map(text =>
@@ -2304,16 +2711,23 @@ function renderDetail() {
       ]),
       el("div", { className: "btngrid" }, [bProbe, bInstall, bRemove, bLaunch, bClose, bFolder]),
       el("div", { className: "btngrid" }, [bOpenLog, bCaptures]),
+      engineNote,
 
     el("div", { className: "controls" }, [
       el("label", { className: "f", style: "flex-direction:row;align-items:center;gap:6px;font-size:13px;color:var(--ink)" },
         [nrBox, "Enable Neural Rendering"]),
       el("label", { className: "f" }, ["DX12 upscaler", upSel]),
-      el("label", { className: "f", title: "Switches neural rendering on and off in game - "
-                                         + "works with the overlay off" }, ["Toggle key", keySel]),
+      el("label", { className: "f", title: amd
+          ? "The amd engine's OptiScaler has no toggle key: use the checkbox, or the "
+            + "overlay's Neural Rendering tab"
+          : "Switches neural rendering on and off in game - works with the overlay off" },
+        ["Toggle key", keySel]),
       el("label", { style: "display:flex;gap:8px;align-items:center",
-                    title: "OptiScaler's in-game menu. Its input hooks froze Like a Dragon Gaiden "
-                         + "when a controller connected during startup, so installs leave it off." },
+                    title: amd
+                      ? "OptiScaler's in-game menu, with the Neural Rendering tab. On some Proton "
+                        + "versions it turns the screen black, so installs leave it off."
+                      : "OptiScaler's in-game menu. Its input hooks froze Like a Dragon Gaiden "
+                        + "when a controller connected during startup, so installs leave it off." },
         [ovBox, "In-game overlay (" + overlayKey + ")"]),
       el("span", { className: "note livenote", id: "livenote", style: "margin:0;flex-basis:100%",
                    textContent: settingsNote(g) }),
@@ -2369,7 +2783,8 @@ function paintLog() {
 
 async function refreshGameLog(dir, engine) {
   LOGS.tab = "game";
-  const data = await api("/api/gamelog", { path: dir, engine, log: LOGS.file });
+  // No log yet leaves LOGS.file null, which the server refuses as a name.
+  const data = await api("/api/gamelog", { path: dir, engine, log: LOGS.file || undefined });
 
   // A refused request used to fall through to "no log yet", which reads as
   // "never run" when the real answer was an error. Say which it was, and name
@@ -2387,7 +2802,8 @@ async function refreshGameLog(dir, engine) {
   if (!LOGS.files.length) {
     LOGS.game = "No log file yet in\n  " + dir + "\n\n" +
       "OptiScaler writes OptiScaler.log beside the proxy DLL once the game has run.\n" +
-      "ReShade writes ReShade.log. Launch the game first.";
+      "ReShade writes ReShade.log, and the amd engine's plugin\n" +
+      "OptiScaler/dlss5nr/cache/dlss5nr.log. Launch the game first.";
     LOGS.meta = "";
     paintLog();
     return;

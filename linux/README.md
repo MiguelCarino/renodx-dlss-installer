@@ -1,6 +1,8 @@
 # dlss5-linux
 
-DLSS 5 "Neural Rendering" on Fedora/Linux via Proton, on an RTX 40 (Ada) card.
+DLSS 5 "Neural Rendering" on Fedora/Linux via Proton, on an RTX 40 (Ada) card —
+and, experimentally, on AMD RDNA2/3/4 through a third-party ZLUDA port (see
+[Supported GPUs](#supported-gpus)).
 
 This is the `linux/` directory of a fork of
 [yumlevi/renodx-dlss-installer](https://github.com/yumlevi/renodx-dlss-installer).
@@ -29,6 +31,7 @@ Or from the shell:
 ./dlss5-linux.sh --check                          # preflight only
 ./dlss5-linux.sh --game-dir=/path/to/game --probe # will this game work?
 ./dlss5-linux.sh --game-dir=/path/to/game         # install (optiscaler engine)
+./dlss5-linux.sh --game-dir=/path/to/game --engine=amd   # AMD GPU, experimental
 ./dlss5-linux.sh --game-dir=/path/to/game --uninstall
 ```
 
@@ -42,6 +45,35 @@ Properties → Compatibility.
 | `--dry-run` | Print every download, copy, extraction, deletion and ini edit that would happen. Changes nothing on disk. Combines with `--configure`, `--uninstall` and `--install-proton`. |
 | `-y`, `--yes` | Answer prompts yes. There is one: "an install already exists here, uninstall first?" |
 | `-h`, `--help` | The full option list, then exit. |
+
+## Supported GPUs
+
+The script reads which GPU you have from `/sys/class/drm` — not from
+`nvidia-smi`, which only exists with NVIDIA's driver — and refuses an engine
+that cannot run on it before downloading anything. A laptop with an integrated
+and a discrete GPU is judged by the one games render on: NVIDIA first, then a
+discrete AMD, then an AMD APU, then Intel. `--check` lists every GPU it found.
+
+| GPU | Status | Engine |
+|---|---|---|
+| **NVIDIA RTX 40 (Ada)** | The tested path. Everything else in this README is about it. | `optiscaler` (default), `reshade`, `feeder` |
+| NVIDIA RTX 50 (Blackwell) | Installs, but the downloaded `nvngx_dlssnr.dll` is Ada-patched (`sm_89` only) and will not initialise. `--check` says so; use the driver's own `nvngx_dlssnr.dll` instead. | same |
+| NVIDIA RTX 20/30 | Same patched DLL, same failure. Not supported. | — |
+| **AMD RDNA3 / RDNA4** (RX 7000 / RX 9000) | **Experimental**, through RedDukeDev's port. Untested by us — there is no AMD card here. | `amd` only |
+| AMD RDNA2 (RX 6000) | Installs with `--engine=amd`, but upstream reports "the performance impact is huge" and too many artifacts to enjoy. | `amd` only |
+| Older AMD (RDNA1, Vega, GCN APUs) | Not covered by the package's translation cache. Refused. | — |
+| Intel | Not supported yet. The one community proof of concept, on Arc Xe2, runs at 3–5 fps on Windows only; there is nothing to install. | — |
+
+On AMD, the AMD generation comes from the `gfx_target_version` the kernel
+publishes under `/sys/class/kfd` (`110000` is `gfx1100`, an RX 7900). That
+target is checked against the `coverage.txt` the package ships beside its
+translation cache — `gfx10-3-generic gfx11-generic gfx1100 gfx1101
+gfx12-generic` in 1.1.0 — because the plugin refuses, at run time, a GPU its
+cache does not hold rather than translating the network in game.
+
+`--force` overrides a refusal, for when the detection has it wrong. It does not
+make an NVIDIA engine work on AMD: those need NVIDIA's NGX runtime, which no
+other driver has.
 
 ## Desktop app and packages
 
@@ -71,7 +103,7 @@ and install it:
 
 ```bash
 packaging/build-rpm.sh
-sudo dnf install ./packaging/dist/dlss5-linux-0.0.1-1.*.noarch.rpm
+sudo dnf install ./packaging/dist/dlss5-linux-0.0.2-1.*.noarch.rpm
 ```
 
 The RPM pulls in the CLI's tools (curl, unzip, binutils, 7z, xdg-utils) and only
@@ -81,10 +113,10 @@ Or an AppImage, a single file that needs no root to run:
 
 ```bash
 packaging/appimage/build-appimage.sh
-chmod +x packaging/dist/DLSS5_for_Linux-0.0.1-x86_64.AppImage   # if the copy lost it
-packaging/dist/DLSS5_for_Linux-0.0.1-x86_64.AppImage             # the desktop app
-packaging/dist/DLSS5_for_Linux-0.0.1-x86_64.AppImage cli --help  # the CLI
-ln -s "$PWD/packaging/dist/DLSS5_for_Linux-0.0.1-x86_64.AppImage" ~/.local/bin/dlss5-linux
+chmod +x packaging/dist/DLSS5_for_Linux-0.0.2-x86_64.AppImage   # if the copy lost it
+packaging/dist/DLSS5_for_Linux-0.0.2-x86_64.AppImage             # the desktop app
+packaging/dist/DLSS5_for_Linux-0.0.2-x86_64.AppImage cli --help  # the CLI
+ln -s "$PWD/packaging/dist/DLSS5_for_Linux-0.0.2-x86_64.AppImage" ~/.local/bin/dlss5-linux
 dlss5-linux --help                                               # the CLI by its usual name
 ```
 
@@ -97,7 +129,7 @@ window, optionally, PyGObject with GTK 4, libadwaita and WebKitGTK 6.0
 opens in your browser.
 
 On a host without FUSE (libfuse2) run it with `--appimage-extract-and-run`
-first, e.g. `DLSS5_for_Linux-0.0.1-x86_64.AppImage --appimage-extract-and-run cli --help`.
+first, e.g. `DLSS5_for_Linux-0.0.2-x86_64.AppImage --appimage-extract-and-run cli --help`.
 The AppImage runtime leaves its extract (`appimage_extracted_<hash>`, about
 250 KB, one per AppImage build) in `$TMPDIR` or `/tmp` after it exits; delete those by hand.
 
@@ -355,6 +387,8 @@ machine-readable form the GUI consumes.
 | Verdict | Meaning |
 |---|---|
 | `supported` | D3D12 + a temporal upscaler. Install it. |
+| `feeder` | D3D11/D3D12 with no upscaler of its own. Install with `--engine=feeder`. |
+| `amd` | On an AMD GPU the amd engine can run: a D3D12 game. Install with `--engine=amd`. |
 | `partial` | D3D11. The game's own DLSS can't be ridden; OptiScaler must substitute its FSR/XeSS "w/Dx12" backend and the pass rides that bridge. |
 | `unsupported` | No upscaler, Vulkan, or a native Linux build — nothing to hook. |
 | `blocked` | Anti-cheat found. Install refuses; `--force` overrides at your own risk. |
@@ -362,6 +396,24 @@ machine-readable form the GUI consumes.
 
 `blocked` is checked first, then `unsupported`, so an anti-cheat hit outranks
 everything else the probe found.
+
+The verdict is for **this machine's GPU**. On NVIDIA it is exactly what it
+always was. On AMD the NVIDIA verdicts (`supported`, `partial`, `feeder`) cannot
+be installed, so the probe answers for the amd engine instead: `amd` for a D3D12
+game, `unsupported` for anything else or for an AMD GPU the cache does not
+cover, `unknown` when the API could not be read. On Intel, or with no GPU found,
+it is `unsupported`. The NVIDIA answer is kept alongside as `nvidia_verdict` in
+`--json` (and "on NVIDIA" in the text form), with `engine_hint` — the engine to
+install with, or `null` — and a `gpu` object: `vendor` (`nvidia`, `amd`,
+`intel`, `none`), `name`, `id`, and on AMD `gfx`, `generation`, `integrated` and
+the cache's `coverage`, plus `engines`, the engines this GPU can run.
+
+`--check --json` is the preflight in the same form: `ok`, `gpu`, `rocm` (on
+AMD: `found`, `path`, the Fedora `package`, and `container_visible`, false for
+a ROCm under `/usr` that Steam's container cannot see), `engines` with each engine's `ok`
+and refusal `reason`, and the `lines` the text form prints. `--launch-options`
+prints the launch option of the install in `--game-dir`; with `--json` it adds
+the `env` to set and, for the amd engine, the `wrapper` that must run the game.
 
 ### Remembered verdicts
 
@@ -493,6 +545,9 @@ it at the game root yourself in that case.
 Switch engines with `--uninstall` then reinstall. Every engine writes a
 `.dlss5-linux.state` file so uninstall knows which proxy DLL to remove.
 
+Both, and the feeder below, need an NVIDIA GPU. AMD has an engine of its own:
+[`--engine=amd`](#amd-gpus---engineamd-experimental).
+
 ### Games with no DLSS: `--engine=feeder`
 
 Both engines above ride a DLSS call the game already makes. A game with no
@@ -534,7 +589,117 @@ exists but names no proxy DLL, uninstall stops and says so rather than reporting
 that it removed nothing — an empty name would otherwise resolve to the game
 directory itself. Under `--dry-run` it says *would remove*, because it did not.
 
+### AMD GPUs: `--engine=amd` (experimental)
+
+[RedDukeDev/dlss5-nr-amd-custom](https://github.com/RedDukeDev/dlss5-nr-amd-custom)
+runs NVIDIA's own network on AMD: a fork of OptiScaler hands each frame to a
+runtime that drives `nvngx_dlssnr.dll`, whose CUDA runs on AMD through a fork
+of ZLUDA, with its hottest kernels replaced by hand-written HIP. Under Proton
+its HIP calls cross from Wine to the native ROCm through a small bridge —
+`amdhip64_7.dll` on the Windows side, `libdlss5nr_hip_bridge.so` preloaded on
+the Linux side. Its runtime, kernels and Linux bridge are MIT; its OptiScaler
+fork is GPL-3.0; ZLUDA is MIT/Apache-2.0. Credit for all of it is theirs.
+
+**We have not run it.** This machine has an RTX 4090. What is tested here is the
+file placement, the state file, reinstall and uninstall, against fake AMD
+`sysfs` trees and a fake D3D12 game — not a single frame on a Radeon. Upstream
+verified it with Hogwarts Legacy under GE-Proton11-7 on an RX 7900 XT with ROCm
+7.15.
+
+What it needs:
+
+- **An AMD GPU its translation cache covers** — RDNA2, RDNA3 or RDNA4 (see
+  [Supported GPUs](#supported-gpus)).
+- **ROCm 7**: `libamdhip64.so.7` in `/opt/rocm/core/lib`, `/opt/rocm/lib`,
+  `/usr/lib`, `/usr/lib64` or `/usr/lib/x86_64-linux-gnu` — where its
+  `launch.sh` looks — or named by `DLSSNR_HIP_LIB` (set it for the install;
+  the state file records it and the launch options carry it). Install it from
+  AMD's packages, into `/opt/rocm`, with AMD's
+  [ROCm install guide](https://rocm.docs.amd.com/projects/install-on-linux/):
+  that is the layout upstream tested, and `launch.sh` shows the whole of
+  `/opt/rocm` to Steam's container. Fedora 44's `rocm-hip` (ROCm 7.1) puts it
+  in `/usr/lib64` instead, and Steam's runtime container keeps `/usr` to
+  itself, so a game Steam starts most likely cannot load it there; `--check`
+  warns about a ROCm it finds under `/usr`. Untested either way on our side.
+  Missing ROCm is a warning, not a refusal: the files install, and neural
+  rendering fails to start (`cuInit failed: 801`) until it is there. `--check`
+  also warns when `/dev/kfd` is missing or not yours to open (the `render`
+  group).
+- **A Direct3D 12 game.** The Neural Rendering tab is D3D12 only; a D3D11 or
+  Vulkan game is refused (`--force` if the probe has the API wrong). It does
+  **not** need DLSS: with an upscaler (DLSS, FSR or XeSS) switched on in game,
+  OptiScaler hands the network depth and motion vectors; with none, the network
+  runs on the finished image — it then trails behind motion and processes the
+  HUD too.
+- **About 1.2 GB of disk**: a 365 MB download cached in
+  `~/.cache/dlss5-linux/`, and ~820 MB unpacked into the game folder, 347 MB of
+  it the translation cache (`OptiScaler/dlss5nr/cache/ComputeCache/zluda2.db`).
+
+The package's own `setup_linux.sh` is **not run** — nothing in the zip is
+executed by this script. What it does is done natively instead, into the same
+folder the optiscaler engine would use (Unreal: `<Game>/Binaries/Win64`):
+
+| From the package | Into the game folder |
+|---|---|
+| `OptiScaler.dll` | `dxgi.dll`, or whatever `--hook` names |
+| `OptiScaler.ini`, `OptiScaler/` (with `dlss5nr/` inside), `Licenses/` | as they are |
+| `linux/amdhip64_7.dll` | beside the executable — Wine looks for it there, not beside ZLUDA |
+| `linux/launch.sh`, `libdlss5nr_hip_bridge.so`, `README.txt` | `dlss5nr-linux/` |
+
+`setup_linux.sh`, `setup_windows.bat` and the "extract all files" marker are left
+out. Everything placed is listed in the state file before anything moves
+(`ours=`), so even an install that dies halfway uninstalls cleanly. A game
+file already sitting under one of those names — its own `dxgi.dll` or
+`amdhip64_7.dll` — is set aside in `.dlss5-linux-backup/` and put back by
+`--uninstall`; a game's own `Licenses/` is merged into file by file and keeps
+its files; an `OptiScaler.log` that predates the install is left alone. A
+hand-installed `OptiScaler/` folder is refused rather than merged. The game's
+own `libxess.dll`, `amd_fidelityfx_*.dll` or `D3D12Core.dll` are never touched:
+the package keeps its copies inside `OptiScaler/`. Uninstall removes
+`dlss5nr-linux/` and the whole `OptiScaler/` folder, cache included.
+
+Its launch option runs the game through `launch.sh`:
+
+```
+WINEDLLOVERRIDES="dxgi=n,b" "/path/to/game/dlss5nr-linux/launch.sh" %command%
+```
+
+No `PROTON_ENABLE_NVAPI=1`: with NVAPI on, Proton puts Wine's `nvcuda` in front
+of the plugin's (ZLUDA's), and the network cannot start. `launch.sh` sets
+`PROTON_DISABLE_NVAPI=1` and `nvcuda=n` itself, preloads the bridge and shows
+ROCm to Steam's container.
+
+`OptiScaler.ini` is edited only through keys the package's ini actually has:
+`--nr` sets `[NeuralRendering] Enabled` (not `[DlssNr]`), `--overlay` sets
+`[Menu] OverlayMenu`, and `--upscaler` sets `[Upscalers] Dx12Upscaler`. There is
+no toggle key on this engine, so `--toggle-key` is refused. Installs default the
+overlay **off** — upstream saw it turn the screen black under GE-Proton11-7 — so
+neural rendering is switched with `--configure --nr=on` or the GUI checkbox, or
+with `--overlay=on` and Insert → Neural Rendering. A reinstall keeps your
+settings, as on the other engines. The plugin's own log is
+`OptiScaler/dlss5nr/cache/dlss5nr.log`; its messages are explained in
+`dlss5nr-linux/README.txt`, the package's own README. That one describes the
+package's layout — `linux/launch.sh`, `setup_linux.sh`, `remove_optiscaler.sh`
+— so the install puts a note at its top with the real launch option and points
+to `--uninstall` instead.
+
+The risks are larger than the other engines' and you should weigh them:
+
+- It bundles **NVIDIA's leaked `nvngx_dlssnr.dll` 310.8.0.0**, unpatched — the
+  same pre-release code as the other engines, in its original signed form.
+- It bundles **ZLUDA and other closed binaries** (`dlss5nr_runtime.dll`,
+  `zluda_real.dll`, the HIP kernels, the bridge `.so` that is preloaded into
+  every process of the game's session), published by a **new GitHub account**.
+  The zip is pinned by SHA-256 (`502624e0…c7718595`), so what you install is what
+  was looked at, not whatever the release holds later — but pinning says
+  nothing about what the binaries do.
+- **Single-player only, never with anti-cheat** — the probe's anti-cheat refusal
+  applies here too.
+
 ## Requirements
+
+These are for the NVIDIA engines; the amd engine's are
+[in its section](#amd-gpus---engineamd-experimental).
 
 - **RTX 40 series (Ada, compute capability 8.9).** The `nvngx_dlssnr.dll` the
   installer downloads has been patched to `sm_89` cubins only — verified:
@@ -586,19 +751,32 @@ VKD3D_CONFIG=dxr11 PROTON_HIDE_NVIDIA_GPU=0 %command%
 Match `dxgi` to whatever `--hook` you chose. `PROTON_ENABLE_NGX_UPDATER` manages
 `nvngx_dlss/dlssg/dlssd` and does not touch `nvngx_dlssnr.dll`.
 
+The amd engine's are different — no NVIDIA variables, and its wrapper in front of
+the game:
+
+```
+WINEDLLOVERRIDES="dxgi=n,b" "/path/to/game/dlss5nr-linux/launch.sh" %command%
+```
+
+The script prints the path quoted for Steam, spaces and all. `--launch-options`
+prints it again later.
+
 ## Caveats
 
 This repository holds no binaries. Every file the installer puts in your game
 folder is fetched at run time, over https, from somebody else's release page,
-unpacked, and copied in. There is no checksum, no signature check and no pinning
-beyond the literal URLs in `dlss5-linux.sh` — a release that is retagged or
-replaced upstream changes what you install, and you would not be told.
+unpacked, and copied in. There is no signature check, and only two downloads are
+pinned by SHA-256 — Microsoft's `d3dcompiler_47.dll` (feeder engine) and the amd
+engine's package. For the rest there is no pinning beyond the literal URLs in
+`dlss5-linux.sh` — a release that is retagged or replaced upstream changes what
+you install, and you would not be told.
 
 | Host | What comes from it |
 |---|---|
 | `github.com/Dagherbou/OptiScaler_DLSSNR` | the OptiScaler build carrying the neural pass — the default engine |
 | `github.com/yumlevi/renodx-dlss-installer` | `streamline.zip`, which is where `nvngx_dlssnr.dll` comes from, and the RenoDX `renodx-dlss5` add-on |
 | `reshade.me` | the ReShade 6.8.0 add-on installer, unpacked for `ReShade64.dll` — reshade engine only |
+| `github.com/RedDukeDev/dlss5-nr-amd-custom` | the 1.1.0 release zip: OptiScaler with dlss5nr, NVIDIA's `nvngx_dlssnr.dll`, ZLUDA, the translation cache and the HIP bridge — amd engine only, pinned by hash |
 | `github.com/GloriousEggroll/proton-ge-custom` | the GE-Proton tarball — `--install-proton` only |
 
 The exact URLs are the `readonly` constants under "Upstream sources" at the top
