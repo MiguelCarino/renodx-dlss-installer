@@ -1,0 +1,2 @@
+# Build outputs from build-rpm.sh and appimage/build-appimage.sh.
+dist/

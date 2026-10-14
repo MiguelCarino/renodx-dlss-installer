@@ -1,0 +1,97 @@
+#!/bin/sh
+# AppRun - entry point of the "DLSS 5 for Linux" AppImage.
+#
+#   DLSS5_for_Linux-x86_64.AppImage [app options]   # the desktop app (dlss5-app.py)
+#   DLSS5_for_Linux-x86_64.AppImage cli [args]      # the CLI (dlss5-linux.sh)
+#   dlss5-linux [args]                              # the CLI, via a symlink of that name
+#
+# The AppImage carries only our scripts, not an interpreter: python3, bash and
+# the tools dlss5-linux.sh shells out to come from the host. Bundling Python,
+# PyGObject, GTK 4, libadwaita and WebKitGTK would cost hundreds of MB and still
+# break against the host's Mesa, glibc and portal versions, which is the usual
+# way GTK AppImages fail. The app already copes with a host that lacks the GTK
+# stack (it falls back to the system browser), so a host python3 is the only
+# hard requirement - and every distro this targets ships one.
+#
+# Nothing here touches LD_LIBRARY_PATH, GI_TYPELIB_PATH, XDG_DATA_DIRS or the
+# like: the host's GTK must load the host's own libraries, untouched.
+set -eu
+
+# The runtime exports APPDIR (the squashfs mount, or the extract dir under
+# --appimage-extract-and-run). Fall back to our own location so the AppDir can
+# also be run unpacked, straight from the build tree.
+APPDIR="${APPDIR:-$(dirname "$(readlink -f "$0")")}"
+SHARE_DIR="$APPDIR/usr/share/dlss5-linux"
+
+# The mount is read-only and the extract dir is shared between runs; neither is
+# a place for Python to drop a __pycache__. dlss5-app.py already turns bytecode
+# writing off for itself; this covers the python3 calls dlss5-linux.sh makes.
+PYTHONDONTWRITEBYTECODE=1
+export PYTHONDONTWRITEBYTECODE
+
+# The .desktop file says Exec=dlss5-linux-gui and the app may call the CLI by
+# name; putting our usr/bin first makes both resolve to this AppImage's copies.
+# usr/bin holds only those two shell wrappers, so nothing of the host's is
+# shadowed.
+PATH="$APPDIR/usr/bin:$PATH"
+export PATH
+
+# ARGV0 is how the runtime passes the name the AppImage was started as ($0 is
+# always this AppRun), so a symlink "dlss5-linux -> DLSS5_for_Linux.AppImage"
+# behaves like the RPM's CLI command.
+mode=app
+case "$(basename "${ARGV0:-$0}")" in
+    dlss5-linux) mode=cli; DLSS5_PROG=dlss5-linux ;;
+esac
+if [ "$mode" = app ] && [ "${1:-}" = cli ]; then
+    mode=cli
+    # dlss5-linux.sh prints this name in its usage and hints, so the examples
+    # it gives can be pasted back as they are.
+    DLSS5_PROG="${APPIMAGE:-${ARGV0:-$0}} cli"
+    shift
+fi
+
+if [ "$mode" = cli ]; then
+    # dlss5-linux.sh checks its own dependencies (curl, unzip, objdump, 7z)
+    # and names the missing ones, so only bash is checked here.
+    if ! command -v bash >/dev/null 2>&1; then
+        echo "dlss5-linux: bash is required but was not found on this system." >&2
+        exit 127
+    fi
+    export DLSS5_PROG
+    exec bash "$SHARE_DIR/dlss5-linux.sh" "$@"
+fi
+
+# fail TEXT - print to stderr, and when no terminal is there to show it (the
+# AppImage was double-clicked, or started from the menu: Terminal=false), also
+# put it on screen with whichever desktop notifier the host has. Otherwise a
+# missing dependency looks like an app that does nothing.
+fail() {
+    printf '%s\n' "$1" >&2
+    if [ ! -t 2 ]; then
+        if command -v zenity >/dev/null 2>&1; then
+            zenity --error --title="DLSS 5 for Linux" --text="$1" >/dev/null 2>&1 || :
+        elif command -v kdialog >/dev/null 2>&1; then
+            kdialog --title "DLSS 5 for Linux" --error "$1" >/dev/null 2>&1 || :
+        elif command -v notify-send >/dev/null 2>&1; then
+            notify-send --app-name="DLSS 5 for Linux" "DLSS 5 for Linux cannot start" "$1" \
+                >/dev/null 2>&1 || :
+        fi
+    fi
+    exit 127
+}
+
+if ! command -v python3 >/dev/null 2>&1; then
+    # printf, not cat: a shell builtin, so the message survives even a PATH
+    # stripped bare enough to lose python3.
+    fail "$(printf '%s\n' \
+        "DLSS 5 for Linux needs Python 3 from your distribution; it is not bundled." \
+        "Install it, then run this AppImage again:" \
+        "    Fedora:        sudo dnf install python3" \
+        "    Debian/Ubuntu: sudo apt install python3" \
+        "    Arch:          sudo pacman -S python" \
+        "For the native window (optional - without it the app opens in your browser)" \
+        "also install PyGObject with GTK 4, libadwaita and WebKitGTK 6.0, e.g. on Fedora:" \
+        "    sudo dnf install python3-gobject gtk4 libadwaita webkitgtk6.0")"
+fi
+exec python3 "$SHARE_DIR/dlss5-app.py" "$@"

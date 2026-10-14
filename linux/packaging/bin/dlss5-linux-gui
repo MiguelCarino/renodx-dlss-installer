@@ -1,0 +1,12 @@
+#!/bin/sh
+# dlss5-linux-gui - launcher for the native desktop app (dlss5-app.py).
+#
+# Resolves the share directory the same way as dlss5-linux. The script is run
+# through its own shebang, not "python3" from PATH: rpmbuild rewrites that
+# shebang to /usr/bin/python3, the interpreter the RPM's python3-gobject is
+# installed for. A venv, conda or pyenv python3 first on PATH has no gi, and
+# would quietly drop the app to the browser. (The AppImage's AppRun calls
+# python3 itself and does not go through this wrapper.)
+set -eu
+SHARE_DIR="$(dirname "$(readlink -f "$0")")/../share/dlss5-linux"
+exec "$SHARE_DIR/dlss5-app.py" "$@"

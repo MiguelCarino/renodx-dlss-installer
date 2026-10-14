@@ -1,0 +1,14 @@
+#!/bin/sh
+# dlss5-linux - CLI launcher for the packaged dlss5-linux.sh.
+#
+# The real script lives in ../share/dlss5-linux relative to this file, which is
+# /usr/share/dlss5-linux for the RPM and <AppDir>/usr/share/dlss5-linux inside
+# the AppImage mount. readlink -f follows a symlink (e.g. ~/.local/bin/dlss5-linux
+# -> /usr/bin/dlss5-linux) so the relative lookup still lands in the right place.
+set -eu
+SHARE_DIR="$(dirname "$(readlink -f "$0")")/../share/dlss5-linux"
+# DLSS5_PROG makes the script's usage and hints name the command the user
+# actually typed, not the dlss5-linux.sh file behind it.
+DLSS5_PROG=dlss5-linux
+export DLSS5_PROG
+exec "$SHARE_DIR/dlss5-linux.sh" "$@"

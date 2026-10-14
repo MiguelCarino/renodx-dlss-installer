@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- DLSS 5 for Linux app icon. Original artwork: coarse pixels on the left are
+     fed through a small network and come out as a smooth "5". No third-party
+     logos or wordmarks. The "5" is a path, not text, so it renders the same
+     with or without any particular font installed. -->
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2b2f6b"/>
+      <stop offset="1" stop-color="#121433"/>
+    </linearGradient>
+    <linearGradient id="glyph" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7ff3ff"/>
+      <stop offset="1" stop-color="#b48cff"/>
+    </linearGradient>
+  </defs>
+  <rect x="12" y="12" width="232" height="232" rx="52" ry="52" fill="url(#bg)"/>
+  <rect x="12.5" y="12.5" width="231" height="231" rx="51.5" ry="51.5" fill="none" stroke="#ffffff" stroke-opacity="0.12"/>
+
+  <!-- Network edges: every input pixel feeds the "5" -->
+  <g stroke="#7ff3ff" stroke-opacity="0.35" stroke-width="3" stroke-linecap="round" fill="none">
+    <path d="M70 82 L112 72"/>
+    <path d="M70 82 L106 122"/>
+    <path d="M70 128 L106 122"/>
+    <path d="M70 128 L150 112"/>
+    <path d="M70 174 L106 122"/>
+    <path d="M70 174 L96 178"/>
+  </g>
+
+  <!-- Low-resolution input: blocky pixels, dimmer toward the edge -->
+  <g fill="#7ff3ff">
+    <rect x="34" y="68" width="28" height="28" rx="5" fill-opacity="0.95"/>
+    <rect x="34" y="114" width="28" height="28" rx="5" fill-opacity="0.7"/>
+    <rect x="34" y="160" width="28" height="28" rx="5" fill-opacity="0.45"/>
+  </g>
+  <g fill="#ffffff">
+    <circle cx="70" cy="82" r="6"/>
+    <circle cx="70" cy="128" r="6"/>
+    <circle cx="70" cy="174" r="6"/>
+  </g>
+
+  <!-- High-resolution output: a smooth "5" -->
+  <path d="M174 72 H112 L106 122 C120 113 134 110 148 111 C176 113 196 132 196 158 C196 186 174 204 146 204 C124 204 106 194 96 178"
+        fill="none" stroke="url(#glyph)" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#ffffff">
+    <circle cx="112" cy="72" r="6"/>
+    <circle cx="106" cy="122" r="6"/>
+    <circle cx="150" cy="112" r="6"/>
+    <circle cx="96" cy="178" r="6"/>
+  </g>
+</svg>

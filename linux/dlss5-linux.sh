@@ -95,8 +95,18 @@ confirm() {
     [[ "${reply,,}" == y || "${reply,,}" == yes ]]
 }
 
+# The name to show in usage and hints: the packaged launchers export
+# DLSS5_PROG (dlss5-linux, or "<AppImage> cli") because $0 there is the script
+# file in /usr/share or the AppImage mount, which is not what the user typed.
+PROG="${DLSS5_PROG:-$0}"
+
 usage() {
-    cat <<'USAGE'
+    # Quoted heredoc, so nothing in it expands. Run from the repository the
+    # text prints exactly as written; under a launcher the name is swapped in
+    # afterwards, with \, & and the | delimiter escaped for sed.
+    local name="${DLSS5_PROG:-dlss5-linux.sh}"
+    name="${name//\\/\\\\}"; name="${name//&/\\&}"; name="${name//|/\\|}"
+    cat <<'USAGE' | sed "s|dlss5-linux\.sh|$name|g"
 dlss5-linux.sh - DLSS 5 Neural Rendering on Linux/Proton for RTX 40 (Ada)
 
 Usage:
@@ -310,7 +320,7 @@ check_proton() {
     done
 
     if (( ! ${#found[@]} )); then
-        warn "No Proton runtimes found. Run: $0 --install-proton"
+        warn "No Proton runtimes found. Run: $PROG --install-proton"
         return
     fi
 
@@ -329,7 +339,7 @@ check_proton() {
         ok "A modern Proton is available"
     else
         warn "Only old Proton found. NGX bridging needs Proton 9+ or GE-Proton."
-        warn "Run: $0 --install-proton"
+        warn "Run: $PROG --install-proton"
     fi
 }
 

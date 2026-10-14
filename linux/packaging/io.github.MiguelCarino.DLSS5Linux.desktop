@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=DLSS 5 for Linux
+GenericName=DLSS 5 Installer
+Comment=Probe Steam games and install DLSS 5 neural rendering under Proton
+# The launcher resolves its own share directory, so the bare name works for
+# both the RPM (/usr/bin on PATH) and the AppImage (AppRun puts usr/bin on PATH).
+Exec=dlss5-linux-gui
+Icon=io.github.MiguelCarino.DLSS5Linux
+Terminal=false
+Categories=Game;Utility;
+Keywords=DLSS;Proton;Steam;OptiScaler;ReShade;upscaling;
+# Matches the GTK application id dlss5-app.py registers, so the dock groups the
+# window under this launcher instead of a generic python3 entry.
+StartupWMClass=io.github.MiguelCarino.DLSS5Linux
+StartupNotify=true

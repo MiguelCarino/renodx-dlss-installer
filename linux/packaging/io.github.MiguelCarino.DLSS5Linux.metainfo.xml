@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata for software centres (GNOME Software, KDE Discover) and
+     for appimagetool, which validates it. The id must equal the desktop file's
+     basename minus ".desktop" or the two are not linked. -->
+<component type="desktop-application">
+  <id>io.github.MiguelCarino.DLSS5Linux</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <!-- No licence has been granted for linux/ yet: the repository's only
+       licence file, reshade/LICENSE.md, is ReShade's own and covers just the
+       vendored reshade/setup code, none of which is packaged. Until the owner
+       adds a LICENSE, "all rights reserved" is the honest answer, and
+       LicenseRef-proprietary is how AppStream spells it. Change this, the
+       spec's License: and the %license line together. -->
+  <project_license>LicenseRef-proprietary</project_license>
+
+  <name>DLSS 5 for Linux</name>
+  <summary>Probe Steam games and install DLSS 5 neural rendering under Proton</summary>
+
+  <developer id="io.github.miguelcarino">
+    <name>MiguelCarino</name>
+  </developer>
+
+  <description>
+    <p>
+      A Linux port of the renodx-dlss-installer. It walks every Steam library,
+      probes each installed game to say whether DLSS 5 can work there, and
+      installs, uninstalls or launches it without you typing a path.
+    </p>
+    <p>Three injection engines are supported:</p>
+    <ul>
+      <li>optiscaler: for D3D12 games that already ship DLSS (recommended)</li>
+      <li>reshade: ReShade with the RenoDX DLSS 5 add-on and Streamline</li>
+      <li>feeder: DLSS5-Feeder for games with no DLSS of their own</li>
+    </ul>
+    <p>
+      Components are downloaded at run time from their projects' GitHub
+      releases and are not shipped with this application. The neural rendering
+      model is pre-release third-party code: use it in single-player games only,
+      never with anti-cheat.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.MiguelCarino.DLSS5Linux.desktop</launchable>
+  <provides>
+    <binary>dlss5-linux</binary>
+    <binary>dlss5-linux-gui</binary>
+  </provides>
+
+  <url type="homepage">https://github.com/MiguelCarino/renodx-dlss-installer</url>
+  <url type="bugtracker">https://github.com/MiguelCarino/renodx-dlss-installer/issues</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>A game with its own DLSS, installed with the optiscaler engine</caption>
+      <image>https://raw.githubusercontent.com/MiguelCarino/renodx-dlss-installer/main/linux/docs/images/gui-dlss-game.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>A game with no DLSS, running DLSS 5 through the feeder engine</caption>
+      <image>https://raw.githubusercontent.com/MiguelCarino/renodx-dlss-installer/main/linux/docs/images/gui-feeder-game.png</image>
+    </screenshot>
+  </screenshots>
+
+  <categories>
+    <category>Game</category>
+    <category>Utility</category>
+  </categories>
+
+  <recommends>
+    <control>pointing</control>
+  </recommends>
+  <supports>
+    <control>keyboard</control>
+  </supports>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="1.0.0" date="2026-10-14">
+      <description>
+        <p>First packaged release: native desktop window, RPM and AppImage builds.</p>
+      </description>
+    </release>
+  </releases>
+</component>

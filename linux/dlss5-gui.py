@@ -1626,6 +1626,7 @@ PAGE = r"""<!doctype html>
       <input id="addpath" type="text" spellcheck="false" autocomplete="off"
              placeholder="/path/to/a/game not in Steam">
       <button id="addfolder" title="Remember a game folder Steam does not list">Add</button>
+      <button id="browsefolder" hidden title="Pick a game folder with the file chooser">Browse&hellip;</button>
     </div>
     <div id="adderr" class="adderr" hidden></div>
     <ul id="games"><li class="empty" style="padding:20px">Loading&hellip;</li></ul>
@@ -2481,6 +2482,30 @@ async function job(path, body) {
   }, 700);
 }
 
+// ---- native app bridge ---------------------------------------------------
+
+// Inside the desktop app (dlss5-app.py) the page runs in a WebKitGTK view that
+// exposes a "dlss5" message handler. A browser has no way to hand a page a
+// filesystem path, so the folder chooser only exists there; in a plain browser
+// the handler is absent and nothing below changes the page.
+function nativeBridge() {
+  const native = window.webkit?.messageHandlers?.dlss5;
+  if (!native) return;
+  const btn = document.getElementById("browsefolder");
+  btn.hidden = false;
+  btn.onclick = () => native.postMessage({ op: "browse" });
+  // The app calls this with the folder the user picked; it then takes exactly
+  // the path a typed entry would, so validation stays in one place.
+  window.dlss5Picked = path => {
+    if (!path) return;
+    document.getElementById("addpath").value = path;
+    addFolder();
+  };
+  // Lets the app's --self-test prove the round trip page -> app -> page.
+  window.dlss5Pong = () => { window.dlss5BridgeOk = true; };
+  native.postMessage({ op: "ping" });
+}
+
 // ---- boot ----------------------------------------------------------------
 
 (async () => {
@@ -2492,6 +2517,7 @@ async function job(path, body) {
   document.getElementById("addpath").onkeydown = e => {
     if (e.key === "Enter") addFolder();
   };
+  nativeBridge();
   startActivity();
 })();
 </script>
@@ -2500,20 +2526,36 @@ async function job(path, body) {
 """
 
 
+def check_script():
+    """Refuse to start without the shell script: every route ends up in it."""
+    if not SCRIPT.is_file():
+        sys.exit("dlss5-linux.sh not found next to this script (%s)" % SCRIPT)
+    if not os.access(SCRIPT, os.X_OK):
+        sys.exit("dlss5-linux.sh is not executable: chmod +x %s" % SCRIPT)
+
+
+def make_server(port):
+    """Bind the GUI's server on 127.0.0.1 and return (server, tokened URL).
+
+    Split out of main() so the native app (dlss5-app.py) can run the very same
+    server in-process. Port 0 asks the kernel for a free one, which is why the
+    URL is built from the bound address rather than from the argument. Raises
+    OSError when the port is taken; the caller decides how to say so."""
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = "http://127.0.0.1:%d/?t=%s" % (server.server_address[1], TOKEN)
+    return server, url
+
+
 def main():
     parser = argparse.ArgumentParser(description="Local web GUI for dlss5-linux.sh")
     parser.add_argument("--port", type=int, default=8777)
     parser.add_argument("--no-open", action="store_true", help="do not open a browser")
     args = parser.parse_args()
 
-    if not SCRIPT.is_file():
-        sys.exit("dlss5-linux.sh not found next to this script (%s)" % SCRIPT)
-    if not os.access(SCRIPT, os.X_OK):
-        sys.exit("dlss5-linux.sh is not executable: chmod +x %s" % SCRIPT)
+    check_script()
 
-    url = "http://127.0.0.1:%d/?t=%s" % (args.port, TOKEN)
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+        server, url = make_server(args.port)
     except OSError as exc:
         sys.exit("cannot listen on 127.0.0.1:%d - %s\nSomething else is using that port; try --port %d"
                  % (args.port, exc.strerror or exc, args.port + 1))

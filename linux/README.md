@@ -43,6 +43,61 @@ Properties → Compatibility.
 | `-y`, `--yes` | Answer prompts yes. There is one: "an install already exists here, uninstall first?" |
 | `-h`, `--help` | The full option list, then exit. |
 
+## Desktop app and packages
+
+`./dlss5-app.py` is the same GUI in its own window (GTK 4, libadwaita and
+WebKitGTK 6 through PyGObject) instead of a browser tab. Without those libraries
+it says what is missing and opens the system browser, exactly like
+`./dlss5-gui.py`; `--browser` does that on purpose.
+
+Installed from a package, the commands are:
+
+```bash
+dlss5-linux-gui        # the desktop app; also "DLSS 5 for Linux" in the app menu
+dlss5-linux --help     # the CLI, i.e. dlss5-linux.sh
+```
+
+Closing the window while an install, uninstall or launch is still running asks
+first: the job would otherwise be cut off mid-way. "Close When Finished" hides
+the window and exits once the last job ends.
+
+Build an RPM (needs `rpm-build`, `desktop-file-utils` and `python3`, no root)
+and install it:
+
+```bash
+packaging/build-rpm.sh
+sudo dnf install ./packaging/dist/dlss5-linux-1.0.0-1.*.noarch.rpm
+```
+
+The RPM pulls in the CLI's tools (curl, unzip, binutils, 7z, xdg-utils) and only
+recommends the GTK/WebKit libraries, since the app works without them.
+
+Or an AppImage, a single file that needs no root to run:
+
+```bash
+packaging/appimage/build-appimage.sh
+chmod +x packaging/dist/DLSS5_for_Linux-1.0.0-x86_64.AppImage   # if the copy lost it
+packaging/dist/DLSS5_for_Linux-1.0.0-x86_64.AppImage             # the desktop app
+packaging/dist/DLSS5_for_Linux-1.0.0-x86_64.AppImage cli --help  # the CLI
+ln -s "$PWD/packaging/dist/DLSS5_for_Linux-1.0.0-x86_64.AppImage" ~/.local/bin/dlss5-linux
+dlss5-linux --help                                               # the CLI by its usual name
+```
+
+The AppImage carries only these scripts, not Python or GTK, so the host
+provides the same things the RPM would install: `python3`, `bash`, `curl`,
+`unzip`, `binutils` (objdump), 7z (`p7zip-plugins` / `7zip` on Fedora,
+`7zip` or `p7zip-full` on Debian/Ubuntu) and `xdg-utils`; and for the native
+window, optionally, PyGObject with GTK 4, libadwaita and WebKitGTK 6.0
+(`python3-gobject gtk4 libadwaita webkitgtk6.0` on Fedora). Without those it
+opens in your browser.
+
+On a host without FUSE (libfuse2) run it with `--appimage-extract-and-run`
+first, e.g. `DLSS5_for_Linux-1.0.0-x86_64.AppImage --appimage-extract-and-run cli --help`.
+The AppImage runtime leaves its extract (`appimage_extracted_<hash>`, about
+250 KB, one per AppImage build) in `$TMPDIR` or `/tmp` after it exits; delete those by hand.
+
+Both builds write to `packaging/dist/`.
+
 ## Web GUI
 
 `./dlss5-gui.py` serves a local page that walks every Steam library, probes each
