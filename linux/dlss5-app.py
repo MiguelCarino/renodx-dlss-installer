@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """
 dlss5-app.py - "DLSS 5 for Linux" as a desktop application
 

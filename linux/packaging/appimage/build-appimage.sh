@@ -119,8 +119,7 @@ put "$PACKAGING_DIR/$APP_ID.svg"          "usr/share/icons/hicolor/scalable/apps
 put "$PACKAGING_DIR/$APP_ID.png"          "usr/share/icons/hicolor/256x256/apps/$APP_ID.png"      0644
 put "$PACKAGING_DIR/$APP_ID.metainfo.xml" "usr/share/metainfo/$APP_ID.metainfo.xml"               0644
 put "$LINUX_DIR/README.md"       usr/share/doc/dlss5-linux/README.md  0644
-# No licence file: linux/ has none yet, and reshade/LICENSE.md is ReShade's,
-# not this app's (see the spec's License: comment). Ship one once it exists.
+put "$LINUX_DIR/LICENSE"         usr/share/licenses/dlss5-linux/LICENSE 0644
 put "$HERE/AppRun" AppRun 0755
 
 # appimagetool wants exactly one .desktop file at the AppDir root, an icon there

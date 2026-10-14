@@ -50,6 +50,7 @@ readonly FILES=(
     linux/dlss5-gui.py
     linux/dlss5-app.py
     linux/README.md
+    linux/LICENSE
     linux/packaging/bin/dlss5-linux
     linux/packaging/bin/dlss5-linux-gui
     "linux/packaging/$APP_ID.desktop"

@@ -606,3 +606,12 @@ Expect a large frame-rate cost — roughly 39% has been reported on Ada, since t
 architecture genuinely lacks the throughput for the model.
 
 **Single-player only. Never with anti-cheat.**
+
+## License
+
+Everything in `linux/` — the scripts, the desktop app and the packaging — is
+licensed under the [GNU General Public License v3.0](LICENSE) (`GPL-3.0-only`).
+It does not cover the rest of the repository: the upstream installer and the
+vendored ReShade code under `../reshade/` keep their own licences
+(`../reshade/LICENSE.md`), and the DLLs the scripts download at install time are
+not distributed here and carry their own terms.

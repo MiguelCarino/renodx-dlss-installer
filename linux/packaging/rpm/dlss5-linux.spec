@@ -12,13 +12,12 @@ Version:        %{!?pkg_version:%{error:build this with ../build-rpm.sh, which w
 Release:        1%{?dist}
 Summary:        Probe Steam games and install DLSS 5 neural rendering under Proton
 
-# No licence has been granted for linux/ yet, so this says "all rights
-# reserved". reshade/LICENSE.md is NOT this package's licence: it is ReShade's
+# linux/ (everything this package ships) is GPL-3.0-only; see linux/LICENSE.
+# reshade/LICENSE.md is NOT this package's licence: it is ReShade's
 # (BSD-3-Clause, Patrick Mours) and covers only the vendored reshade/setup code,
-# none of which is packaged. When the owner adds a LICENSE, set it here, add a
-# %%license line for it and update <project_license> in the metainfo to match.
+# none of which is packaged. Keep <project_license> in the metainfo in step.
 # The DLLs fetched at run time carry their own terms and are not shipped.
-License:        LicenseRef-proprietary
+License:        GPL-3.0-only
 URL:            https://github.com/MiguelCarino/renodx-dlss-installer
 Source0:        %{name}-%{version}.tar.gz
 
@@ -94,6 +93,7 @@ python3 -c 'import sys; [compile(open(f).read(), f, "exec") for f in sys.argv[1:
     %{buildroot}%{_datadir}/%{name}/*.py
 
 %files
+%license linux/LICENSE
 # README.md is the project's full readme; its build-from-source paths do not
 # apply to an installed system, but its usage sections do.
 %doc linux/README.md

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
 #
 # dlss5-linux.sh - DLSS 5 "Neural Rendering" on Fedora/Linux via Proton, on RTX 40 (Ada).
 #

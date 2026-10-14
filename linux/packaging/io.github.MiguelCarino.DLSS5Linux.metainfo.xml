@@ -5,13 +5,7 @@
 <component type="desktop-application">
   <id>io.github.MiguelCarino.DLSS5Linux</id>
   <metadata_license>CC0-1.0</metadata_license>
-  <!-- No licence has been granted for linux/ yet: the repository's only
-       licence file, reshade/LICENSE.md, is ReShade's own and covers just the
-       vendored reshade/setup code, none of which is packaged. Until the owner
-       adds a LICENSE, "all rights reserved" is the honest answer, and
-       LicenseRef-proprietary is how AppStream spells it. Change this, the
-       spec's License: and the %license line together. -->
-  <project_license>LicenseRef-proprietary</project_license>
+  <project_license>GPL-3.0-only</project_license>
 
   <name>DLSS 5 for Linux</name>
   <summary>Probe Steam games and install DLSS 5 neural rendering under Proton</summary>
