@@ -73,6 +73,15 @@ anti-cheat.
 install -Dpm 0755 linux/dlss5-linux.sh %{buildroot}%{_datadir}/%{name}/dlss5-linux.sh
 install -Dpm 0755 linux/dlss5-gui.py   %{buildroot}%{_datadir}/%{name}/dlss5-gui.py
 install -Dpm 0755 linux/dlss5-app.py   %{buildroot}%{_datadir}/%{name}/dlss5-app.py
+# The "Still image" view's runtime: a Wine-side helper built from still/native
+# (shipped beside it as its corresponding source) and the script that runs it
+# in a private prefix under ~/.local/share.
+install -Dpm 0755 linux/still/nr-runtime.sh            %{buildroot}%{_datadir}/%{name}/still/nr-runtime.sh
+install -Dpm 0644 linux/still/bin/nrstill.exe          %{buildroot}%{_datadir}/%{name}/still/bin/nrstill.exe
+install -Dpm 0644 linux/still/bin/nvngx.dll_nrshim.dll %{buildroot}%{_datadir}/%{name}/still/bin/nvngx.dll_nrshim.dll
+install -Dpm 0644 linux/still/native/nrstill.cpp       %{buildroot}%{_datadir}/%{name}/still/native/nrstill.cpp
+install -Dpm 0644 linux/still/native/nrshim.cpp        %{buildroot}%{_datadir}/%{name}/still/native/nrshim.cpp
+install -Dpm 0755 linux/still/native/build.sh          %{buildroot}%{_datadir}/%{name}/still/native/build.sh
 
 install -Dpm 0755 linux/packaging/bin/dlss5-linux     %{buildroot}%{_bindir}/dlss5-linux
 install -Dpm 0755 linux/packaging/bin/dlss5-linux-gui %{buildroot}%{_bindir}/dlss5-linux-gui
@@ -86,6 +95,7 @@ install -Dpm 0644 linux/packaging/%{app_id}.metainfo.xml %{buildroot}%{_metainfo
 desktop-file-validate %{buildroot}%{_datadir}/applications/%{app_id}.desktop
 # Catches a script that would fail before printing anything, e.g. a syntax error.
 bash -n %{buildroot}%{_datadir}/%{name}/dlss5-linux.sh
+bash -n %{buildroot}%{_datadir}/%{name}/still/nr-runtime.sh
 sh -n %{buildroot}%{_bindir}/dlss5-linux
 sh -n %{buildroot}%{_bindir}/dlss5-linux-gui
 # compile() rather than py_compile, so no __pycache__ lands in the buildroot.
@@ -103,12 +113,17 @@ python3 -c 'import sys; [compile(open(f).read(), f, "exec") for f in sys.argv[1:
 %{_datadir}/%{name}/dlss5-linux.sh
 %{_datadir}/%{name}/dlss5-gui.py
 %{_datadir}/%{name}/dlss5-app.py
+%{_datadir}/%{name}/still/
 %{_datadir}/applications/%{app_id}.desktop
 %{_datadir}/icons/hicolor/scalable/apps/%{app_id}.svg
 %{_datadir}/icons/hicolor/256x256/apps/%{app_id}.png
 %{_metainfodir}/%{app_id}.metainfo.xml
 
 %changelog
+* Wed Oct 14 2026 MiguelCarino <miguel.carino1994@outlook.com> - 0.0.3-1
+- Experimental "Still image" view: run the DLSS 5 NR model on a picture
+  through a headless Wine helper (still/), with a before/after comparison.
+
 * Wed Oct 14 2026 MiguelCarino <miguel.carino1994@outlook.com> - 0.0.2-1
 - Detect the GPU vendor from sysfs; clear messages on AMD and Intel.
 - Experimental AMD engine (--engine=amd) using RedDukeDev/dlss5-nr-amd-custom.

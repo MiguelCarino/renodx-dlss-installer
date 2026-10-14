@@ -69,6 +69,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.0.3" date="2026-10-14">
+      <description>
+        <p>Experimental "Still image" view: run the DLSS 5 neural rendering model on a picture in a private, headless Wine prefix, and compare the result with the original.</p>
+      </description>
+    </release>
     <release version="0.0.2" date="2026-10-14">
       <description>
         <p>GPU vendor detection with clear messages for AMD and Intel, and an experimental AMD engine (RDNA2/3/4 through RedDukeDev's ZLUDA port, needs ROCm 7).</p>

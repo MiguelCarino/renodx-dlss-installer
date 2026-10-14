@@ -49,6 +49,12 @@ readonly FILES=(
     linux/dlss5-linux.sh
     linux/dlss5-gui.py
     linux/dlss5-app.py
+    linux/still/nr-runtime.sh
+    linux/still/bin/nrstill.exe
+    linux/still/bin/nvngx.dll_nrshim.dll
+    linux/still/native/nrstill.cpp
+    linux/still/native/nrshim.cpp
+    linux/still/native/build.sh
     linux/README.md
     linux/LICENSE
     linux/packaging/bin/dlss5-linux

@@ -129,7 +129,7 @@ window, optionally, PyGObject with GTK 4, libadwaita and WebKitGTK 6.0
 opens in your browser.
 
 On a host without FUSE (libfuse2) run it with `--appimage-extract-and-run`
-first, e.g. `DLSS5_for_Linux-0.0.2-x86_64.AppImage --appimage-extract-and-run cli --help`.
+first, e.g. `DLSS5_for_Linux-0.0.3-x86_64.AppImage --appimage-extract-and-run cli --help`.
 The AppImage runtime leaves its extract (`appimage_extracted_<hash>`, about
 250 KB, one per AppImage build) in `$TMPDIR` or `/tmp` after it exits; delete those by hand.
 
@@ -336,6 +336,51 @@ the panel says when it is showing a tail.
 OptiScaler ships `LogToFile=true` at `LogLevel=2` (Info), so the log exists after
 a run with no configuration. Set `LogLevel=0` in `OptiScaler.ini` for trace
 detail when something is failing and Info is not saying why.
+
+## Still image (experimental)
+
+The **Still image** tab in the header runs the neural rendering model on a
+picture instead of a game. Open or drop an image, set the effect and press
+**Run**. Drag across the result to compare it with the original, and use
+**Save PNG** to write it to `~/Pictures/DLSS 5/`.
+
+- **Intensity** sets the strength of the whole effect. At 0 the image is
+  unchanged, and values above 1 add nothing.
+- **Structure** sets how much fine detail the model redraws. Lower values keep
+  more of the original detail.
+- **Tone** sets how much the lighting and colour change.
+- **Style 1** gives a darker, matte look.
+- **Passes** sets how many times the same image is fed in. The model keeps a
+  history between frames; the last pass is shown.
+
+The model relights the scene: it lifts shadowed sides, softens hard shadows and
+shrinks highlights. It does not sharpen or upscale. The picture is fed in as
+an sRGB game frame with flat depth and no motion, scaled down to 3840 px on the
+long side if it is larger.
+
+It needs an NVIDIA GPU (the cached `nvngx_dlssnr.dll` is the RTX 40 / sm_89
+build), GE-Proton, and the driver's NGX Wine files. On first use the tab offers
+a one-time setup, which:
+
+- creates a private, headless Wine prefix of about 1 GB in
+  `~/.local/share/dlss5-linux/still`; set `DLSS5_STILL_DATA` to put it elsewhere;
+- copies `nvngx_dlssnr.dll` from the installer's cache. Install the
+  optiscaler engine once to fill the cache, or choose the DLL or
+  `streamline.zip` yourself.
+
+Nothing runs in a window, and nothing touches games or their prefixes.
+
+How it works: `still/bin/nrstill.exe` creates a D3D12 device and starts the
+driver's NGX runtime. It then loads the NR DLL directly and creates and runs
+NGX feature 18. On RTX 40 the driver reports that feature as unavailable, so
+the driver's own loader cannot be used. The DLL also only accepts calls from a
+module whose path contains `nvngx.dll`, so every call goes through
+`still/bin/nvngx.dll_nrshim.dll`. The sources are in `still/native/`, and
+`build.sh` rebuilds both binaries with zig. `still/nr-runtime.sh` is the whole
+runtime (`status`, `setup`, `run`) and works without the GUI.
+
+Depth has no measurable effect on the output, and the model's preset setting
+did nothing in testing. Images with faces, and HDR input, are untested.
 
 ## Configuring OptiScaler.ini
 

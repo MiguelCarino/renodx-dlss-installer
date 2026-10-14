@@ -667,6 +667,122 @@ def open_path(path):
     return str(target)
 
 
+# ---- still image -----------------------------------------------------------
+#
+# The "Still image" view runs the NR model on a picture instead of a game:
+# still/nr-runtime.sh drives still/bin/nrstill.exe in a private, headless Wine
+# prefix. The page decodes the picture itself and sends raw RGBA8, so nothing
+# here needs an image library; it gets raw RGBA8 back and encodes the PNG
+# itself too.
+
+STILL_RUNTIME = HERE / "still" / "nr-runtime.sh"
+STILL_DATA = Path(os.environ.get("DLSS5_STILL_DATA") or DATA_HOME / "dlss5-linux" / "still")
+STILL_RUN = STILL_DATA / "prefix" / "drive_c" / "nr"
+STILL_LOG = STILL_DATA / "last-run.log"
+STILL_MAX_SIDE = 3840
+# A 4K frame of RGBA8 plus headroom; the page never sends more.
+STILL_MAX_BODY = STILL_MAX_SIDE * 2160 * 4 + (1 << 20)
+# One GPU run at a time: the prefix, input file and output folder are shared.
+STILL_LOCK = threading.Lock()
+STILL_STYLES = (0, 1, 2)
+
+
+def still_status():
+    """Whether the still-image runtime is set up, or what is missing."""
+    if not STILL_RUNTIME.is_file():
+        return {"ready": False, "message": "missing: runtime", "setup": False}
+    try:
+        out = subprocess.run([str(STILL_RUNTIME), "status"], capture_output=True,
+                             text=True, timeout=20).stdout.strip()
+    except subprocess.TimeoutExpired:
+        out = "status check timed out"
+    # A prefix or DLL can be fixed by the setup job; GE-Proton or the NVIDIA
+    # driver's NGX files cannot.
+    return {"ready": out == "ready", "message": out,
+            "setup": out in ("missing: prefix", "missing: dll"),
+            "data": str(STILL_DATA)}
+
+
+def still_pictures_dir():
+    try:
+        out = subprocess.run(["xdg-user-dir", "PICTURES"], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        out = ""
+    base = Path(out) if out and out != str(Path.home()) else Path.home() / "Pictures"
+    return base / "DLSS 5"
+
+
+def still_number(query, key, default, lo, hi):
+    try:
+        value = float(query.get(key, [default])[0])
+    except ValueError:
+        raise BadRequest("%s is not a number" % key)
+    if not lo <= value <= hi:
+        raise BadRequest("%s must be between %s and %s" % (key, lo, hi))
+    return value
+
+
+def still_run(query, rgba):
+    """Run the model on one RGBA8 frame; returns (output bytes, info) or raises."""
+    width = int(still_number(query, "w", 0, 2, STILL_MAX_SIDE))
+    height = int(still_number(query, "h", 0, 2, STILL_MAX_SIDE))
+    if len(rgba) != width * height * 4:
+        raise BadRequest("expected %d bytes for %dx%d, got %d"
+                         % (width * height * 4, width, height, len(rgba)))
+    intensity = still_number(query, "intensity", 1, 0, 1)
+    structure = still_number(query, "structure", 1, 0, 1)
+    tone = still_number(query, "tone", 1, 0, 1)
+    style = int(still_number(query, "style", 0, 0, 2))
+    passes = int(still_number(query, "passes", 8, 1, 32))
+    if style not in STILL_STYLES:
+        raise BadRequest("unknown style")
+
+    if not STILL_LOCK.acquire(blocking=False):
+        raise Busy("A still image is already being processed.")
+    try:
+        status = still_status()
+        if not status["ready"]:
+            raise BadRequest("Still image is not set up: %s" % status["message"])
+        (STILL_RUN / "in").mkdir(parents=True, exist_ok=True)
+        (STILL_RUN / "in" / "gui.rgba").write_bytes(rgba)
+        out_dir = STILL_RUN / "out" / "gui"
+        for old in out_dir.glob("frame_*.rgba"):
+            old.unlink()
+        argv = [str(STILL_RUNTIME), "run", str(STILL_LOG),
+                "--color", r"C:\nr\in\gui.rgba", "--size", str(width), str(height),
+                "--frames", str(passes), "--dump", str(passes), "--out", r"C:\nr\out\gui",
+                "--intensity", "%g" % intensity, "--local-structure", "%g" % structure,
+                "--local-tone", "%g" % tone, "--style", str(style)]
+        subprocess.run(argv, capture_output=True, timeout=300)
+        result = out_dir / ("frame_%03d.rgba" % passes)
+        log = STILL_LOG.read_text(errors="replace") if STILL_LOG.is_file() else ""
+        if not result.is_file() or result.stat().st_size != len(rgba):
+            keep = [ln for ln in log.splitlines()
+                    if any(k in ln for k in ("FAILED", "->", "failed", "exit code", "removed", "no NVIDIA"))]
+            raise BadRequest("DLSS 5 did not produce an image.\n" + "\n".join(keep[-6:]))
+        ms = re.findall(r"gpu\+wait ([0-9.]+) ms", log)
+        return result.read_bytes(), {"ms": ms[-1] if ms else ""}
+    finally:
+        STILL_LOCK.release()
+
+
+def still_save(query, png):
+    """Write a PNG the page encoded to ~/Pictures/DLSS 5/; returns its path."""
+    if not png.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise BadRequest("not a PNG")
+    stem = re.sub(r"[^\w.\- ]+", "_", query.get("name", ["image"])[0]).strip(" .")[:80] or "image"
+    folder = still_pictures_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / ("%s-dlss5.png" % stem)
+    n = 2
+    while target.exists():
+        target = folder / ("%s-dlss5-%d.png" % (stem, n))
+        n += 1
+    target.write_bytes(png)
+    return str(target)
+
+
 def game_logs(game_dir, engine=None):
     """Every log we know about in the game folder, newest first."""
     directory = Path(game_dir)
@@ -1468,6 +1584,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"games": games, "protons": list_protons(),
                         "folders": read_folders(),
                         "probes": remembered_probes(g["path"] for g in games)})
+        elif url.path == "/api/still/status":
+            self._json(still_status())
         elif url.path.startswith("/api/job/"):
             job_id = url.path.rsplit("/", 1)[-1]
             with JOBS_LOCK:
@@ -1475,9 +1593,45 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"error": "not found"}, 404)
 
+    def _raw_body(self, limit):
+        """A binary request body (still image pixels or PNG), up to limit bytes."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise BadRequest("Content-Length is not a number")
+        if not 0 < length <= limit:
+            raise BadRequest("body empty or too large")
+        data = self.rfile.read(length)
+        if len(data) != length:
+            raise BadRequest("body cut short")
+        return data
+
     def _post(self):
         url = urlparse(self.path)
         if not self._authed():
+            return
+
+        # The two binary routes, before the JSON body parser sees them.
+        if url.path in ("/api/still/run", "/api/still/save"):
+            query = parse_qs(url.query)
+            try:
+                data = self._raw_body(STILL_MAX_BODY)
+                if url.path == "/api/still/run":
+                    out, info = still_run(query, data)
+                    self._sent = True
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(out)))
+                    self.send_header("X-Still-Ms", info["ms"])
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(out)
+                else:
+                    self._json({"saved": still_save(query, data)})
+            except BadRequest as exc:
+                self._json({"error": str(exc)}, 400)
+            except Busy as exc:
+                self._json({"error": str(exc)}, 409)
             return
 
         try:
@@ -1542,6 +1696,23 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/api/folders/remove":
                 remove_folder(str_field(body, "path"))
                 self._json({"folders": read_folders()})
+
+            elif url.path == "/api/still/setup":
+                # A chosen nvngx_dlssnr.dll or streamline.zip, or none: then the
+                # runtime copies the DLL out of the installer's own cache.
+                source = str_field(body, "dll", "")
+                argv = [str(STILL_RUNTIME), "setup"]
+                if source:
+                    src = Path(source).expanduser()
+                    if not src.is_file() or src.suffix.lower() not in (".dll", ".zip"):
+                        raise BadRequest("Choose nvngx_dlssnr.dll or streamline.zip.")
+                    argv.append(str(src))
+                self._json({"job": start_job(argv)})
+
+            elif url.path == "/api/still/reveal":
+                folder = still_pictures_dir()
+                folder.mkdir(parents=True, exist_ok=True)
+                self._json({"opened": open_path(folder)})
 
             elif url.path == "/api/open":
                 # Token-gated, but nothing here has any business handing an
@@ -1866,6 +2037,42 @@ PAGE = r"""<!doctype html>
   .fact .sub:empty::before { content:"\00a0"; }
   .note { color:var(--muted); font-size:12px; margin-top:10px; }
   .note.warn { color:var(--warn); }
+
+  /* ---- still image view ---- */
+  nav.views { display:flex; gap:4px; padding:3px; border:1px solid var(--line); border-radius:9px; }
+  nav.views button { border:0; padding:5px 12px; background:transparent; color:var(--muted); }
+  nav.views button.on { background:var(--accent); color:#fff; font-weight:600; }
+  main[hidden], #still[hidden] { display:none; }
+  #still { flex:1; min-height:0; display:grid; grid-template-columns:1fr 340px; }
+  @media (max-width:820px) { #still { grid-template-columns:1fr; } .stage { height:60vh; } }
+  .stage { position:relative; min-height:0; display:flex; align-items:center; justify-content:center;
+           padding:16px; overflow:hidden; }
+  .stage.drag { outline:2px dashed var(--accent); outline-offset:-10px; }
+  .cmp { position:relative; display:flex; max-width:100%; max-height:100%; touch-action:none;
+         cursor:col-resize; user-select:none; }
+  .cmp canvas { display:block; max-width:100%; max-height:calc(100vh - 190px); width:auto; height:auto; }
+  .cmp canvas#stIn { position:absolute; inset:0; width:100%; height:100%; max-height:none; }
+  .cmp .split { position:absolute; top:0; bottom:0; width:2px; margin-left:-1px; background:#fff;
+                box-shadow:0 0 0 1px rgba(0,0,0,.35); pointer-events:none; }
+  .cmp .tag { position:absolute; top:8px; font-size:11px; font-weight:650; padding:2px 7px; border-radius:5px;
+              background:rgba(0,0,0,.6); color:#fff; pointer-events:none; }
+  .cmp .tag.l { left:8px; } .cmp .tag.r { right:8px; }
+  .stempty { text-align:center; color:var(--muted); max-width:420px; }
+  .stempty b { display:block; font-size:16px; color:var(--ink); margin-bottom:6px; }
+  .stside { border-left:1px solid var(--line); background:var(--panel); overflow:auto; padding:18px 18px 24px; }
+  .stside h2 { font-size:17px; }
+  .stside .grp { margin-top:16px; display:flex; flex-direction:column; gap:12px; }
+  .stside label.f input[type=range] { width:100%; }
+  .stside [hidden] { display:none !important; }
+  .stside label.f { position:relative; }
+  .stside label.f .v { position:absolute; right:0; top:0; color:var(--ink); font-variant-numeric:tabular-nums; }
+  .stside select, .stside input[type=number] { width:100%; }
+  .stside input[type=number], .stside input[type=text] { font:inherit; padding:6px 9px; border-radius:7px;
+       border:1px solid var(--line); background:var(--panel); color:var(--ink); }
+  .stside .btns { display:flex; gap:8px; flex-wrap:wrap; }
+  .stside pre { white-space:pre-wrap; font-size:11.5px; max-height:220px; overflow:auto;
+                background:var(--bg); padding:8px; border-radius:7px; margin:0; }
+  #stSetup { border:1px solid var(--line); border-radius:9px; padding:12px; background:var(--info-bg); }
 </style>
 </head>
 <body>
@@ -1875,6 +2082,10 @@ PAGE = r"""<!doctype html>
     <h1>DLSS 5 Neural Rendering</h1>
     <div class="sub">Probe, install and launch &mdash; Fedora / Proton</div>
   </div>
+  <nav class="views" aria-label="View">
+    <button id="viewGames" class="on">Games</button>
+    <button id="viewStill" title="Run DLSS 5 on a picture">Still image</button>
+  </nav>
   <div id="preflight"></div>
 </header>
 
@@ -1896,6 +2107,69 @@ PAGE = r"""<!doctype html>
 
   <div id="detail"><div class="empty">Select a game on the left.</div></div>
 </main>
+
+<section id="still" hidden>
+  <div class="stage" id="stStage">
+    <div class="stempty" id="stEmpty">
+      <b>Run DLSS 5 on a picture</b>
+      Open an image or drop one here. The model relights it; drag across the result to
+      compare it with the original.
+    </div>
+    <div class="cmp" id="stCmp" hidden>
+      <canvas id="stOut"></canvas>
+      <canvas id="stIn"></canvas>
+      <div class="split" id="stSplit"></div>
+      <span class="tag l" id="stTagL">Original</span>
+      <span class="tag r" id="stTagR">DLSS 5</span>
+    </div>
+  </div>
+  <aside class="stside">
+    <h2>Still image</h2>
+    <div class="note" style="margin-top:4px">Feeds one picture to the neural rendering model as if it
+      were a game frame (flat depth, no motion). Experimental; needs an RTX 40 GPU and GE-Proton.</div>
+
+    <div id="stSetup" class="grp" hidden>
+      <div id="stSetupMsg"></div>
+      <label class="f">nvngx_dlssnr.dll or streamline.zip (optional)
+        <input id="stDll" type="text" spellcheck="false" placeholder="Empty: copy it from the installer cache"></label>
+      <div class="btns">
+        <button id="stSetupBtn" class="primary">Set up</button>
+        <button id="stBrowse" hidden>Browse&hellip;</button>
+      </div>
+      <pre id="stSetupLog" hidden></pre>
+    </div>
+
+    <div class="grp">
+      <div class="btns">
+        <button id="stOpen">Open image&hellip;</button>
+        <button id="stRun" class="primary" disabled>Run</button>
+      </div>
+      <input id="stFile" type="file" accept="image/*" hidden>
+    </div>
+
+    <div class="grp">
+      <label class="f">Intensity <span class="v" id="stIntensityV"></span>
+        <input id="stIntensity" type="range" min="0" max="1" step="0.05" value="1"></label>
+      <label class="f">Structure (lower keeps more detail) <span class="v" id="stStructureV"></span>
+        <input id="stStructure" type="range" min="0" max="1" step="0.05" value="1"></label>
+      <label class="f">Tone (lighting and colour) <span class="v" id="stToneV"></span>
+        <input id="stTone" type="range" min="0" max="1" step="0.05" value="1"></label>
+      <label class="f">Style
+        <select id="stStyle"><option value="0">Default</option><option value="1">Matte (style 1)</option>
+          <option value="2">Style 2</option></select></label>
+      <label class="f">Passes &ndash; the same image fed this many times; the last is shown
+        <input id="stPasses" type="number" min="1" max="32" value="8"></label>
+    </div>
+
+    <div class="grp">
+      <div class="btns">
+        <button id="stSave" disabled>Save PNG</button>
+        <button id="stReveal">Show folder</button>
+      </div>
+      <div class="note" id="stStatus">No image loaded.</div>
+    </div>
+  </aside>
+</section>
 
 <script>
 const TOKEN = "__TOKEN__";
@@ -2899,6 +3173,203 @@ async function job(path, body) {
   }, 700);
 }
 
+
+// ---- still image ---------------------------------------------------------
+
+// The page decodes the picture and sends raw RGBA8; the server runs the model
+// headless under Wine and answers with raw RGBA8 of the same size.
+const ST = { w: 0, h: 0, name: "", px: null, out: false, params: "", busy: false, split: 0.5,
+             status: null, setupPoll: null };
+const STILL_MAX_SIDE = 3840;
+const $ = id => document.getElementById(id);
+
+function showView(which) {
+  const still = which === "still";
+  document.querySelector("main").hidden = still;
+  $("still").hidden = !still;
+  $("viewGames").classList.toggle("on", !still);
+  $("viewStill").classList.toggle("on", still);
+  history.replaceState(null, "", still ? "#still" : location.pathname + location.search);
+  if (still) stillStatus();
+}
+
+function stillParams() {
+  return new URLSearchParams({
+    w: ST.w, h: ST.h,
+    intensity: $("stIntensity").value, structure: $("stStructure").value, tone: $("stTone").value,
+    style: $("stStyle").value,
+    passes: Math.max(1, Math.min(32, parseInt($("stPasses").value, 10) || 8)),
+  }).toString();
+}
+
+function stillPaint() {
+  for (const k of ["Intensity", "Structure", "Tone"])
+    $("st" + k + "V").textContent = Number($("st" + k).value).toFixed(2);
+  const ready = ST.status?.ready;
+  $("stRun").disabled = ST.busy || !ST.px || !ready;
+  $("stSave").disabled = ST.busy || !ST.out;
+  $("stOpen").disabled = ST.busy;
+  $("stSetupBtn").disabled = ST.busy || !!ST.setupPoll;
+  $("stTagR").hidden = !ST.out;
+  $("stTagL").textContent = ST.out ? "Original" : "Original (not run yet)";
+  $("stSplit").hidden = !ST.out;
+  const cut = ST.out ? (1 - ST.split) * 100 : 0;
+  $("stIn").style.clipPath = "inset(0 " + cut + "% 0 0)";
+  $("stSplit").style.left = (ST.split * 100) + "%";
+}
+
+function stillSay(text, kind) {
+  const el = $("stStatus");
+  el.textContent = text;
+  el.className = "note" + (kind ? " " + kind : "");
+}
+
+async function stillStatus() {
+  try { ST.status = await api("/api/still/status"); }
+  catch (e) { ST.status = { ready: false, message: String(e) }; }
+  const st = ST.status;
+  $("stSetup").hidden = st.ready;
+  if (!st.ready) {
+    const msg = st.message || "";
+    $("stSetupMsg").textContent = st.setup
+      ? "One-time setup: a private Wine prefix of about 1 GB in " + st.data + ", and the NR DLL copied into it."
+      : "Not available: " + msg.replace(/^missing: /, "missing ") + ".";
+    $("stSetupBtn").hidden = !st.setup;
+  }
+  stillPaint();
+}
+
+async function stillSetup() {
+  $("stSetupLog").hidden = false;
+  $("stSetupLog").textContent = "Starting…";
+  const body = $("stDll").value.trim() ? { dll: $("stDll").value.trim() } : {};
+  const res = await api("/api/still/setup", body);
+  if (res.error) { $("stSetupLog").textContent = "Error: " + res.error; return; }
+  ST.setupPoll = setInterval(async () => {
+    const j = await api("/api/job/" + res.job);
+    $("stSetupLog").textContent = j.output || "…";
+    if (j.status === "running") return;
+    clearInterval(ST.setupPoll);
+    ST.setupPoll = null;
+    await stillStatus();
+    if (ST.status.ready) $("stSetupLog").hidden = true;
+  }, 700);
+  stillPaint();
+}
+
+async function stillLoad(file) {
+  if (!file || ST.busy) return;
+  let bmp;
+  try { bmp = await createImageBitmap(file, { imageOrientation: "from-image" }); }
+  catch (e) { stillSay("Could not open " + file.name + ": not an image this browser can decode.", "warn"); return; }
+  const scale = Math.min(1, STILL_MAX_SIDE / Math.max(bmp.width, bmp.height));
+  // Even dimensions; the model takes any size, but odd ones gain nothing.
+  const w = Math.max(2, Math.floor(bmp.width * scale / 2) * 2);
+  const h = Math.max(2, Math.floor(bmp.height * scale / 2) * 2);
+  const cin = $("stIn"), cout = $("stOut");
+  cin.width = cout.width = w;
+  cin.height = cout.height = h;
+  const ctx = cin.getContext("2d", { willReadFrequently: true });
+  ctx.fillStyle = "#000";                    // transparent pixels become black, alpha 255
+  ctx.fillRect(0, 0, w, h);
+  ctx.drawImage(bmp, 0, 0, w, h);
+  ST.px = ctx.getImageData(0, 0, w, h).data;
+  cout.getContext("2d").drawImage(cin, 0, 0);
+  Object.assign(ST, { w, h, name: file.name.replace(/\.[^.]+$/, ""), out: false, params: "", split: 0.5 });
+  $("stEmpty").hidden = true;
+  $("stCmp").hidden = false;
+  const note = scale < 1 || w !== bmp.width || h !== bmp.height
+    ? " (from " + bmp.width + "×" + bmp.height + ")" : "";
+  stillSay(file.name + ": " + w + "×" + h + note + ". Press Run.");
+  stillPaint();
+}
+
+async function stillRun() {
+  if (ST.busy || !ST.px) return;
+  ST.busy = true;
+  const params = stillParams();
+  const passes = new URLSearchParams(params).get("passes");
+  stillSay("Running DLSS 5 on " + ST.w + "×" + ST.h + ", " + passes + " passes…");
+  stillPaint();
+  try {
+    const res = await fetch("/api/still/run?" + params, {
+      method: "POST", headers: { "X-Token": TOKEN, "Content-Type": "application/octet-stream" },
+      body: ST.px,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.status + " " + res.statusText }));
+      stillSay(err.error || "Failed.", "warn");
+      return;
+    }
+    const buf = await res.arrayBuffer();
+    $("stOut").getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(buf), ST.w, ST.h), 0, 0);
+    ST.out = true;
+    ST.params = params;
+    const ms = res.headers.get("X-Still-Ms");
+    stillSay("Done. " + ST.w + "×" + ST.h + ", " + passes + " passes" + (ms ? ", last pass " + ms + " ms" : "") +
+             ". Drag across the picture to compare.");
+  } catch (e) {
+    stillSay("Failed: " + e, "warn");
+  } finally {
+    ST.busy = false;
+    stillPaint();
+  }
+}
+
+function stillSave() {
+  if (!ST.out) return;
+  $("stOut").toBlob(async blob => {
+    const res = await fetch("/api/still/save?name=" + encodeURIComponent(ST.name), {
+      method: "POST", headers: { "X-Token": TOKEN, "Content-Type": "image/png" }, body: blob,
+    });
+    const j = await res.json().catch(() => ({ error: "save failed" }));
+    stillSay(j.saved ? "Saved " + j.saved : (j.error || "Save failed."), j.saved ? "" : "warn");
+  }, "image/png");
+}
+
+function stillInit() {
+  $("viewGames").onclick = () => showView("games");
+  $("viewStill").onclick = () => showView("still");
+  $("stOpen").onclick = () => $("stFile").click();
+  $("stFile").onchange = () => { stillLoad($("stFile").files[0]); $("stFile").value = ""; };
+  $("stRun").onclick = stillRun;
+  $("stSave").onclick = stillSave;
+  $("stReveal").onclick = () => api("/api/still/reveal", {});
+  $("stSetupBtn").onclick = stillSetup;
+  for (const id of ["stIntensity", "stStructure", "stTone", "stStyle", "stPasses"])
+    $(id).oninput = () => {
+      stillPaint();
+      if (ST.out && stillParams() !== ST.params) stillSay("Settings changed. Press Run to apply them.");
+    };
+
+  const stage = $("stStage");
+  stage.ondragover = e => { e.preventDefault(); stage.classList.add("drag"); };
+  stage.ondragleave = () => stage.classList.remove("drag");
+  stage.ondrop = e => {
+    e.preventDefault();
+    stage.classList.remove("drag");
+    stillLoad(e.dataTransfer.files[0]);
+  };
+
+  const cmp = $("stCmp");
+  const move = e => {
+    const r = cmp.getBoundingClientRect();
+    ST.split = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    stillPaint();
+  };
+  cmp.onpointerdown = e => { if (!ST.out) return; cmp.setPointerCapture(e.pointerId); move(e); };
+  cmp.onpointermove = e => { if (cmp.hasPointerCapture(e.pointerId)) move(e); };
+
+  window.addEventListener("keydown", e => {
+    if ($("still").hidden || !(e.ctrlKey || e.metaKey)) return;
+    if (e.key === "o") { e.preventDefault(); $("stFile").click(); }
+    else if (e.key === "Enter") { e.preventDefault(); stillRun(); }
+    else if (e.key === "s") { e.preventDefault(); stillSave(); }
+  });
+  stillPaint();
+  if (location.hash === "#still") showView("still");
+}
+
 // ---- native app bridge ---------------------------------------------------
 
 // Inside the desktop app (dlss5-app.py) the page runs in a WebKitGTK view that
@@ -2911,6 +3382,11 @@ function nativeBridge() {
   const btn = document.getElementById("browsefolder");
   btn.hidden = false;
   btn.onclick = () => native.postMessage({ op: "browse" });
+  // The same for the still image view's DLL/zip chooser.
+  const dllBtn = document.getElementById("stBrowse");
+  dllBtn.hidden = false;
+  dllBtn.onclick = () => native.postMessage({ op: "pickdll" });
+  window.dlss5PickedDll = path => { if (path) document.getElementById("stDll").value = path; };
   // The app calls this with the folder the user picked; it then takes exactly
   // the path a typed entry would, so validation stays in one place.
   window.dlss5Picked = path => {
@@ -2926,6 +3402,7 @@ function nativeBridge() {
 // ---- boot ----------------------------------------------------------------
 
 (async () => {
+  stillInit();
   loadPreflight();
   await loadGames();
   document.getElementById("filter").oninput = renderList;

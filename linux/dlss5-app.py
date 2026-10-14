@@ -231,6 +231,27 @@ def run_native(gui, mods, port, self_test):
                 run_js("window.dlss5Picked && window.dlss5Picked(%s)" % json.dumps(path))
         dialog.select_folder(state["window"], None, picked)
 
+    def pick_dll():
+        # The still image view's setup takes nvngx_dlssnr.dll, or the
+        # installer's streamline.zip that holds it.
+        dialog = Gtk.FileDialog(title="Choose nvngx_dlssnr.dll or streamline.zip", modal=True)
+        wanted = Gtk.FileFilter(name="nvngx_dlssnr.dll or streamline.zip")
+        wanted.add_pattern("*.dll")
+        wanted.add_pattern("*.zip")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(wanted)
+        dialog.set_filters(filters)
+
+        def picked(dlg, result):
+            try:
+                chosen = dlg.open_finish(result)
+            except GLib.Error:
+                return                              # cancelled or dismissed
+            path = chosen.get_path() if chosen else None
+            if path:
+                run_js("window.dlss5PickedDll && window.dlss5PickedDll(%s)" % json.dumps(path))
+        dialog.open(state["window"], None, picked)
+
     def on_message(_manager, value):
         try:
             msg = json.loads(value.to_json(0) or "null")
@@ -239,6 +260,8 @@ def run_native(gui, mods, port, self_test):
         op = msg.get("op") if isinstance(msg, dict) else None
         if op == "browse":
             browse_folder()
+        elif op == "pickdll":
+            pick_dll()
         elif op == "ping":
             run_js("window.dlss5Pong && window.dlss5Pong()")
 
