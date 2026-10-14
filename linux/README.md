@@ -49,6 +49,18 @@ Properties → Compatibility.
 installed game, and installs/uninstalls/launches without you typing a path.
 Standard library only — no pip, no venv.
 
+![A game that ships DLSS: Like a Dragon Gaiden, installed with the optiscaler engine, its last session confirmed running the neural pass](docs/images/gui-dlss-game.png)
+
+*A game with its own DLSS. The cover grid shows each game's verdict; the banner
+reads the injector's log and says whether the neural pass actually ran.*
+
+![A game with no DLSS: Yakuza 0 probes as "feeder" and runs DLSS 5 through DLSS5-Feeder](docs/images/gui-feeder-game.png)
+
+*A game with no DLSS. Yakuza 0 probes as `feeder`; installed with the feeder
+engine it ran the neural pass at 3440x1440 under Proton — about 306,000 frames
+delivered in an hour-long session. Its launch options override both proxies and
+Microsoft's `d3dcompiler_47`.*
+
 It binds to `127.0.0.1` and mints a fresh token per run; the URL printed in the
 terminal is the only way in. Install is disabled outright for any game where the
 probe finds anti-cheat.
