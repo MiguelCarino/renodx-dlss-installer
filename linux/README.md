@@ -143,7 +143,57 @@ reshade engine. Per the ini's documentation, everything under `[DlssNr]` is live
 there except `Preset`, which is baked in when the model is created.
 
 While a game is running, the note under the config controls says this and names
-the overlay key for the installed engine.
+the overlay key for the installed engine — or, with the overlay off, says to
+relaunch instead.
+
+### The overlay is off by default
+
+An optiscaler install writes `[Menu] OverlayMenu=false`. The overlay menu brings
+OptiScaler's input layer with it — window-subclass, raw-input, DirectInput and
+XInput hooks — and in Like a Dragon Gaiden an 8BitDo controller connecting a few
+seconds after launch, while those hooks were going in, deadlocked Wine's
+`xinput_cs` critical section. The game's main thread waited on it forever and
+the window stayed black (Proton log: `RtlpWaitForCriticalSection ... xinput_cs
+wait timed out in thread 0124, blocked by 0150`). With the menu off the same
+controller connected mid-game and worked.
+
+The hooks are not strictly gone with the menu off — OptiScaler still installs
+them once the game creates its upscaler — but they go in after startup instead
+of during it, which is what was observed to matter. One run each way, so treat
+this as the likely cause rather than a proven one.
+
+Nothing the neural pass needs lives in the menu: `[DlssNr] Enabled` and the DX12
+upscaler are ini settings the GUI writes, and switching it in game does not need
+the menu either — see the toggle key below. Turn the overlay back on per game with
+`--configure --overlay=on` or the **In-game overlay** checkbox; you lose
+OptiScaler's frame generation with it off, which none of the tested games used.
+
+### Switching it in game: F9
+
+Installs bind `[DlssNr] ToggleKey=0x78`, so **F9** turns the neural pass on and
+off mid-game with the overlay off. Change it with `--toggle-key=F1..F12|none|0xNN`
+or the GUI's **Toggle key** menu.
+
+The key belongs in `[DlssNr]`. The ini OptiScaler ships documents `ToggleKey`
+under `[FrameGen]`, but it is never read from there: with it set under
+`[FrameGen]` the startup "Config parameters" list did not include it and F9 did
+nothing; moved to `[DlssNr]`, the list shows `DlssNr.ToggleKey: 0x78` and F9
+works. In `dxgi.dll` the key's name sits with the other `DlssNr` keys, not the
+frame-generation ones. The template has no `[DlssNr]` line for it, so the
+installer adds one.
+
+The other `[DlssNr]` controls — `TransferStrength`, `Intensity`, `LocalTone`,
+`MaxRatio` and the rest — are only live in the overlay; without it they apply
+at the next launch.
+
+### Reinstalling keeps your settings
+
+The package ships its own `OptiScaler.ini`, and extracting it used to replace
+the old one wholesale — so a **Reinstall** handed neural rendering back switched
+off, which is what made Control stop working right after one. Now every key that
+had been moved off `auto` is read out before extraction and written back after,
+and the install-time defaults (DX12 upscaler `dlss`, overlay off, F9) only apply
+to keys that were not carried over.
 
 ### Knowing the game is running
 
@@ -240,6 +290,31 @@ machine-readable form the GUI consumes.
 
 `blocked` is checked first, then `unsupported`, so an anti-cheat hit outranks
 everything else the probe found.
+
+### Remembered verdicts
+
+Every verdict the GUI reaches is written to
+`~/.cache/dlss5-linux/probes.json`, keyed by game folder, and read back when the
+page next loads. A game you have probed before therefore opens showing what it
+was, instead of coming back as an unprobed `?` on every run. The detail pane
+dates it — *probed 3 days ago* — so a remembered verdict is never mistaken for a
+fresh one.
+
+Each entry also stores the modification times of the game root and of the binary
+directory below it. When those no longer match, the folder has moved on under the
+stored verdict — a game update, or an install done outside this page — and the
+GUI re-probes in the background the next time you select the game, keeping the
+old verdict on screen while it does. **Re-probe** and **Probe all** override all
+of this and always re-run; **Probe all** covers every game this session has not
+probed for itself.
+
+Only a verdict the script actually reached is stored: a probe that times out or
+comes back garbled is reported to the page but never written, so a bad moment
+cannot bury a good verdict a game already had. The file is a cache in the proper
+sense — deleting it costs nothing but a re-probe — which is why it sits in
+`~/.cache` alongside the downloads rather than in `~/.config` with `folders.json`.
+It holds the 500 most recently probed folders, and forgetting an added folder
+forgets its verdict too.
 
 Detection is best-effort in one direction: a game with engine-integrated FSR2 and
 no separate DLL will read as `unsupported` even though it might work. The probe
@@ -399,7 +474,7 @@ enable checkbox and `OptiScaler.log` has more.
 
 ```
 WINEDLLOVERRIDES="dxgi=n,b" PROTON_ENABLE_NVAPI=1 PROTON_ENABLE_NGX_UPDATER=1 \
-VKD3D_CONFIG=dxr11 PROTON_HIDE_NVIDIA_GPU=0 %COMMAND%
+VKD3D_CONFIG=dxr11 PROTON_HIDE_NVIDIA_GPU=0 %command%
 ```
 
 Match `dxgi` to whatever `--hook` you chose. `PROTON_ENABLE_NGX_UPDATER` manages

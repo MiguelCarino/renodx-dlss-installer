@@ -41,6 +41,10 @@ DO_INSTALL_PROTON=0
 DRY_RUN=0
 FORCE=0
 NR_SET=""
+TOGGLE_KEY=""
+# "Section.Key" names a reinstall carried over from the previous OptiScaler.ini,
+# so the install-time defaults below know not to overwrite the user's choice.
+PRESERVED=" "
 UPSCALER=""
 CONFIG_ONLY=0
 ASSUME_YES=0
@@ -108,7 +112,15 @@ Options:
   --upscaler=NAME     Set [Upscalers] Dx12Upscaler: dlss, xess, fsr21,
                       fsr22, ffx, auto. Force dlss if OptiScaler
                       mis-detects the GPU and falls back to XeSS.
-  --configure         Apply --nr / --upscaler to an existing install
+  --overlay=on|off    Set [Menu] OverlayMenu, OptiScaler's in-game menu
+                      (Insert). Installs default it to off: its input
+                      hooks can deadlock a controller connecting during
+                      startup. The ini settings above still apply.
+  --toggle-key=KEY    Bind [DlssNr] ToggleKey, which switches the neural
+                      pass on and off in game with the overlay off: F1-F12,
+                      none, or a hex virtual-key code. Installs default to F9.
+  --configure         Apply --nr / --upscaler / --overlay / --toggle-key
+                      to an existing install
                       and exit, without reinstalling
   -y, --yes           Assume yes for prompts
   -h, --help          This message
@@ -135,6 +147,8 @@ for arg in "$@"; do
         --force)          FORCE=1 ;;
         --nr=*)           NR_SET="${arg#*=}" ;;
         --upscaler=*)     UPSCALER="${arg#*=}" ;;
+        --overlay=*)      OVERLAY_SET="${arg#*=}" ;;
+        --toggle-key=*)   TOGGLE_KEY="${arg#*=}" ;;
         --configure)      CONFIG_ONLY=1 ;;
         -y|--yes)         ASSUME_YES=1 ;;
         -h|--help)        usage ;;
@@ -158,6 +172,23 @@ case "$NR_SET" in
     *)     die "--nr must be 'on' or 'off', got '$NR_SET'" ;;
 esac
 
+case "${OVERLAY_SET:=}" in
+    "")    ;;
+    on)    OVERLAY_SET=true ;;
+    off)   OVERLAY_SET=false ;;
+    *)     die "--overlay must be 'on' or 'off', got '$OVERLAY_SET'" ;;
+esac
+
+# A function key by name, "none" to unbind, or a raw virtual-key code. F-keys
+# map to VK_F1 (0x70) onwards; "auto" is OptiScaler's own word for unbound.
+case "$TOGGLE_KEY" in
+    "")              ;;
+    none)            TOGGLE_KEY=auto ;;
+    F[1-9]|F1[0-2])  TOGGLE_KEY=$(printf '0x%X' $(( 0x6F + ${TOGGLE_KEY#F} ))) ;;
+    0x[0-9A-Fa-f]|0x[0-9A-Fa-f][0-9A-Fa-f]) ;;
+    *) die "--toggle-key must be F1-F12, none, or a hex virtual-key code like 0x78" ;;
+esac
+
 case "$UPSCALER" in
     ""|dlss|xess|fsr21|fsr22|ffx|auto) ;;
     *) die "--upscaler must be one of: dlss xess fsr21 fsr22 ffx auto" ;;
@@ -170,8 +201,8 @@ esac
 
 # Both flags write OptiScaler.ini, which the reshade engine never creates.
 # Catch it here rather than after a full install has already been performed.
-if [[ "$ENGINE" == reshade && ( -n "$NR_SET" || -n "$UPSCALER" ) ]]; then
-    die "--nr / --upscaler edit OptiScaler.ini and do not apply to --engine=reshade.
+if [[ "$ENGINE" == reshade && ( -n "$NR_SET" || -n "$UPSCALER" || -n "$OVERLAY_SET" || -n "$TOGGLE_KEY" ) ]]; then
+    die "--nr / --upscaler / --overlay / --toggle-key edit OptiScaler.ini and do not apply to --engine=reshade.
      On the reshade engine, neural rendering is toggled in the ReShade overlay
      (Home > Add-ons > RenoDX DLSS5) and there is no upscaler to select."
 fi
@@ -536,6 +567,17 @@ install_optiscaler() {
     fetch "$OPTI_URL" "$CACHE_DIR/optiscaler-dlssnr.zip"
     fetch "$STREAMLINE_URL" "$CACHE_DIR/streamline.zip"
 
+    # The package ships its own OptiScaler.ini and unzip -o puts it over the
+    # old one, so a reinstall used to hand back neural rendering switched off
+    # and every other choice reset - Control came back "switched off" right
+    # after a Reinstall. Everything the user moved off "auto" is read out now
+    # and written back once the new file is down.
+    local saved=""
+    if [[ -f "$dir/OptiScaler.ini" ]] && (( ! DRY_RUN )); then
+        saved="$(mktemp)"
+        ini_snapshot "$dir/OptiScaler.ini" > "$saved"
+    fi
+
     log "Extracting OptiScaler package ..."
     # The archive uses backslash separators; unzip warns but extracts correctly.
     run unzip -o -q "$CACHE_DIR/optiscaler-dlssnr.zip" -d "$dir" || true
@@ -556,6 +598,11 @@ install_optiscaler() {
     fi
 
     run rm -f "$dir/!! EXTRACT ALL FILES TO GAME FOLDER !!" "$dir/setup_windows.bat"
+
+    if [[ -n "$saved" ]]; then
+        ini_restore "$dir/OptiScaler.ini" "$saved"
+        rm -f "$saved"
+    fi
 
     write_state "$dir" optiscaler
     ok "OptiScaler installed as $HOOK_DLL"
@@ -678,7 +725,7 @@ print_launch_options() {
 
 Set these under the game's Properties > General > Launch Options:
 
-  ${C_BLD}WINEDLLOVERRIDES="${hook}=n,b" PROTON_ENABLE_NVAPI=1 PROTON_ENABLE_NGX_UPDATER=1 VKD3D_CONFIG=dxr11 PROTON_HIDE_NVIDIA_GPU=0 %COMMAND%${C_RST}
+  ${C_BLD}WINEDLLOVERRIDES="${hook}=n,b" PROTON_ENABLE_NVAPI=1 PROTON_ENABLE_NGX_UPDATER=1 VKD3D_CONFIG=dxr11 PROTON_HIDE_NVIDIA_GPU=0 %command%${C_RST}
 
 What each one does:
   WINEDLLOVERRIDES  load '${hook}' (our proxy DLL) before the builtin. Required.
@@ -694,10 +741,12 @@ EOF
 
     if [[ "$ENGINE" == optiscaler ]]; then
         cat <<'EOF'
-In game: press Insert to open the OptiScaler overlay, then enable
-"Enable Neural Rendering" under DLSS Neural Rendering. It is off by default.
-If it refuses, the overlay states the reason under the checkbox.
-Push "Detail strength" above 1.0 to see clearly what the model contributes.
+Neural rendering starts as OptiScaler.ini says: --configure --nr=on, or the
+checkbox in dlss5-gui.py. In game, F9 switches it on and off (--toggle-key).
+The overlay (Insert) is off by default - its input hooks can freeze a game
+when a controller connects at startup. Want it anyway: --configure
+--overlay=on, then Insert > DLSS Neural Rendering for the live sliders.
+A reinstall keeps every setting you changed in OptiScaler.ini.
 EOF
     else
         cat <<'EOF'
@@ -810,7 +859,7 @@ path, section, key, value = sys.argv[1:5]
 with open(path, encoding="utf-8", errors="replace", newline="") as handle:
     lines = handle.read().split("\n")
 
-current, done = None, False
+current, done, last_in_section = None, False, None
 for i, line in enumerate(lines):
     # The BOM lands on line 0, which is a section header here; leaving it on
     # makes startswith("[") fail and every edit silently no-op.
@@ -818,11 +867,21 @@ for i, line in enumerate(lines):
     if stripped.startswith("[") and stripped.endswith("]"):
         current = stripped[1:-1]
         continue
+    if current == section and "=" in stripped and not stripped.startswith(";"):
+        last_in_section = i
     if current == section and re.match(r"\s*%s\s*=" % re.escape(key), line):
         eol = "\r" if line.endswith("\r") else ""
         lines[i] = "%s=%s%s" % (key, value, eol)
         done = True
         break
+
+# A key the shipped template leaves out of its section - [DlssNr] ToggleKey,
+# which the template files under [FrameGen] although OptiScaler only reads it
+# from [DlssNr] - is added after the section's last setting.
+if not done and last_in_section is not None:
+    eol = "\r" if lines[last_in_section].endswith("\r") else ""
+    lines.insert(last_in_section + 1, "%s=%s%s" % (key, value, eol))
+    done = True
 
 if done:
     with open(path, "w", encoding="utf-8", errors="replace", newline="") as handle:
@@ -840,6 +899,37 @@ PY
     fi
 }
 
+# Every key moved off "auto", as "Section<TAB>Key<TAB>Value" lines.
+ini_snapshot() {
+    python3 - "$1" <<'PY'
+import sys
+current = None
+with open(sys.argv[1], encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        s = line.strip().lstrip("\ufeff")
+        if s.startswith("[") and s.endswith("]"):
+            current = s[1:-1]
+        elif current and "=" in s and not s.startswith(";"):
+            key, value = s.split("=", 1)
+            if value.strip().lower() != "auto":
+                print("%s\t%s\t%s" % (current, key.strip(), value.strip()))
+PY
+}
+
+# Write a snapshot back, recording what was carried over in PRESERVED.
+ini_restore() {
+    local ini="$1" saved="$2" section key value count=0
+    while IFS=$'\t' read -r section key value; do
+        [[ -n "$key" ]] || continue
+        if ini_set "$ini" "$section" "$key" "$value" >/dev/null; then
+            PRESERVED+="$section.$key "
+            count=$(( count + 1 ))
+        fi
+    done < "$saved"
+    (( count )) && ok "Kept $count setting(s) from the previous OptiScaler.ini"
+    return 0
+}
+
 apply_ini_settings() {
     # Two statements deliberately: bash expands every word of a `local` command
     # before the builtin runs, so `local dir="$1" ini="$dir/..."` would expand
@@ -847,7 +937,7 @@ apply_ini_settings() {
     local dir="$1"
     local ini="$dir/OptiScaler.ini"
 
-    [[ -z "$NR_SET" && -z "$UPSCALER" ]] && return 0
+    [[ -z "$NR_SET" && -z "$UPSCALER" && -z "$OVERLAY_SET" && -z "$TOGGLE_KEY" ]] && return 0
 
     step "Configuring OptiScaler.ini"
 
@@ -870,6 +960,12 @@ apply_ini_settings() {
         # DLSS, which under Proton it can get wrong: its NVAPI probe runs before
         # the game loads nvapi64.dll. Forcing the key sidesteps the detection.
         ini_set "$ini" Upscalers Dx12Upscaler "$UPSCALER" || rc=1
+    fi
+    if [[ -n "$OVERLAY_SET" ]]; then
+        ini_set "$ini" Menu OverlayMenu "$OVERLAY_SET" || rc=1
+    fi
+    if [[ -n "$TOGGLE_KEY" ]]; then
+        ini_set "$ini" DlssNr ToggleKey "$TOGGLE_KEY" || rc=1
     fi
     return $rc
 }
@@ -1305,9 +1401,30 @@ main() {
     # Nothing about that is recoverable at runtime, so the choice is written
     # into the ini at install time instead. Only when the user did not ask for
     # a specific upscaler, and only on NVIDIA, where dlss is the right answer.
-    if [[ -z "$UPSCALER" ]] && [[ "$GPU_NAME" == *NVIDIA* || "$GPU_NAME" == *GeForce* ]]; then
+    if [[ -z "$UPSCALER" && "$PRESERVED" != *" Upscalers.Dx12Upscaler "* ]] \
+       && [[ "$GPU_NAME" == *NVIDIA* || "$GPU_NAME" == *GeForce* ]]; then
         UPSCALER="dlss"
         log "Forcing Dx12Upscaler=dlss (NVAPI is probed too early under Proton to detect it)"
+    fi
+
+    # OptiScaler's overlay menu installs window, raw-input and XInput hooks.
+    # With them going in during startup, an 8BitDo controller that connected a
+    # few seconds after launch deadlocked Wine's xinput_cs and left Like a
+    # Dragon Gaiden on a black window; with the menu off the same controller
+    # connected mid-game without trouble. Nothing the neural pass needs lives in
+    # the menu - [DlssNr] and the upscaler are ini settings the GUI writes - so
+    # a fresh install leaves it off unless --overlay=on asks otherwise.
+    if [[ "$ENGINE" == optiscaler && -z "$OVERLAY_SET" && "$PRESERVED" != *" Menu.OverlayMenu "* ]]; then
+        OVERLAY_SET="false"
+        log "Disabling the OptiScaler overlay menu (--overlay=on to keep it)"
+    fi
+
+    # With the overlay off, this key is the only way to switch the pass in game.
+    # It works without the menu: F9 toggled it in Like a Dragon Gaiden with
+    # OverlayMenu=false, once the key sat in [DlssNr] where OptiScaler reads it.
+    if [[ "$ENGINE" == optiscaler && -z "$TOGGLE_KEY" && "$PRESERVED" != *" DlssNr.ToggleKey "* ]]; then
+        TOGGLE_KEY="0x78"
+        log "Binding F9 to switch neural rendering in game (--toggle-key to change)"
     fi
 
     apply_ini_settings "$GAME_DIR"
