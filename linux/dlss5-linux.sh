@@ -30,6 +30,22 @@ readonly OPTI_URL="https://github.com/Dagherbou/OptiScaler_DLSSNR/releases/downl
 readonly STREAMLINE_URL="https://github.com/yumlevi/renodx-dlss-installer/releases/download/latest/streamline.zip"
 readonly ADDON_URL="https://github.com/yumlevi/renodx-dlss-installer/releases/download/latest/renodx-dlss5-v2.5.addon64"
 readonly RESHADE_URL="https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe"
+# The feeder engine: DLSS 5 for games with no DLSS of their own. Pinned, and
+# fetched only from the projects' own GitHub - DLSS5-Feeder warns that lookalike
+# zips (including copies of its repository) circulate with malware in them.
+readonly FEEDER_VERSION="1.19.0"
+readonly FEEDER_URL="https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/download/v${FEEDER_VERSION}/DLSS5-Feeder-${FEEDER_VERSION}.zip"
+readonly LUMENITE_REF="f80e98d716ad72e12af6f7baa727bcfeb4be5094"
+readonly LUMENITE_URL="https://codeload.github.com/umar-afzaal/LumeniteFX/zip/${LUMENITE_REF}"
+readonly RESHADE_HEADERS_URL="https://raw.githubusercontent.com/crosire/reshade-shaders/slim/Shaders"
+# Microsoft's d3dcompiler_47, as winetricks fetches it (Mozilla's fxc2 mirror,
+# same pinned hash). ReShade compiles its effects through d3dcompiler_47, and
+# Wine's builtin one is vkd3d-shader's HLSL front end, which rejects the
+# [fastopt] ReShade emits for every loop ("E5017: Aborting due to not yet
+# implemented feature: Unhandled attribute 'fastopt'") - so under Proton the
+# feed and the motion-vector shader never compiled and nothing was fed.
+readonly D3DCOMPILER_URL="https://raw.githubusercontent.com/mozilla/fxc2/master/dll/d3dcompiler_47.dll"
+readonly D3DCOMPILER_SHA256="4432bbd1a390874f3f0a503d45cc48d346abc3a8c0213c289f4b615bf0ee84f3"
 readonly GE_API="https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest"
 
 # --- Defaults -----------------------------------------------------------------
@@ -95,7 +111,9 @@ Options:
   --game-dir=PATH     Folder holding the game's .exe. For Unreal titles this is
                       <Game>/Binaries/Win64; for Cyberpunk 2077 it is bin/x64.
                       The script auto-corrects if you point it at a launcher.
-  --engine=NAME       optiscaler (default) | reshade
+  --engine=NAME       optiscaler (default) | reshade | feeder
+                      feeder: for D3D11/D3D12 games with no DLSS of their own
+                      (ReShade + DLSS5-Feeder + OptiScaler DLSS-NR)
   --hook=NAME         DLL name to masquerade as: dxgi.dll (default), d3d12.dll,
                       version.dll, winmm.dll, dbghelp.dll, wininet.dll, winhttp.dll
   --install-proton    Fetch the latest GE-Proton into compatibilitytools.d
@@ -160,8 +178,8 @@ DO_PROBE="${DO_PROBE:-0}"
 JSON_OUT="${JSON_OUT:-0}"
 
 case "$ENGINE" in
-    optiscaler|reshade) ;;
-    *) die "--engine must be 'optiscaler' or 'reshade', got '$ENGINE'" ;;
+    optiscaler|reshade|feeder) ;;
+    *) die "--engine must be 'optiscaler', 'reshade' or 'feeder', got '$ENGINE'" ;;
 esac
 
 # on/off is what a user types; true/false is what OptiScaler.ini wants.
@@ -214,7 +232,7 @@ require_tools() {
     for t in curl unzip objdump python3; do
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
-    if [[ "$ENGINE" == reshade ]] && ! command -v 7z >/dev/null 2>&1; then
+    if [[ "$ENGINE" == reshade || "$ENGINE" == feeder ]] && ! command -v 7z >/dev/null 2>&1; then
         missing+=("7z")
     fi
     if (( ${#missing[@]} )); then
@@ -554,8 +572,13 @@ check_game_preconditions() {
 
     (( has_d3d12 )) && ok "Game imports D3D12/DXGI" \
                     || warn "No D3D12/DXGI import found - the add-on is D3D12-only."
-    (( has_dlss ))  && ok "Game ships DLSS libraries" \
-                    || warn "No nvngx_dlss*.dll found. If the game has no DLSS, the neural pass has nothing to hook."
+    if (( has_dlss )); then
+        ok "Game ships DLSS libraries"
+    elif [[ "$ENGINE" == feeder ]]; then
+        ok "No DLSS of its own - the feeder engine supplies the DLSS request"
+    else
+        warn "No nvngx_dlss*.dll found. If the game has no DLSS, the neural pass has nothing to hook - see --engine=feeder."
+    fi
 }
 
 # --- Engine: OptiScaler -------------------------------------------------------
@@ -567,16 +590,6 @@ install_optiscaler() {
     fetch "$OPTI_URL" "$CACHE_DIR/optiscaler-dlssnr.zip"
     fetch "$STREAMLINE_URL" "$CACHE_DIR/streamline.zip"
 
-    # The package ships its own OptiScaler.ini and unzip -o puts it over the
-    # old one, so a reinstall used to hand back neural rendering switched off
-    # and every other choice reset - Control came back "switched off" right
-    # after a Reinstall. Everything the user moved off "auto" is read out now
-    # and written back once the new file is down.
-    local saved=""
-    if [[ -f "$dir/OptiScaler.ini" ]] && (( ! DRY_RUN )); then
-        saved="$(mktemp)"
-        ini_snapshot "$dir/OptiScaler.ini" > "$saved"
-    fi
 
     log "Extracting OptiScaler package ..."
     # The archive uses backslash separators; unzip warns but extracts correctly.
@@ -599,10 +612,7 @@ install_optiscaler() {
 
     run rm -f "$dir/!! EXTRACT ALL FILES TO GAME FOLDER !!" "$dir/setup_windows.bat"
 
-    if [[ -n "$saved" ]]; then
-        ini_restore "$dir/OptiScaler.ini" "$saved"
-        rm -f "$saved"
-    fi
+    restore_settings "$dir"
 
     write_state "$dir" optiscaler
     ok "OptiScaler installed as $HOOK_DLL"
@@ -648,6 +658,150 @@ install_reshade() {
 # Mirrors SeedAddonStartDisabled() from MainWindow.Custom.cs: RenoDX resolves
 # non-global settings from whichever preset section is active and falls back to
 # its built-in default when the key is absent, so seed every candidate section.
+# DLSS 5 for a game that has no DLSS. DLSS5-Feeder (a ReShade add-on) builds
+# the DLSS request the game never makes - its frame, ReShade's depth buffer and
+# motion vectors estimated by LumeniteFX - and the OptiScaler DLSS-NR fork,
+# loaded under a second proxy name, answers it with real DLSS and then the
+# neural pass. Proven under Proton with the feeder's own --test: 300/300
+# evaluates, the neural model created, DLSS 310.x underneath, no game needed.
+install_feeder() {
+    local dir="$1"
+    step "Installing DLSS5-Feeder $FEEDER_VERSION + OptiScaler DLSS-NR into $dir"
+
+    fetch "$FEEDER_URL" "$CACHE_DIR/DLSS5-Feeder-${FEEDER_VERSION}.zip"
+    fetch "$LUMENITE_URL" "$CACHE_DIR/LumeniteFX-${LUMENITE_REF:0:12}.zip"
+    fetch "$RESHADE_URL" "$CACHE_DIR/ReShade_Setup_6.8.0_Addon.exe"
+    fetch "$OPTI_URL" "$CACHE_DIR/optiscaler-dlssnr.zip"
+    fetch "$STREAMLINE_URL" "$CACHE_DIR/streamline.zip"
+    local h
+    for h in ReShade.fxh ReShadeUI.fxh DrawText.fxh; do
+        fetch "$RESHADE_HEADERS_URL/$h" "$CACHE_DIR/reshade-headers/$h"
+    done
+    fetch "$D3DCOMPILER_URL" "$CACHE_DIR/d3dcompiler/d3dcompiler_47.dll"
+    if (( ! DRY_RUN )); then
+        local sum
+        sum=$(sha256sum "$CACHE_DIR/d3dcompiler/d3dcompiler_47.dll" | cut -d' ' -f1)
+        [[ "$sum" == "$D3DCOMPILER_SHA256" ]] || {
+            rm -f "$CACHE_DIR/d3dcompiler/d3dcompiler_47.dll"
+            die "d3dcompiler_47.dll does not match the hash winetricks pins ($sum)."
+        }
+    fi
+
+    # OptiScaler needs a name the game imports at start, other than the one
+    # ReShade has: the feeder's own installer picks it the same way. Yakuza 0
+    # imports none of winmm/version but does import dbghelp.
+    local opti="" name imports
+    imports=$(find "$dir" -maxdepth 1 -iname '*.exe' -print0 2>/dev/null \
+        | xargs -0 -r -n1 objdump -p 2>/dev/null | sed -n 's/.*DLL Name: //p' | tr 'A-Z' 'a-z' | sort -u)
+    for name in winmm.dll version.dll dbghelp.dll winhttp.dll wininet.dll; do
+        [[ "$name" == "${HOOK_DLL,,}" ]] && continue
+        if grep -qx "$name" <<< "$imports"; then opti="$name"; break; fi
+    done
+    [[ -n "$opti" ]] || die "The game imports none of winmm/version/dbghelp/winhttp/wininet.dll,
+     so there is no second proxy name for OptiScaler to load under."
+    log "OptiScaler will load as $opti (the game imports it); ReShade as $HOOK_DLL"
+
+    if (( DRY_RUN )); then
+        printf '     [dry-run] would install ReShade, the feeder, LumeniteFX and OptiScaler into %s\n' "$dir"
+        INSTALLED_HOOKS="$HOOK_DLL,$opti"
+        return 0
+    fi
+
+    # ReShade with add-on support, as the first proxy.
+    rm -rf "$CACHE_DIR/reshade-extract"
+    mkdir -p "$CACHE_DIR/reshade-extract"
+    7z e -y -o"$CACHE_DIR/reshade-extract" "$CACHE_DIR/ReShade_Setup_6.8.0_Addon.exe" ReShade64.dll >/dev/null
+    [[ -f "$CACHE_DIR/reshade-extract/ReShade64.dll" ]] || die "Could not extract ReShade64.dll from the installer."
+    cp "$CACHE_DIR/reshade-extract/ReShade64.dll" "$dir/$HOOK_DLL"
+    ok "ReShade 6.8.0 installed as $HOOK_DLL"
+
+    # The feeder: the add-on beside the exe, its effect with the shaders.
+    local work shaders="$dir/reshade-shaders/Shaders" textures="$dir/reshade-shaders/Textures"
+    work=$(mktemp -d)
+    unzip -o -q "$CACHE_DIR/DLSS5-Feeder-${FEEDER_VERSION}.zip" -d "$work/feeder" 2>/dev/null || true
+    mkdir -p "$shaders" "$textures"
+    cp "$work/feeder/dlss5-feed.addon64" "$dir/"
+    cp "$work/feeder/reshade-shaders/Shaders/DLSS5_Feed.fx" "$shaders/"
+    cp "$CACHE_DIR"/reshade-headers/*.fxh "$shaders/"
+    ok "DLSS5-Feeder $FEEDER_VERSION installed"
+
+    # LumeniteFX: the motion-vector provider the feeder is tuned on.
+    unzip -o -q "$CACHE_DIR/LumeniteFX-${LUMENITE_REF:0:12}.zip" -d "$work/lumenite"
+    local lum
+    lum=$(find "$work/lumenite" -maxdepth 1 -mindepth 1 -type d | head -1)
+    # Only the kernel the preset enables: every .fx in the folder is compiled
+    # at startup, and the rest of LumeniteFX is unrelated effects.
+    cp "$lum/Shaders/lumenite_Kernel.fx" "$shaders/"
+    [[ -d "$lum/Shaders/include" ]] && cp -r "$lum/Shaders/include" "$shaders/"
+    cp "$lum/Textures/lumenite_bluenoise256.png" "$textures/"
+    ok "LumeniteFX installed"
+    rm -rf "$work"
+
+    # OptiScaler DLSS-NR, the neural consumer, under the second name. Its own
+    # setup_linux.sh is not run: it wants dxgi.dll, which ReShade holds.
+    unzip -o -q "$CACHE_DIR/optiscaler-dlssnr.zip" -d "$dir" || true
+    mv -f "$dir/OptiScaler.dll" "$dir/$opti"
+    rm -f "$dir/!! EXTRACT ALL FILES TO GAME FOLDER !!" "$dir/setup_windows.bat"
+    unzip -o -j -q "$CACHE_DIR/streamline.zip" 'streamline/nvngx_dlssnr.dll' -d "$dir"
+    verify_dlssnr "$dir/nvngx_dlssnr.dll"
+
+    # A DLSS runtime for the feeder's request. These games ship none; one
+    # that does keeps its own, and only a copy put here is recorded as ours.
+    local ours=""
+    if [[ ! -f "$dir/nvngx_dlss.dll" ]]; then
+        unzip -o -j -q "$CACHE_DIR/streamline.zip" 'streamline/nvngx_dlss.dll' -d "$dir"
+        ours="nvngx_dlss.dll"
+    fi
+    # Microsoft's shader compiler, for ReShade (see D3DCOMPILER_URL). A game
+    # that ships its own keeps it - that one is Microsoft's too.
+    if [[ ! -f "$dir/d3dcompiler_47.dll" ]]; then
+        cp "$CACHE_DIR/d3dcompiler/d3dcompiler_47.dll" "$dir/"
+        ours+="${ours:+,}d3dcompiler_47.dll"
+    fi
+    ok "OptiScaler DLSS-NR installed as $opti"
+
+    # The keys a bare NGX client needs, as the feeder's installer sets them.
+    local kv
+    for kv in DlssNr:Enabled:true DlssNr:ScanExposure:false \
+              Log:LogToFile:true Log:LogLevel:2 \
+              Spoofing:Dxgi:false Spoofing:StreamlineSpoofing:false \
+              Inputs:EnableXeSSInputs:false Inputs:EnableFsr2Inputs:false \
+              Inputs:EnableFsr3Inputs:false Inputs:EnableFfxInputs:false \
+              Hotfix:CheckForUpdate:false; do
+        IFS=: read -r s k v <<< "$kv"
+        ini_set "$dir/OptiScaler.ini" "$s" "$k" "$v" >/dev/null || warn "[$s] $k could not be set"
+    done
+    restore_settings "$dir"
+    write_feeder_reshade_ini "$dir"
+
+    INSTALLED_HOOKS="$HOOK_DLL,$opti"
+    write_state "$dir" feeder "$INSTALLED_HOOKS" "$ours"
+    ok "Feeder engine installed: ReShade ($HOOK_DLL) + DLSS5-Feeder + OptiScaler DLSS-NR ($opti)"
+}
+
+# ReShade.ini and ReShadePreset.ini as the feeder's installer writes them: the
+# add-ons beside the exe, Lumenite's kernel ahead of the feed, provider 3.
+write_feeder_reshade_ini() {
+    local dir="$1"
+    if [[ ! -f "$dir/ReShade.ini" ]]; then
+        printf '%s\r\n' '[ADDON]' 'AddonPath=.\' '' '[DEPTH]' 'DepthCopyBeforeClears=0' '' \
+            '[GENERAL]' 'EffectSearchPaths=.\reshade-shaders\Shaders\**' \
+            'TextureSearchPaths=.\reshade-shaders\Textures\**' 'PresetPath=.\ReShadePreset.ini' \
+            'SkipLoadingDisabledEffects=0' '' '[OVERLAY]' 'TutorialProgress=4' > "$dir/ReShade.ini"
+        ok "Wrote ReShade.ini"
+    else
+        warn "ReShade.ini already exists; leaving it alone."
+    fi
+    if [[ ! -f "$dir/ReShadePreset.ini" ]]; then
+        printf '%s\r\n' \
+            'Techniques=Lumenite_Kernel@lumenite_Kernel.fx,DLSS5_Feed@DLSS5_Feed.fx' \
+            'TechniqueSorting=Lumenite_Kernel@lumenite_Kernel.fx,DLSS5_Feed@DLSS5_Feed.fx,DLSS5_Feed_Debug@DLSS5_Feed.fx' \
+            '' '[DLSS5_Feed.fx]' 'DEBUG_VIEW=0' 'MV_SCALE=1.000000' 'MV_SIGN=1.000000,1.000000' \
+            'PreprocessorDefinitions=DLSS5_MV_PROVIDER=3' > "$dir/ReShadePreset.ini"
+        ok "Wrote ReShadePreset.ini: Lumenite kernel, then DLSS5 Feed"
+    fi
+}
+
 write_reshade_ini() {
     local ini="$1/ReShade.ini"
 
@@ -711,21 +865,41 @@ verify_dlssnr() {
     fi
 }
 
+# hook= is the proxy DLL, or for the feeder engine a comma list of both
+# (ReShade's and OptiScaler's): uninstall removes every one and the launch
+# options override every one. ours= lists extra top-level files that engine
+# put down and that a game might otherwise ship itself.
 write_state() {
     (( DRY_RUN )) && return 0
     printf 'engine=%s\nhook=%s\ninstalled=%s\n' \
-        "$2" "$HOOK_DLL" "$(date -Iseconds)" > "$1/$STATE_FILE"
+        "$2" "${3:-$HOOK_DLL}" "$(date -Iseconds)" > "$1/$STATE_FILE"
+    [[ -n "${4:-}" ]] && printf 'ours=%s\n' "$4" >> "$1/$STATE_FILE"
+    return 0
+}
+
+# "dxgi.dll,dbghelp.dll" -> "dxgi=n,b;dbghelp=n,b"
+dll_overrides() {
+    local list="$1" out="" name
+    IFS=',' read -r -a names <<< "$list"
+    for name in "${names[@]}"; do
+        [[ -n "$name" ]] && out+="${out:+;}${name%.dll}=n,b"
+    done
+    printf '%s' "$out"
 }
 
 print_launch_options() {
-    local hook="${HOOK_DLL%.dll}"
+    local hooks="${INSTALLED_HOOKS:-$HOOK_DLL}"
+    local hook="${hooks//.dll/}" overrides
+    overrides=$(dll_overrides "$hooks")
+    # The feeder engine's ReShade needs Microsoft's compiler, not Wine's.
+    [[ "$ENGINE" == feeder ]] && overrides+=";d3dcompiler_47=n,b"
 
     step "Steam launch options"
     cat <<EOF
 
 Set these under the game's Properties > General > Launch Options:
 
-  ${C_BLD}WINEDLLOVERRIDES="${hook}=n,b" PROTON_ENABLE_NVAPI=1 PROTON_ENABLE_NGX_UPDATER=1 VKD3D_CONFIG=dxr11 PROTON_HIDE_NVIDIA_GPU=0 %command%${C_RST}
+  ${C_BLD}WINEDLLOVERRIDES="${overrides}" PROTON_ENABLE_NVAPI=1 PROTON_ENABLE_NGX_UPDATER=1 VKD3D_CONFIG=dxr11 PROTON_HIDE_NVIDIA_GPU=0 %command%${C_RST}
 
 What each one does:
   WINEDLLOVERRIDES  load '${hook}' (our proxy DLL) before the builtin. Required.
@@ -739,7 +913,15 @@ Also set Compatibility to a modern Proton (GE-Proton preferred, Proton 9+ minimu
 
 EOF
 
-    if [[ "$ENGINE" == optiscaler ]]; then
+    if [[ "$ENGINE" == feeder ]]; then
+        cat <<'EOF'
+In game: the feed starts on its own (ReShadePreset.ini enables LUMENITE: Kernel
+and DLSS 5 Feed). Home opens ReShade's overlay to check them; F9 switches the
+neural pass. dlss5-feed.log beside the exe should say "frame N delivered".
+Turn the game's own MSAA/SSAA off. Expect ghosting on fast motion: the motion
+vectors are estimated from the picture, not taken from the game.
+EOF
+    elif [[ "$ENGINE" == optiscaler ]]; then
         cat <<'EOF'
 Neural rendering starts as OptiScaler.ini says: --configure --nr=on, or the
 checkbox in dlss5-gui.py. In game, F9 switches it on and off (--toggle-key).
@@ -783,8 +965,10 @@ do_uninstall() {
     # level is always the game's. Removing them cost Resident Evil Requiem
     # four of re9.exe's static imports and left it exiting on c0000135
     # before it drew a frame. The OptiScaler directory below clears ours.
+    local -a hooks
+    IFS=',' read -r -a hooks <<< "$hook"
     local -a targets=(
-        "$hook" "$STATE_FILE"
+        "${hooks[@]}" "$STATE_FILE"
         OptiScaler.ini OptiScaler.log OptiScaler.dll "nvngx.dll_dlssnr.dll"
         remove_optiscaler.sh setup_linux.sh "READ ME - DLSS Neural Rendering.txt"
         ReShade.ini ReShade.log ReShadePreset.ini
@@ -796,6 +980,15 @@ do_uninstall() {
     # install_optiscaler takes only nvngx_dlssnr.dll out of it and leaves the
     # rest. So these are ours under reshade and the game's under optiscaler -
     # Control ships its own nvngx_dlss.dll and would lose it otherwise.
+    if [[ "$engine" == feeder ]]; then
+        targets+=(dlss5-feed.addon64 dlss5-feed.log dlss5-feed.cfg setup_windows.bat)
+        # nvngx_dlss.dll only when this install supplied it; a game with its
+        # own keeps it.
+        local ours
+        ours=$(grep '^ours=' "$dir/$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
+        [[ -n "$ours" ]] && IFS=',' read -r -a extra <<< "$ours" && targets+=("${extra[@]}")
+    fi
+
     if [[ "$engine" == reshade ]]; then
         targets+=(
             nvngx_dlss.dll nvngx_dlssg.dll
@@ -914,6 +1107,26 @@ with open(sys.argv[1], encoding="utf-8", errors="replace") as handle:
             if value.strip().lower() != "auto":
                 print("%s\t%s\t%s" % (current, key.strip(), value.strip()))
 PY
+}
+
+# The package ships its own OptiScaler.ini, so a reinstall used to hand back
+# neural rendering switched off and every other choice reset - Control came
+# back "switched off" right after a Reinstall. main() reads out everything the
+# user moved off "auto" before anything is touched - before the pre-install
+# uninstall too, which deletes the file - and the engines write it back here.
+SAVED_INI=""
+snapshot_settings() {
+    local ini="$1/OptiScaler.ini"
+    [[ -f "$ini" ]] && (( ! DRY_RUN )) || return 0
+    SAVED_INI="$(mktemp)"
+    ini_snapshot "$ini" > "$SAVED_INI"
+}
+
+restore_settings() {
+    [[ -n "$SAVED_INI" && -f "$SAVED_INI" && -f "$1/OptiScaler.ini" ]] || return 0
+    ini_restore "$1/OptiScaler.ini" "$SAVED_INI"
+    rm -f "$SAVED_INI"
+    SAVED_INI=""
 }
 
 # Write a snapshot back, recording what was carried over in PRESERVED.
@@ -1076,6 +1289,12 @@ installed_by_us() {
         nvngx_dlssnr.dll|nvngx.dll_dlssnr.dll) return 0 ;;
     esac
 
+    if [[ "$engine" == feeder ]]; then
+        local ours
+        ours=$(grep '^ours=' "$dir/$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
+        [[ ",${ours,,}," == *",$base,"* ]] && return 0
+    fi
+
     if [[ "$engine" == reshade ]]; then
         case "$base" in
             nvngx_dlss.dll|nvngx_dlssg.dll) return 0 ;;
@@ -1197,7 +1416,7 @@ probe_scan() {
 
     # A game shipping its own dxgi.dll proxy (REFramework, ENB, mod loaders)
     # would collide with ours, so steer to version.dll in that case.
-    if [[ -f "$dir/dxgi.dll" && "$P_HOOK" != "dxgi.dll" ]]; then
+    if [[ -f "$dir/dxgi.dll" && ",$P_HOOK," != *",dxgi.dll,"* ]]; then
         P_HINT="version.dll"
         P_REASONS+=("A dxgi.dll already exists here (mod loader?) - use --hook=version.dll.")
     else
@@ -1221,6 +1440,14 @@ probe_verdict() {
     fi
 
     if [[ -z "$P_UPSCALERS" ]]; then
+        # No DLSS to ride, but a D3D11/D3D12 game can still get the pass from
+        # the feeder engine, which builds the DLSS request itself.
+        if [[ "$P_API" == d3d11 || "$P_API" == d3d12 ]]; then
+            P_VERDICT="feeder"
+            P_REASONS+=("No upscaler of its own - the optiscaler engine has nothing to hook here.")
+            P_REASONS+=("Install with the feeder engine: it builds the DLSS request itself from ReShade's depth buffer and estimated motion. Expect ghosting on fast motion and roughly half the frame rate.")
+            return
+        fi
         P_VERDICT="unsupported"
         P_REASONS+=("No upscaler runtime found. The neural pass borrows depth and motion vectors from an existing temporal upscaler; with none, it has nothing to hook.")
         P_REASONS+=("If the game has an engine-integrated FSR2 with no separate DLL, this check cannot see it - try anyway.")
@@ -1252,6 +1479,7 @@ probe_report_text() {
     case "$P_VERDICT" in
         supported)   badge="${C_GRN}SUPPORTED${C_RST}" ;;
         partial)     badge="${C_YEL}PARTIAL${C_RST}" ;;
+        feeder)      badge="${C_YEL}FEEDER (no DLSS - use --engine=feeder)${C_RST}" ;;
         blocked)     badge="${C_RED}BLOCKED${C_RST}" ;;
         unsupported) badge="${C_RED}UNSUPPORTED${C_RST}" ;;
         *)           badge="${C_YEL}UNKNOWN${C_RST}" ;;
@@ -1382,6 +1610,8 @@ main() {
 
     check_game_preconditions "$GAME_DIR"
 
+    snapshot_settings "$GAME_DIR"
+
     if [[ -f "$GAME_DIR/$STATE_FILE" ]]; then
         warn "An existing install was found in this folder."
         confirm "Run --uninstall first and then reinstall?" && do_uninstall "$GAME_DIR"
@@ -1390,6 +1620,7 @@ main() {
     case "$ENGINE" in
         optiscaler) install_optiscaler "$GAME_DIR" ;;
         reshade)    install_reshade "$GAME_DIR" ;;
+        feeder)     install_feeder "$GAME_DIR" ;;
     esac
 
     # OptiScaler decides what the GPU can do by probing NVAPI while it loads,
@@ -1414,7 +1645,7 @@ main() {
     # connected mid-game without trouble. Nothing the neural pass needs lives in
     # the menu - [DlssNr] and the upscaler are ini settings the GUI writes - so
     # a fresh install leaves it off unless --overlay=on asks otherwise.
-    if [[ "$ENGINE" == optiscaler && -z "$OVERLAY_SET" && "$PRESERVED" != *" Menu.OverlayMenu "* ]]; then
+    if [[ "$ENGINE" != reshade && -z "$OVERLAY_SET" && "$PRESERVED" != *" Menu.OverlayMenu "* ]]; then
         OVERLAY_SET="false"
         log "Disabling the OptiScaler overlay menu (--overlay=on to keep it)"
     fi
@@ -1422,7 +1653,7 @@ main() {
     # With the overlay off, this key is the only way to switch the pass in game.
     # It works without the menu: F9 toggled it in Like a Dragon Gaiden with
     # OverlayMenu=false, once the key sat in [DlssNr] where OptiScaler reads it.
-    if [[ "$ENGINE" == optiscaler && -z "$TOGGLE_KEY" && "$PRESERVED" != *" DlssNr.ToggleKey "* ]]; then
+    if [[ "$ENGINE" != reshade && -z "$TOGGLE_KEY" && "$PRESERVED" != *" DlssNr.ToggleKey "* ]]; then
         TOGGLE_KEY="0x78"
         log "Binding F9 to switch neural rendering in game (--toggle-key to change)"
     fi

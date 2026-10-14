@@ -53,7 +53,7 @@ It binds to `127.0.0.1` and mints a fresh token per run; the URL printed in the
 terminal is the only way in. Install is disabled outright for any game where the
 probe finds anti-cheat.
 
-"Launch with overrides" runs the game through Proton directly, with the
+"Launch" (launch with overrides) runs the game through Proton directly, with the
 environment applied by the GUI process, so nothing edits Steam's config files.
 It sets `SteamAppId` / `SteamGameId` / `STEAM_COMPAT_APP_ID` so `steam_api64.dll`
 can still attach to the running Steam client, and `STEAM_COMPAT_MOUNTS` so the
@@ -408,7 +408,7 @@ it keeps the path it was given — so a game installed somewhere the list does n
 name, probed at `Binaries/Win64`, is scanned only from `Binaries/Win64`. Point
 it at the game root yourself in that case.
 
-## Two engines
+## Engines
 
 | | `--engine=optiscaler` (default) | `--engine=reshade` |
 |---|---|---|
@@ -418,8 +418,42 @@ it at the game root yourself in that case.
 | Overlay key | `Insert` | `Home` |
 | Linux support | ships its own `setup_linux.sh` | none upstream; this script supplies it |
 
-Switch engines with `--uninstall` then reinstall. Both write a
+Switch engines with `--uninstall` then reinstall. Every engine writes a
 `.dlss5-linux.state` file so uninstall knows which proxy DLL to remove.
+
+### Games with no DLSS: `--engine=feeder`
+
+Both engines above ride a DLSS call the game already makes. A game with no
+temporal upscaler — Yakuza 0, most older titles — never makes one, and probes as
+`feeder`. The feeder engine supplies that call:
+
+| Piece | What it does |
+|---|---|
+| ReShade 6.8.0 (add-on build), as `dxgi.dll` | hooks the game and finds its depth buffer |
+| [LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) `Lumenite_Kernel` | estimates motion vectors from the picture |
+| [DLSS5-Feeder](https://github.com/jlrouzies-fr/DLSS5-Feeder) `dlss5-feed.addon64` + `DLSS5_Feed.fx` | builds a DLSS DLAA request from frame, depth and motion, on a private D3D12 device |
+| OptiScaler DLSS-NR, as a **second** proxy | answers that request with real DLSS, then runs the neural pass in place |
+
+OptiScaler cannot also be `dxgi.dll`, so it loads under a name the game imports
+at start — the first of `winmm`, `version`, `dbghelp`, `winhttp`, `wininet` the
+executable lists (Yakuza 0: `dbghelp.dll`). The state file records both as
+`hook=dxgi.dll,dbghelp.dll`, and the launch options override both:
+`WINEDLLOVERRIDES="dxgi=n,b;dbghelp=n,b"`. A `nvngx_dlss.dll` is supplied from the
+streamline set only when the game has none, and recorded as `ours=` so uninstall
+never takes a game's own.
+
+Before wiring this up, the feeder's own `host64\dlss5-feed-host64.exe --test`
+was run under GE-Proton 11-3 on an RTX 4090, driver 615.78, with no game:
+**300/300 evaluates**, then the same with OptiScaler DLSS-NR beside it as
+`winmm.dll` — `neural model (feature 18) loaded`, DLSS 310.2.1 underneath,
+`DLSS-NR running`. So NGX, the cross-device path and the Ada-patched model all
+work under Wine; what a given game adds is only whether ReShade finds its depth.
+
+Costs, from the feeder's own documentation: the motion vectors are estimated,
+so fast motion ghosts; the HUD is processed with everything else; expect around
+half the frame rate. Releases are pinned and fetched only from each project's
+GitHub — the feeder warns that lookalike zips, including copies of its repo,
+have carried malware.
 
 `--uninstall` resolves the game directory the same way installing does, so the
 game root works as well as the exact directory the files went into. A state file

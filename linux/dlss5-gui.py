@@ -584,7 +584,7 @@ def start_job(argv, env=None, cwd=None, folder=None):
 
 # OptiScaler ships LogToFile=true at LogLevel=2, so the log exists after a run
 # without the user configuring anything. ReShade writes its own alongside.
-LOG_NAMES = ("OptiScaler.log", "ReShade.log")
+LOG_NAMES = ("OptiScaler.log", "dlss5-feed.log", "ReShade.log")
 CAPTURE_DIR = "dlssnr-capture"
 
 
@@ -677,6 +677,33 @@ NR_DX12 = re.compile(r"D3D12CreateDevice|ID3D12CommandQueue created|Dx12 swapcha
 NR_UPSCALER_CALL = re.compile(r"TryCreateOptiFeature|IFeature::SetInitParameters")
 
 
+def installed_engine(directory):
+    """The engine the state file in this folder records, or None."""
+    try:
+        for line in (Path(directory) / ".dlss5-linux.state").read_text().splitlines():
+            if line.startswith("engine="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def feeder_reason(directory):
+    """Why a feeder install has not reached the neural pass, from its own log."""
+    try:
+        feed = (Path(directory) / "dlss5-feed.log").read_text(errors="replace")
+    except OSError:
+        return ("The feeder add-on has not written dlss5-feed.log, so ReShade did not load it. "
+                "Check the launch options override both proxy DLLs, then press Home in game "
+                "and look for DLSS 5 Feed under Add-ons.")
+    if "delivered" not in feed:
+        return ("The feeder is loaded but has not delivered a frame. Press Home in game: "
+                "LUMENITE: Kernel and DLSS 5 Feed must both be enabled, in that order. "
+                "dlss5-feed.log says what it is waiting for.")
+    return ("The feeder is delivering frames but OptiScaler never ran the neural pass. "
+            "dlss5-feed.log says whether its NGX calls reached OptiScaler DLSS-NR.")
+
+
 def never_ran_reason(text, directory):
     """(headline, detail) naming why OptiScaler loaded but DLSS-NR never ran.
 
@@ -697,11 +724,16 @@ def never_ran_reason(text, directory):
              ) if NR_NVAPI_MISS.search(text) and config.get("upscaler", "auto") == "auto" else ""
     stuck = "Injector loaded, neural pass never ran"
 
+    # The feeder builds the upscaler call the game lacks, so "D3D11, no
+    # upscaler" is its normal state rather than a dead end.
+    if installed_engine(directory) == "feeder":
+        return (stuck, feeder_reason(directory) + nvapi)
+
     if dx11 and not upscaler:
-        return ("This game cannot run the neural pass",
-                "It is a Direct3D 11 game with no DLSS, FSR or XeSS of its own, so "
-                "there is nothing for the neural pass to borrow depth and motion "
-                "vectors from. No setting changes that - uninstall it.")
+        return ("This engine cannot run the neural pass here",
+                "It is a Direct3D 11 game with no DLSS, FSR or XeSS of its own, so the "
+                "optiscaler engine has nothing to hook. Reinstall with the DLSS5-Feeder "
+                "engine, which builds that call itself.")
     if dx11:
         return (stuck, "This is a Direct3D 11 game. The neural pass is Direct3D 12 "
                        "only, and the DX12 upscaler setting does not apply here." + nvapi)
@@ -984,8 +1016,11 @@ def read_optiscaler_config(game_dir):
 
 def launch_env(hook, extra=None):
     """The Proton environment the injector needs. Mirrors print_launch_options()."""
+    # A feeder install has two proxies, recorded as "dxgi.dll,dbghelp.dll".
+    overrides = ";".join("%s=n,b" % h.strip().removesuffix(".dll")
+                         for h in hook.split(",") if h.strip())
     env = {
-        "WINEDLLOVERRIDES": "%s=n,b" % hook.removesuffix(".dll"),
+        "WINEDLLOVERRIDES": overrides,
         "PROTON_ENABLE_NVAPI": "1",
         "PROTON_ENABLE_NGX_UPDATER": "1",
         "VKD3D_CONFIG": "dxr11",
@@ -1432,10 +1467,20 @@ PAGE = r"""<!doctype html>
   @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.25 } }
   @media (prefers-reduced-motion: reduce) { .live { animation:none } }
 
+  /* Fixed slots. Everything that changes while a game runs - the status, the
+     Close button, the note under the settings - lives in a box whose size does
+     not depend on what it currently says, so a status change never moves the
+     controls under the pointer. Text that would overflow is clamped and kept
+     whole in the tooltip. */
   .status {
     display:flex; gap:12px; align-items:flex-start; padding:13px 15px;
     border-radius:10px; margin:14px 0; border:1px solid var(--line);
-    background:var(--info-bg);
+    background:var(--info-bg); height:84px; overflow:hidden;
+  }
+  .status > div { min-width:0; }
+  .status .hd { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .status .dt {
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;
   }
   .status.ok   { background:var(--ok-bg);   border-color:var(--ok);   }
   .status.warn { background:var(--warn-bg); border-color:var(--warn); }
@@ -1462,6 +1507,7 @@ PAGE = r"""<!doctype html>
   .badge.supported   { background:var(--ok-bg);   color:var(--ok); }
   .badge.installed   { background:var(--ok);      color:var(--ok-bg); }
   .badge.partial     { background:var(--warn-bg); color:var(--warn); }
+  .badge.feeder      { background:var(--info-bg); color:var(--accent); }
   .badge.blocked,
   .badge.missing,
   .badge.unsupported { background:var(--bad-bg);  color:var(--bad); }
@@ -1535,18 +1581,28 @@ PAGE = r"""<!doctype html>
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px;
   }
   .logwrap { margin-top:18px; border-top:1px solid var(--line); padding-top:14px; }
-  .logtabs { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+  .logtabs { display:flex; gap:8px; align-items:center; flex-wrap:nowrap; margin-bottom:8px; min-width:0; }
+  .logtabs select { min-width:0; max-width:160px; }
   .logtabs button.tab { border-radius:7px 7px 0 0; border-bottom-color:transparent; }
   .logtabs button.tab[aria-selected="true"] {
     background:var(--info-bg); border-color:var(--accent); color:var(--accent); font-weight:600;
   }
-  .logmeta { color:var(--muted); font-size:11.5px; margin-left:auto; }
+  .logmeta { color:var(--muted); font-size:11.5px; margin-left:auto; min-width:0;
+             white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .live { color:var(--ok); font-weight:600; }
   #log {
     background:#0d1013; color:#cfd6dd; border-radius:9px;
     padding:12px 14px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-    font-size:12px; white-space:pre-wrap; max-height:340px; overflow:auto; margin:0;
+    font-size:12px; white-space:pre-wrap; height:300px; overflow:auto; margin:0;
   }
+  /* Buttons sit in equal cells: a label that changes ("Reinstall", "Confirm
+     close") or a button that becomes unavailable never reflows its row. */
+  .btngrid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-top:10px; }
+  .btngrid button { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .selgrid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+  .selgrid select { width:100%; min-width:0; }
+  .livenote { min-height:4.6em; }
+  .fact .sub:empty::before { content:"\00a0"; }
   .note { color:var(--muted); font-size:12px; margin-top:10px; }
 </style>
 </head>
@@ -1643,7 +1699,9 @@ function flash(btn, msg) {
 }
 
 const el = (tag, props = {}, kids = []) => {
-  const node = Object.assign(document.createElement(tag), props);
+  const { dataset, ...rest } = props;
+  const node = Object.assign(document.createElement(tag), rest);
+  if (dataset) Object.assign(node.dataset, dataset);
   for (const k of [].concat(kids)) node.append(k);
   return node;
 };
@@ -1683,6 +1741,25 @@ function coverImg(g) {
   return [img];
 }
 
+// The poll only ever changes which games are running, so it moves the dots
+// rather than rebuilding a grid of 150 covers every few seconds.
+function paintListLive() {
+  for (const li of document.querySelectorAll("#games li.tile")) {
+    const g = GAMES.find(x => x.appid === li.dataset.appid);
+    if (!g) continue;
+    const cv = li.querySelector(".cv");
+    const dot = cv.querySelector(".live");
+    const live = !!ACTIVITY.running[gameDir(g)];
+    if (live && !dot) cv.append(el("span", { className: "live", title: "Running now" }));
+    if (!live && dot) dot.remove();
+  }
+}
+
+function markSelected() {
+  for (const li of document.querySelectorAll("#games li.tile"))
+    li.setAttribute("aria-selected", li.dataset.appid === SELECTED?.appid);
+}
+
 function renderList() {
   const needle = document.getElementById("filter").value.toLowerCase();
   const ul = document.getElementById("games");
@@ -1714,7 +1791,8 @@ function renderList() {
                      ? r.installed.engine + " as " + r.installed.hook + " \u00b7 verdict " + r.verdict + " \u00b7 " + age
                      : age }),
     ]);
-    const li = el("li", { className: "tile", tabIndex: 0, title: g.name + "\n" + g.path }, [
+    const li = el("li", { className: "tile", tabIndex: 0, title: g.name + "\n" + g.path,
+                          dataset: { appid: g.appid } }, [
       cover,
       el("span", { className: "nm", textContent: g.name }),
     ]);
@@ -1741,7 +1819,7 @@ async function select(game) {
   }
   Object.assign(LOGS, { job: "", game: "", tab: "job", meta: "", file: null, files: [], captures: false });
 
-  renderList();
+  markSelected();
   renderDetail();
   pollActivity();
   // No verdict at all is worth waiting for. A remembered one is shown at once,
@@ -1804,8 +1882,10 @@ async function pollActivity() {
   ACTIVITY.status = data.status || null;
   if (JSON.stringify(ACTIVITY) === before) return;   // nothing moved, no repaint
 
-  renderList();
-  renderDetail();
+  // Patched in place, never rebuilt: a full repaint every few seconds while a
+  // game ran closed any open dropdown and reset the panes under the pointer.
+  paintListLive();
+  paintDetailLive();
 }
 
 function startActivity() {
@@ -1919,6 +1999,83 @@ function armable(btn, key, armedText, action) {
   };
 }
 
+// "Installed" and "working" are different things, and only the injector's own
+// log can tell them apart: it can load, hook and still never dispatch the
+// neural pass. This says which of those actually happened. It always returns a
+// banner, of one fixed height, so the panes below never jump when it changes.
+function statusBanner(g) {
+  const installed = (RESULTS[g.appid] || {}).installed;
+  const live = !!ACTIVITY.running[gameDir(g)];
+  const st = ACTIVITY.status;
+  const banner = (cls, mark, hd, dt, dot) => el("div", { className: "status " + cls, id: "statusbar",
+                                                       title: hd + "\n" + dt }, [
+    el("span", { className: "mark", textContent: mark }),
+    el("div", {}, [
+      el("div", { className: "hd" }, [el("span", { textContent: hd }),
+        ...(dot ? [el("span", { className: "live", style: "margin-left:8px;display:inline-block" })] : [])]),
+      el("div", { className: "dt", textContent: dt }),
+    ]),
+  ]);
+
+  if (!installed && !live)
+    return banner("", "\u25cb", "Not installed",
+                  "Install, then launch the game - this will say whether the neural pass ran.");
+  if (!st)
+    return live
+      ? banner("", "\u25cf", "Running - waiting for the injector to write its log",
+               "The game is up. OptiScaler.log appears once it loads.", true)
+      : banner("", "\u25cb", "Installed, never run",
+               "Launch the game and this will say whether the neural pass ran.");
+
+  // A log older than a couple of minutes with nothing running describes the
+  // last session, not this moment, and saying so stops it reading as live.
+  const stale = !live && st.age > 120;
+  const when = stale ? " (last session, " + fmtAge(st.age) + " ago)" : "";
+  return banner(stale ? "" : st.state,
+                st.state === "ok" ? "\u2713" : st.state === "warn" ? "!" : "\u2717",
+                st.headline + when, st.detail || "", live);
+}
+
+// What the settings note says depends on whether the game is running, so it is
+// rebuilt by the poll along with the banner. Its box reserves three lines.
+function settingsNote(g) {
+  const ctx = DETAIL_CTX;
+  if (!ctx.cfg) return "Install first to configure OptiScaler.ini.";
+  if (!ACTIVITY.running[gameDir(g)])
+    return "Written straight into OptiScaler.ini, so it is the state the game starts in. "
+         + "Force 'dlss' if OptiScaler mis-detects the GPU under Proton and falls back to XeSS.";
+  // OptiScaler reads the ini once, at startup - it imports no file-watch API
+  // and has no reload action - so a change made now waits for the next launch.
+  return "Running: changes here apply at the next launch."
+    + (ctx.overlayOn
+      ? " Live now: press " + ctx.overlayKey + " for the OptiScaler overlay (all but Preset)."
+      : ctx.toggleNow !== "none"
+        ? " Press " + ctx.toggleNow + " in game to switch neural rendering on and off."
+        : " The overlay is off, so quit and relaunch to apply.");
+}
+
+let DETAIL_CTX = {};
+
+function paintDetailLive() {
+  const g = SELECTED;
+  if (!g || g.missing || !document.getElementById("statusbar")) return;
+  document.getElementById("statusbar").replaceWith(statusBanner(g));
+  const note = document.getElementById("livenote");
+  if (note) note.textContent = settingsNote(g);
+  const close = document.getElementById("bclose");
+  const live = !!ACTIVITY.running[gameDir(g)];
+  if (close && !close.dataset.busy) close.disabled = !live;
+
+  // Only a launch from this page used to follow the game log, so a game
+  // started from Steam left the tab on "No log file yet" for its whole
+  // session. Follow it whenever the game is up, however it was started, and
+  // read it once more as it stops so the last lines land too.
+  const wasLive = DETAIL_CTX.live;
+  DETAIL_CTX.live = live;
+  if (LOGS.tab === "game" && !gameLogTimer && (live || wasLive))
+    refreshGameLog(gameDir(g), (RESULTS[g.appid] || {}).installed?.engine);
+}
+
 function renderDetail() {
   const box = document.getElementById("detail");
   if (!SELECTED) {
@@ -1948,73 +2105,48 @@ function renderDetail() {
     ...(sub ? [el("div", { className: "sub", textContent: sub })] : []),
   ]);
 
-  // "Installed" and "working" are different things, and only the injector's own
-  // log can tell them apart: it can load, hook and still never dispatch the
-  // neural pass. This says which of those actually happened.
-  const statusBanner = () => {
-    const live = !!ACTIVITY.running[gameDir(g)];
-    const st = ACTIVITY.status;
-
-    if (!installed && !live) return null;
-    if (!st) {
-      return el("div", { className: "status" }, [
-        el("span", { className: "mark", textContent: live ? "\u25cf" : "\u25cb" }),
-        el("div", {}, [
-          el("div", { className: "hd", textContent: live
-            ? "Running - waiting for the injector to write its log"
-            : "Installed, never run" }),
-          el("div", { className: "dt", textContent: live
-            ? "The game is up. OptiScaler.log appears once it loads."
-            : "Launch the game and this will say whether the neural pass ran." }),
-        ]),
-      ]);
-    }
-
-    // A log older than a couple of minutes with nothing running describes the
-    // last session, not this moment, and saying so stops it reading as live.
-    const stale = !live && st.age > 120;
-    const when = stale ? " (last session, " + fmtAge(st.age) + " ago)" : "";
-
-    return el("div", { className: "status " + (stale ? "" : st.state) }, [
-      el("span", { className: "mark", textContent:
-        st.state === "ok" ? "\u2713" : st.state === "warn" ? "!" : "\u2717" }),
-      el("div", {}, [
-        el("div", { className: "hd" }, [
-          el("span", { textContent: st.headline + when }),
-          ...(live ? [el("span", { className: "live", style: "margin-left:8px" },
-                              [])] : []),
-        ]),
-        el("div", { className: "dt", textContent: st.detail || "" }),
-      ]),
-    ]);
-  };
-
   const engineSel = el("select", { id: "engine" }, [
-    el("option", { value: "optiscaler", textContent: "OptiScaler (recommended)" }),
+    el("option", { value: "optiscaler", textContent: "OptiScaler", title: "Recommended" }),
     el("option", { value: "reshade", textContent: "ReShade + RenoDX" }),
+    el("option", { value: "feeder", textContent: "DLSS5-Feeder",
+                   title: "For games with no DLSS: builds the DLSS request from ReShade's depth "
+                        + "and estimated motion" }),
   ]);
   if (installed) engineSel.value = installed.engine;
+  else if (r.verdict === "feeder") engineSel.value = "feeder";
 
   const hookSel = el("select", { id: "hook" },
     ["dxgi.dll", "d3d12.dll", "version.dll", "winmm.dll", "dbghelp.dll", "wininet.dll", "winhttp.dll"]
       .map(n => el("option", { value: n, textContent: n })));
-  hookSel.value = hook;
+  // A feeder install records both proxies ("dxgi.dll,dbghelp.dll"): the
+  // selector shows ReShade's, and launching overrides the whole list.
+  hookSel.value = hook.split(",")[0];
+  // The feeder's ReShade also needs Microsoft's d3dcompiler_47 over Wine's,
+  // which cannot compile the effects ReShade generates.
+  const runHooks = () => installed
+    ? installed.hook + (installed.engine === "feeder" ? ",d3dcompiler_47.dll" : "")
+    : hookSel.value;
 
   const protonSel = el("select", { id: "proton" },
     PROTONS.map(p => el("option", { value: p.path, textContent: p.name })));
 
   const bInstall = el("button", { className: "primary", textContent: installed ? "Reinstall" : "Install" });
   const bRemove  = el("button", { className: "danger", textContent: "Uninstall", disabled: !installed });
-  const bLaunch  = el("button", { textContent: "Launch with overrides", disabled: !installed || !PROTONS.length });
+  const bLaunch  = el("button", { textContent: "Launch", disabled: !installed || !PROTONS.length,
+                                  title: "Launch with overrides: runs the game through Proton "
+                                       + "directly with the launch options below applied" });
   const bProbe   = el("button", { textContent: "Re-probe" });
   // For a game that will not quit by itself - a hung exit, an invisible
   // dialog, a launcher that outlives it. Armed on the first click like an
   // unsupported install, because it throws away anything unsaved.
   const gameLive = !!ACTIVITY.running[gameDir(g)];
-  const bClose   = el("button", { className: "danger", textContent: "Close game", hidden: !gameLive,
-                                  title: "Stop every process this game left running" });
-  armable(bClose, "close:" + g.appid, "Unsaved progress is lost - click again", async () => {
+  const bClose   = el("button", { className: "danger", textContent: "Close game", disabled: !gameLive,
+                                  id: "bclose",
+                                  title: "Stop every process this game left running. "
+                                       + "Click twice - unsaved progress is lost." });
+  armable(bClose, "close:" + g.appid, "Confirm close", async () => {
     bClose.disabled = true;
+    bClose.dataset.busy = "1";
     bClose.textContent = "Closing\u2026";
     const res = await api("/api/close", { path: g.path });
     LOGS.tab = "job";
@@ -2023,6 +2155,8 @@ function renderDetail() {
       : "Closed " + g.name + ": " + res.found + " process(es)" +
         (res.killed ? ", " + res.killed + " had to be killed" : ", all exited cleanly") + ".";
     paintLog();
+    delete bClose.dataset.busy;
+    bClose.textContent = "Close game";
     pollActivity();
   });
 
@@ -2040,9 +2174,10 @@ function renderDetail() {
   // installs. No modal: it would block the page's own polling.
   const doInstall = () => job("/api/install", {
     path: g.path, engine: engineSel.value, hook: hookSel.value });
-  if (r.verdict === "unsupported")
-    armable(bInstall, "install:" + g.appid, "Unsupported - click again to install anyway", doInstall);
-  else
+  if (r.verdict === "unsupported") {
+    bInstall.title = "The probe found nothing for the pass to hook. Click twice to install anyway.";
+    armable(bInstall, "install:" + g.appid, "Install anyway?", doInstall);
+  } else
     bInstall.onclick = doInstall;
   // Uninstall stays on r.dir: it has no anti-cheat refusal to protect, and
   // dlss5-linux.sh --uninstall deletes from the path it is handed without
@@ -2052,12 +2187,12 @@ function renderDetail() {
   // the resolved directory is both exact and where the log follow expects to look.
   bLaunch.onclick  = () => job("/api/launch", {
     game: { ...g, path: r.dir || g.path, executable: r.executable },
-    proton: protonSel.value, hook: hookSel.value });
+    proton: protonSel.value, hook: runHooks() });
 
   const opts = el("textarea", { readOnly: true, id: "optsbox", value: "" });
-  api("/api/launch-options", { hook: hookSel.value }).then(d => { opts.value = d.options; });
+  api("/api/launch-options", { hook: runHooks() }).then(d => { opts.value = d.options; });
   hookSel.onchange = () =>
-    api("/api/launch-options", { hook: hookSel.value }).then(d => { opts.value = d.options; });
+    api("/api/launch-options", { hook: runHooks() }).then(d => { opts.value = d.options; });
 
   const bCopy = el("button", { textContent: "Copy" });
   bCopy.onclick = async () => flash(bCopy, (await copyText(opts.value)) ? "Copied" : "Copy failed");
@@ -2070,7 +2205,7 @@ function renderDetail() {
   bOpenLog.onclick = () => LOGS.file && api("/api/open", { path: LOGS.file });
 
   const bCaptures = el("button", { textContent: "Open captures" });
-  bCaptures.style.display = LOGS.captures ? "" : "none";
+  bCaptures.disabled = !LOGS.captures;
   bCaptures.title = "Before/after frames the neural pass writes each session";
   bCaptures.onclick = () => api("/api/open", { path: dir + "/dlssnr-capture" });
 
@@ -2084,7 +2219,7 @@ function renderDetail() {
 
   const fileSel = el("select", { id: "logfile" },
     LOGS.files.map(f => el("option", { value: f.path, textContent: f.name })));
-  fileSel.style.display = LOGS.files.length > 1 ? "" : "none";
+  fileSel.disabled = LOGS.files.length < 2;
   if (LOGS.file) fileSel.value = LOGS.file;
   fileSel.onchange = () => { LOGS.file = fileSel.value; refreshGameLog(dir, engineSel.value); };
 
@@ -2133,11 +2268,13 @@ function renderDetail() {
   keySel.value = toggleNow;
   keySel.onchange = () => job("/api/configure", { path: dir, toggle: keySel.value });
 
+  DETAIL_CTX = { cfg, overlayOn, overlayKey, toggleNow, live: !!ACTIVITY.running[gameDir(g)] };
+
   box.replaceChildren(
     el("h2", { textContent: g.name }),
     el("div", { className: "path", textContent: r.dir || g.path }),
 
-    statusBanner() || "",
+    statusBanner(g),
 
     el("div", { className: "panes" }, [
      el("div", { className: "col-read" }, [
@@ -2158,15 +2295,13 @@ function renderDetail() {
      ]),
 
      el("div", { className: "col-act" }, [
-      el("div", { className: "controls", style: "border-top:0;padding-top:0" }, [
-      el("label", { className: "f" }, ["Engine", engineSel]),
-      el("label", { className: "f" }, ["Proxy DLL", hookSel]),
-      el("label", { className: "f" }, ["Proton", protonSel]),
-      bProbe, bInstall, bRemove, bLaunch, bClose,
-    ]),
-
-    el("div", { className: "controls", style: "border-top:0;padding-top:0" },
-      [bFolder, bOpenLog, bCaptures]),
+      el("div", { className: "selgrid" }, [
+        el("label", { className: "f" }, ["Engine", engineSel]),
+        el("label", { className: "f" }, ["Proxy DLL", hookSel]),
+        el("label", { className: "f" }, ["Proton", protonSel]),
+      ]),
+      el("div", { className: "btngrid" }, [bProbe, bInstall, bRemove, bLaunch, bClose, bFolder]),
+      el("div", { className: "btngrid" }, [bOpenLog, bCaptures]),
 
     el("div", { className: "controls" }, [
       el("label", { className: "f", style: "flex-direction:row;align-items:center;gap:6px;font-size:13px;color:var(--ink)" },
@@ -2178,27 +2313,8 @@ function renderDetail() {
                     title: "OptiScaler's in-game menu. Its input hooks froze Like a Dragon Gaiden "
                          + "when a controller connected during startup, so installs leave it off." },
         [ovBox, "In-game overlay (" + overlayKey + ")"]),
-      el("span", { className: "note", style: "margin:0;flex-basis:100%" }, [
-        !cfg ? "Install first to configure OptiScaler.ini."
-        : !!ACTIVITY.running[gameDir(g)]
-          // OptiScaler reads the ini once, at startup - it imports no file-watch
-          // API and has no reload action - so a change made now is real on disk
-          // and simply will not reach the session that is already running.
-          ? "The game is running. OptiScaler reads OptiScaler.ini only at startup, so a change "
-            + "here is saved but does not reach this session \u2014 it applies the next time the "
-            + "game starts."
-            + (overlayOn
-              ? " To change it now, press " + overlayKey + " in the game for the OptiScaler "
-                + "overlay; everything under DLSS Neural Rendering is live there except Preset, "
-                + "which is baked in when the model is created."
-              : toggleNow !== "none"
-                ? " Press " + toggleNow + " in game to switch neural rendering on and off; "
-                  + "anything else needs a relaunch."
-                : " The in-game overlay is off, so quit and relaunch to apply it.")
-          : "Written straight into OptiScaler.ini, so it is the state the game starts in \u2014 no "
-            + "overlay needed. Force 'dlss' if OptiScaler mis-detects the GPU under Proton and "
-            + "falls back to XeSS."
-      ]),
+      el("span", { className: "note livenote", id: "livenote", style: "margin:0;flex-basis:100%",
+                   textContent: settingsNote(g) }),
     ]),
 
     el("div", { className: "opts" }, [
@@ -2207,7 +2323,7 @@ function renderDetail() {
       opts,
       el("div", { style: "margin-top:8px" }, bCopy),
       el("div", { className: "note", textContent:
-        "\"Launch with overrides\" runs the game through Proton directly and applies these itself. " +
+        "\"Launch\" runs the game through Proton directly and applies these itself. " +
         "Use the copied string instead if you would rather start the game from Steam." }),
       ]),
      ]),
@@ -2253,11 +2369,21 @@ async function refreshGameLog(dir, engine) {
   LOGS.tab = "game";
   const data = await api("/api/gamelog", { path: dir, engine, log: LOGS.file });
 
+  // A refused request used to fall through to "no log yet", which reads as
+  // "never run" when the real answer was an error. Say which it was, and name
+  // the folder that was looked in, so a wrong guess about it is visible.
+  if (data.error) {
+    LOGS.game = "Could not read the game log: " + data.error + "\n\nFolder: " + dir;
+    LOGS.meta = "";
+    paintLog();
+    return;
+  }
+
   LOGS.files = data.logs || [];
   LOGS.captures = data.captures;
 
   if (!LOGS.files.length) {
-    LOGS.game = "No log file yet.\n\n" +
+    LOGS.game = "No log file yet in\n  " + dir + "\n\n" +
       "OptiScaler writes OptiScaler.log beside the proxy DLL once the game has run.\n" +
       "ReShade writes ReShade.log. Launch the game first.";
     LOGS.meta = "";
