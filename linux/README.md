@@ -61,12 +61,17 @@ Closing the window while an install, uninstall or launch is still running asks
 first: the job would otherwise be cut off mid-way. "Close When Finished" hides
 the window and exits once the last job ends.
 
+Prebuilt packages are on the
+[Releases page](https://github.com/MiguelCarino/renodx-dlss-installer/releases):
+download the `.noarch.rpm` and `sudo dnf install ./dlss5-linux-*.noarch.rpm`, or
+download the `.AppImage`, `chmod +x` it and run it. To build them yourself:
+
 Build an RPM (needs `rpm-build`, `desktop-file-utils` and `python3`, no root)
 and install it:
 
 ```bash
 packaging/build-rpm.sh
-sudo dnf install ./packaging/dist/dlss5-linux-1.0.0-1.*.noarch.rpm
+sudo dnf install ./packaging/dist/dlss5-linux-0.0.1-1.*.noarch.rpm
 ```
 
 The RPM pulls in the CLI's tools (curl, unzip, binutils, 7z, xdg-utils) and only
@@ -76,10 +81,10 @@ Or an AppImage, a single file that needs no root to run:
 
 ```bash
 packaging/appimage/build-appimage.sh
-chmod +x packaging/dist/DLSS5_for_Linux-1.0.0-x86_64.AppImage   # if the copy lost it
-packaging/dist/DLSS5_for_Linux-1.0.0-x86_64.AppImage             # the desktop app
-packaging/dist/DLSS5_for_Linux-1.0.0-x86_64.AppImage cli --help  # the CLI
-ln -s "$PWD/packaging/dist/DLSS5_for_Linux-1.0.0-x86_64.AppImage" ~/.local/bin/dlss5-linux
+chmod +x packaging/dist/DLSS5_for_Linux-0.0.1-x86_64.AppImage   # if the copy lost it
+packaging/dist/DLSS5_for_Linux-0.0.1-x86_64.AppImage             # the desktop app
+packaging/dist/DLSS5_for_Linux-0.0.1-x86_64.AppImage cli --help  # the CLI
+ln -s "$PWD/packaging/dist/DLSS5_for_Linux-0.0.1-x86_64.AppImage" ~/.local/bin/dlss5-linux
 dlss5-linux --help                                               # the CLI by its usual name
 ```
 
@@ -92,7 +97,7 @@ window, optionally, PyGObject with GTK 4, libadwaita and WebKitGTK 6.0
 opens in your browser.
 
 On a host without FUSE (libfuse2) run it with `--appimage-extract-and-run`
-first, e.g. `DLSS5_for_Linux-1.0.0-x86_64.AppImage --appimage-extract-and-run cli --help`.
+first, e.g. `DLSS5_for_Linux-0.0.1-x86_64.AppImage --appimage-extract-and-run cli --help`.
 The AppImage runtime leaves its extract (`appimage_extracted_<hash>`, about
 250 KB, one per AppImage build) in `$TMPDIR` or `/tmp` after it exits; delete those by hand.
 

@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="0.0.1"
 readonly CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/dlss5-linux"
 readonly STATE_FILE=".dlss5-linux.state"
 
