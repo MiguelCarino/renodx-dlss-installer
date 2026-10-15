@@ -8,7 +8,8 @@
 #
 # The AppDir mirrors the RPM's /usr layout (usr/bin wrappers, usr/share/...), so
 # the same launchers, desktop file and icons work unchanged in both. Python and
-# the GTK stack are NOT bundled - see AppRun for why.
+# the GTK stack are NOT bundled - see AppRun for why. A static ffmpeg and
+# ffprobe are, for the "Images & video" view.
 #
 # Needs only curl, sha256sum and coreutils; no root and no FUSE. appimagetool
 # itself is an AppImage, run with --appimage-extract-and-run so it works on
@@ -43,6 +44,16 @@ readonly RUNTIME_TAG="20251108"
 readonly RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/download/$RUNTIME_TAG/runtime-$TARGET_ARCH"
 readonly RUNTIME_SHA256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
 
+# Static FFmpeg for the "Images & video" view, so video works without the host
+# having ffmpeg. BtbN's GPL build of the 8.1 branch (it includes libx264); the
+# sha256 is the digest GitHub publishes for this asset. BtbN prunes old
+# autobuild releases, so once this tag is gone a fresh build needs a newer one;
+# the cached copy keeps rebuilding this version until then.
+readonly FFMPEG_TAG="autobuild-2026-10-13-13-05"
+readonly FFMPEG_NAME="ffmpeg-n8.1.3-18-g46d899d7a0-linux64-gpl-8.1"
+readonly FFMPEG_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/$FFMPEG_TAG/$FFMPEG_NAME.tar.xz"
+readonly FFMPEG_SHA256="b3506f47a71a2f8cff8c0775112bf02a8a49035e3994232aa5f218058328e0e7"
+
 # Same cache root as dlss5-linux.sh, in a build/ subfolder so a "clean cache"
 # of the installer's downloads and the build tools stay distinguishable.
 readonly BUILD_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/dlss5-linux/build"
@@ -51,7 +62,7 @@ die() { printf 'build-appimage: %s\n' "$*" >&2; exit 1; }
 log() { printf 'build-appimage: %s\n' "$*"; }
 
 [[ "$(uname -m)" == "$TARGET_ARCH" ]] || die "this builds an $TARGET_ARCH AppImage and must run on $TARGET_ARCH (got $(uname -m))"
-for t in curl sha256sum install; do
+for t in curl sha256sum install tar xz; do
     command -v "$t" >/dev/null 2>&1 || die "$t not found"
 done
 
@@ -91,6 +102,8 @@ APPIMAGETOOL="$BUILD_CACHE/appimagetool-$APPIMAGETOOL_TAG-$TARGET_ARCH.AppImage"
 RUNTIME="$BUILD_CACHE/type2-runtime-$RUNTIME_TAG-$TARGET_ARCH"
 fetch "$APPIMAGETOOL_URL" "$APPIMAGETOOL_SHA256" "$APPIMAGETOOL"
 fetch "$RUNTIME_URL" "$RUNTIME_SHA256" "$RUNTIME"
+FFMPEG_TARBALL="$BUILD_CACHE/ffmpeg/$FFMPEG_NAME.tar.xz"
+fetch "$FFMPEG_URL" "$FFMPEG_SHA256" "$FFMPEG_TARBALL"
 chmod 0755 "$APPIMAGETOOL"
 
 # ---------------------------------------------------------------------------
@@ -128,6 +141,26 @@ put "$LINUX_DIR/README.md"       usr/share/doc/dlss5-linux/README.md  0644
 put "$LINUX_DIR/LICENSE"         usr/share/licenses/dlss5-linux/LICENSE 0644
 put "$HERE/AppRun" AppRun 0755
 
+# ffmpeg and ffprobe go in usr/bin, which AppRun puts first on PATH, so the
+# app uses these rather than whatever the host has. ffplay is left out.
+mkdir -p "$STAGE/ffmpeg"
+tar -xJf "$FFMPEG_TARBALL" -C "$STAGE/ffmpeg" --strip-components=1 \
+    "$FFMPEG_NAME/bin/ffmpeg" "$FFMPEG_NAME/bin/ffprobe" "$FFMPEG_NAME/LICENSE.txt"
+put "$STAGE/ffmpeg/bin/ffmpeg"   usr/bin/ffmpeg  0755
+put "$STAGE/ffmpeg/bin/ffprobe"  usr/bin/ffprobe 0755
+put "$STAGE/ffmpeg/LICENSE.txt"  usr/share/licenses/dlss5-linux/ffmpeg/LICENSE.txt 0644
+cat > "$STAGE/ffmpeg/SOURCE.txt" <<SRC
+The ffmpeg and ffprobe in this AppImage are BtbN's static GPL build
+$FFMPEG_NAME (release $FFMPEG_TAG):
+  $FFMPEG_URL
+FFmpeg source for this exact revision: https://github.com/FFmpeg/FFmpeg (tag/commit in the name above).
+Build scripts, including every bundled library and its source location:
+  https://github.com/BtbN/FFmpeg-Builds
+FFmpeg is licensed under the GPL as built here; see LICENSE.txt beside this file.
+SRC
+put "$STAGE/ffmpeg/SOURCE.txt" usr/share/licenses/dlss5-linux/ffmpeg/SOURCE.txt 0644
+rm -rf "$STAGE/ffmpeg"
+
 # appimagetool wants exactly one .desktop file at the AppDir root, an icon there
 # named after its Icon= key, and .DirIcon (what file managers show for the
 # AppImage). Relative symlinks keep a single copy of each and survive the
@@ -163,7 +196,7 @@ fi
 # --appimage-extract-and-run is consumed by the AppImage runtime (it must come
 # first), not by appimagetool: the tool unpacks to a temp dir, runs from there
 # and removes it, so no FUSE is needed. ARCH tells appimagetool what it packs;
-# with only shell and Python inside, it cannot infer that from an ELF.
+# it cannot be left to infer that from the bundled ffmpeg either.
 #
 # TMPDIR points into the staging dir because the extract is not reliably
 # removed by the runtime (1.9.1 leaves appimage_extracted_<md5> behind in

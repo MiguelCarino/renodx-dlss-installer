@@ -129,7 +129,7 @@ window, optionally, PyGObject with GTK 4, libadwaita and WebKitGTK 6.0
 opens in your browser.
 
 On a host without FUSE (libfuse2) run it with `--appimage-extract-and-run`
-first, e.g. `DLSS5_for_Linux-0.0.3-x86_64.AppImage --appimage-extract-and-run cli --help`.
+first, e.g. `DLSS5_for_Linux-0.0.4-x86_64.AppImage --appimage-extract-and-run cli --help`.
 The AppImage runtime leaves its extract (`appimage_extracted_<hash>`, about
 250 KB, one per AppImage build) in `$TMPDIR` or `/tmp` after it exits; delete those by hand.
 
@@ -337,12 +337,39 @@ OptiScaler ships `LogToFile=true` at `LogLevel=2` (Info), so the log exists afte
 a run with no configuration. Set `LogLevel=0` in `OptiScaler.ini` for trace
 detail when something is failing and Info is not saying why.
 
-## Still image (experimental)
+## Images & video (experimental)
 
-The **Still image** tab in the header runs the neural rendering model on a
-picture instead of a game. Open or drop an image, set the effect and press
-**Run**. Drag across the result to compare it with the original, and use
-**Save PNG** to write it to `~/Pictures/DLSS 5/`.
+The **Images & video** tab in the header runs the neural rendering model on a
+picture or a video instead of a game.
+
+**Picture:** open or drop an image, set the effect and press **Run**. Drag
+across the result to compare it with the original, and use **Save PNG** to
+write it to `~/Pictures/DLSS 5/`.
+
+**Video:** open or drop a video and press **Start**. It is processed frame by
+frame and saved, with its original sound, to `~/Videos/DLSS 5/`. While it
+runs, the panel shows progress and the newest frame next to its original.
+Cancel deletes the partial file.
+
+- **Size** scales the video down (2160p to 720p); otherwise it stays at its
+  own size, up to 4K.
+- **Length** processes only the first N seconds, which is useful for trying out
+  settings.
+- **History between frames** is on by default. The model then uses earlier
+  frames, which in testing gave less flicker. There are no motion vectors, so
+  fast motion can smear. The history resets at scene cuts, which are detected
+  from frame differences. Turn it off to process every frame on its own.
+
+The AppImage bundles a static `ffmpeg` and `ffprobe`: BtbN's GPL build of
+FFmpeg 8.1, with its licence and source pointers in
+`usr/share/licenses/dlss5-linux/ffmpeg/`. That adds about 120 MB to the file.
+The RPM uses the system's ffmpeg and recommends it (Fedora: `ffmpeg-free`).
+Encoding uses
+libx264, then h264_nvenc, libopenh264 or libvpx-vp9, whichever is available
+first, and writes BT.709-tagged video. On an RTX 4090 a 1080p video runs at
+about 15–20 frames per second, plus a few seconds to start the model. One
+helper process handles the whole video: frames go to `nrstill.exe --stream`
+over a pipe.
 
 - **Intensity** sets the strength of the whole effect. At 0 the image is
   unchanged, and values above 1 add nothing.

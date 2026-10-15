@@ -26,7 +26,9 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -739,11 +741,11 @@ def still_run(query, rgba):
         raise BadRequest("unknown style")
 
     if not STILL_LOCK.acquire(blocking=False):
-        raise Busy("A still image is already being processed.")
+        raise Busy("The GPU is busy with another picture or video.")
     try:
         status = still_status()
         if not status["ready"]:
-            raise BadRequest("Still image is not set up: %s" % status["message"])
+            raise BadRequest("Images & video is not set up: %s" % status["message"])
         (STILL_RUN / "in").mkdir(parents=True, exist_ok=True)
         (STILL_RUN / "in" / "gui.rgba").write_bytes(rgba)
         out_dir = STILL_RUN / "out" / "gui"
@@ -781,6 +783,334 @@ def still_save(query, png):
         n += 1
     target.write_bytes(png)
     return str(target)
+
+
+# ---- still image: video ------------------------------------------------------
+#
+# A video goes through the same helper, in its --stream mode: ffmpeg decodes
+# the upload to raw RGBA8, each frame goes to nrstill.exe behind a small header
+# (with a "reset history" flag at scene cuts), and the processed frames go to a
+# second ffmpeg that encodes them with the original audio.
+
+VIDEO_DIR = CACHE_HOME / "dlss5-linux" / "still-video"
+STILL_VIDEO_LOG = STILL_DATA / "last-video.log"
+VIDEO_MAX_UPLOAD = 64 << 30
+VIDEOS = {}
+VIDEOS_LOCK = threading.Lock()
+# Mean |difference| (0-255) between sparse samples of two frames that counts as
+# a scene cut. A false positive only resets the history for one frame.
+VIDEO_CUT = 45.0
+VIDEO_SIZES = (0, 720, 1080, 1440, 2160)
+
+
+def video_tools():
+    return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+
+def _fraction(text):
+    try:
+        num, _, den = (text or "").partition("/")
+        value = float(num) / float(den or 1)
+        return value if value > 0 else 0.0
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def video_probe(path):
+    if not video_tools():
+        raise BadRequest("Video needs ffmpeg and ffprobe (dnf install ffmpeg-free).")
+    run = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type,width,height,avg_frame_rate,r_frame_rate,color_space:format=duration",
+         "-of", "json", str(path)], capture_output=True, text=True, timeout=60)
+    try:
+        data = json.loads(run.stdout or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    streams = data.get("streams") or []
+    video = next((st for st in streams if st.get("codec_type") == "video" and st.get("width")), None)
+    if not video:
+        raise BadRequest("No video stream found in that file.")
+    rate = video.get("avg_frame_rate") if _fraction(video.get("avg_frame_rate")) else video.get("r_frame_rate")
+    fps = _fraction(rate)
+    if not 1 <= fps <= 240:
+        rate, fps = "30", 30.0
+    duration = float((data.get("format") or {}).get("duration") or 0)
+    return {"width": int(video["width"]), "height": int(video["height"]), "fps": round(fps, 3),
+            "rate": rate, "duration": round(duration, 2),
+            "frames": int(duration * fps) if duration else 0,
+            "audio": any(st.get("codec_type") == "audio" for st in streams),
+            "matrix": video.get("color_space") or ""}
+
+
+def video_size(info, short_side):
+    w, h = info["width"], info["height"]
+    scale = min(1.0, STILL_MAX_SIDE / max(w, h))
+    if short_side:
+        scale = min(scale, short_side / min(w, h))
+    return max(2, int(w * scale) // 2 * 2), max(2, int(h * scale) // 2 * 2)
+
+
+def video_encoder():
+    listing = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True,
+                             text=True, timeout=30).stdout
+    for name, args, ext, audio in (
+            ("libx264", ["-c:v", "libx264", "-preset", "medium", "-crf", "17"], "mp4", "aac"),
+            ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "19"], "mp4", "aac"),
+            ("libopenh264", ["-c:v", "libopenh264", "-b:v", "20M"], "mp4", "aac"),
+            ("libvpx-vp9", ["-c:v", "libvpx-vp9", "-crf", "24", "-b:v", "0", "-row-mt", "1"], "webm", "libopus")):
+        if re.search(r"^\s*V\S*\s+%s\s" % re.escape(name), listing, re.M):
+            return name, args, ext, audio
+    raise BadRequest("ffmpeg has no usable encoder (libx264, h264_nvenc, libopenh264 or libvpx-vp9).")
+
+
+def videos_dir():
+    try:
+        out = subprocess.run(["xdg-user-dir", "VIDEOS"], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        out = ""
+    base = Path(out) if out and out != str(Path.home()) else Path.home() / "Videos"
+    return base / "DLSS 5"
+
+
+def video_state(vid):
+    with VIDEOS_LOCK:
+        state = VIDEOS.get(vid)
+    if not state:
+        raise BadRequest("Unknown video; upload it again.")
+    return state
+
+
+def video_upload(handler, query):
+    """Stream an uploaded video to the cache and probe it."""
+    try:
+        length = int(handler.headers.get("Content-Length") or 0)
+    except ValueError:
+        raise BadRequest("Content-Length is not a number")
+    if not 0 < length <= VIDEO_MAX_UPLOAD:
+        raise BadRequest("empty or too large (64 GB at most)")
+    name = query.get("name", ["video"])[0]
+    stem = re.sub(r"[^\w.\- ]+", "_", Path(name).stem).strip(" .")[:80] or "video"
+    ext = re.sub(r"[^\w]", "", Path(name).suffix)[:8]
+
+    # Only the newest upload is kept; anything not being processed goes.
+    with VIDEOS_LOCK:
+        for old_id in [k for k, v in VIDEOS.items() if v["status"] != "running"]:
+            shutil.rmtree(VIDEO_DIR / old_id, ignore_errors=True)
+            del VIDEOS[old_id]
+    vid = uuid.uuid4().hex
+    folder = VIDEO_DIR / vid
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / ("input." + ext if ext else "input")
+    left = length
+    try:
+        with open(target, "wb") as fh:
+            while left:
+                chunk = handler.rfile.read(min(left, 1 << 20))
+                if not chunk:
+                    raise BadRequest("upload cut short")
+                fh.write(chunk)
+                left -= len(chunk)
+        info = video_probe(target)
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+    with VIDEOS_LOCK:
+        VIDEOS[vid] = {"status": "ready", "name": stem, "input": str(target), "info": info,
+                       "done": 0, "total": 0, "error": "", "output": "", "cuts": 0,
+                       "cancel": False, "preview": None}
+    return dict(info, id=vid, name=stem)
+
+
+def video_start(body):
+    vid = str_field(body, "id")
+    state = video_state(vid)
+    if state["status"] == "running":
+        raise Busy("This video is already being processed.")
+    q = {k: [str(v)] for k, v in body.items() if isinstance(v, (int, float, str))}
+    opts = {
+        "intensity": still_number(q, "intensity", 1, 0, 1),
+        "structure": still_number(q, "structure", 1, 0, 1),
+        "tone": still_number(q, "tone", 1, 0, 1),
+        "style": int(still_number(q, "style", 0, 0, 2)),
+        "seconds": still_number(q, "seconds", 0, 0, 86400),
+        "short": int(still_number(q, "size", 0, 0, 2160)),
+        "history": bool(body.get("history", True)),
+    }
+    if opts["short"] not in VIDEO_SIZES:
+        raise BadRequest("unknown size")
+    status = still_status()
+    if not status["ready"]:
+        raise BadRequest("Images & video is not set up: %s" % status["message"])
+    encoder = video_encoder()
+    if not STILL_LOCK.acquire(blocking=False):
+        raise Busy("The GPU is busy with another picture or video.")
+    info = state["info"]
+    w, h = video_size(info, opts["short"])
+    length = min(info["duration"], opts["seconds"]) if opts["seconds"] and info["duration"] else (
+        opts["seconds"] or info["duration"])
+    out_dir = videos_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / ("%s-dlss5.%s" % (state["name"], encoder[2]))
+    n = 2
+    while target.exists():
+        target = out_dir / ("%s-dlss5-%d.%s" % (state["name"], n, encoder[2]))
+        n += 1
+    state.update(status="running", done=0, total=int(length * info["fps"]) if length else 0,
+                 error="", output=str(target), cuts=0, cancel=False, preview=None,
+                 width=w, height=h, started=time.time(), finished=None, encoder=encoder[0])
+    threading.Thread(target=video_worker, args=(state, opts, encoder, w, h, target),
+                     daemon=True).start()
+    return {"id": vid, "width": w, "height": h, "total": state["total"], "output": str(target)}
+
+
+def _read_exact(stream, n):
+    parts, left = [], n
+    while left:
+        chunk = stream.read(left)
+        if not chunk:
+            return None
+        parts.append(chunk)
+        left -= len(chunk)
+    return parts[0] if len(parts) == 1 else b"".join(parts)
+
+
+def _sample_diff(a, b):
+    sa, sb = a[::1999], b[::1999]
+    return sum(abs(x - y) for x, y in zip(sa, sb)) / max(1, len(sa))
+
+
+def video_worker(state, opts, encoder, w, h, target):
+    info, src = state["info"], state["input"]
+    n = w * h * 4
+    part = target.with_name(target.stem + ".part" + target.suffix)
+    logs = VIDEO_DIR / Path(src).parent.name
+    procs = []
+    try:
+        limit = ["-t", "%g" % opts["seconds"]] if opts["seconds"] else []
+        # Untagged HD video is BT.709 in every player, so decode it that way too.
+        matrix = info["matrix"] if info["matrix"] in ("bt709", "bt470bg", "smpte170m", "bt2020nc") else (
+            "bt709" if info["height"] >= 720 else "smpte170m")
+        matrix = {"bt470bg": "bt601", "smpte170m": "bt601", "bt2020nc": "bt2020"}.get(matrix, matrix)
+        dec = subprocess.Popen(
+            ["ffmpeg", "-v", "error", "-nostdin"] + limit + ["-i", src, "-map", "0:v:0",
+             "-vf", "scale=%d:%d:flags=lanczos:in_color_matrix=%s,format=rgba" % (w, h, matrix),
+             "-fps_mode", "cfr", "-r", info["rate"], "-f", "rawvideo", "-pix_fmt", "rgba", "-"],
+            stdout=subprocess.PIPE, stderr=open(logs / "decode.log", "wb"))
+        procs.append(dec)
+        nr = subprocess.Popen(
+            [str(STILL_RUNTIME), "stream", str(STILL_VIDEO_LOG), "--size", str(w), str(h),
+             "--intensity", "%g" % opts["intensity"], "--local-structure", "%g" % opts["structure"],
+             "--local-tone", "%g" % opts["tone"], "--style", str(opts["style"])]
+            + ([] if opts["history"] else ["--reset-every"]),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        procs.append(nr)
+        _, vargs, ext, acodec = encoder
+        audio = info["audio"]
+        enc_cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "rawvideo", "-pix_fmt", "rgba",
+                   "-s", "%dx%d" % (w, h), "-r", info["rate"], "-i", "-"]
+        if audio:
+            enc_cmd += limit + ["-i", src]
+        enc_cmd += ["-map", "0:v:0"] + (["-map", "1:a:0?"] if audio else [])
+        # Tag the frames themselves: encoders take colour metadata from the
+        # frames, so -color_primaries alone came out as "unknown".
+        enc_cmd += ["-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,"
+                           "setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+                    "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"] + vargs
+        enc_cmd += (["-c:a", acodec, "-b:a", "192k"] if audio else [])
+        enc_cmd += (["-movflags", "+faststart"] if ext == "mp4" else []) + ["-shortest", str(part)]
+        enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, stderr=open(logs / "encode.log", "wb"))
+        procs.append(enc)
+
+        pending = {}            # frame number -> input frame, for the preview pair
+        pending_lock = threading.Lock()
+
+        def feed():
+            prev, index = None, 0
+            try:
+                while not state["cancel"]:
+                    frame = _read_exact(dec.stdout, n)
+                    if frame is None:
+                        break
+                    index += 1
+                    flags = 0
+                    if prev is not None and opts["history"] and _sample_diff(prev, frame) > VIDEO_CUT:
+                        flags = 1
+                        state["cuts"] += 1
+                    prev = frame
+                    with pending_lock:
+                        pending[index] = frame
+                        for old in [k for k in pending if k < index - 8]:
+                            del pending[old]
+                    nr.stdin.write(b"NRINPUT1" + struct.pack("<II", flags, 0))
+                    nr.stdin.write(frame)
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            finally:
+                try:
+                    nr.stdin.close()
+                except OSError:
+                    pass
+
+        threading.Thread(target=feed, daemon=True).start()
+        while not state["cancel"]:
+            hdr = _read_exact(nr.stdout, 16)
+            if hdr is None:
+                break
+            index, result = struct.unpack("<II", hdr[8:])
+            if hdr[:8] != b"NRFRAME1" or index != state["done"] + 1 or result != 1:
+                raise RuntimeError("helper stream out of step at frame %d (result 0x%x)"
+                                   % (state["done"] + 1, result))
+            frame = _read_exact(nr.stdout, n)
+            if frame is None:
+                break
+            enc.stdin.write(frame)
+            with pending_lock:
+                source = pending.pop(index, None)
+            state["preview"] = (index, source, frame)
+            state["done"] = index
+        enc.stdin.close()
+        if state["cancel"]:
+            raise InterruptedError
+        enc.wait()
+        nr.wait(timeout=60)
+        dec.wait(timeout=60)
+        if not state["done"]:
+            raise RuntimeError("no frames came back from the helper")
+        if enc.returncode != 0:
+            raise RuntimeError("the encoder failed: %s" % (logs / "encode.log").read_text(errors="replace")[-400:])
+        part.replace(target)
+        state["status"] = "done"
+    except InterruptedError:
+        state["status"] = "cancelled"
+    except Exception as exc:                          # noqa: BLE001 - reported to the page
+        log = STILL_VIDEO_LOG.read_text(errors="replace") if STILL_VIDEO_LOG.is_file() else ""
+        keep = [ln for ln in log.splitlines()
+                if any(k in ln for k in ("FAILED", "failed", "stream:", "removed", "no NVIDIA"))]
+        state["error"] = "%s\n%s" % (exc, "\n".join(keep[-5:]))
+        state["status"] = "failed"
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+        # Killing the runtime script does not reach Wine; this does.
+        subprocess.run([str(STILL_RUNTIME), "stop"], capture_output=True, timeout=60)
+        if state["status"] != "done":
+            part.unlink(missing_ok=True)
+        state["finished"] = time.time()
+        STILL_LOCK.release()
+
+
+def video_progress(vid):
+    state = video_state(vid)
+    elapsed = (state.get("finished") or time.time()) - state.get("started", time.time())
+    fps = state["done"] / elapsed if elapsed > 0 and state["done"] else 0
+    left = max(0, state["total"] - state["done"])
+    return {k: state.get(k) for k in ("status", "done", "total", "error", "output", "cuts",
+                                      "width", "height", "encoder", "name", "info")} | {
+        "fps": round(fps, 1), "eta": round(left / fps) if fps and state["status"] == "running" else None,
+        "preview": state["preview"][0] if state["preview"] else 0}
 
 
 def game_logs(game_dir, engine=None):
@@ -1585,7 +1915,34 @@ class Handler(BaseHTTPRequestHandler):
                         "folders": read_folders(),
                         "probes": remembered_probes(g["path"] for g in games)})
         elif url.path == "/api/still/status":
-            self._json(still_status())
+            self._json(dict(still_status(), video=video_tools()))
+        elif url.path == "/api/still/video/progress":
+            try:
+                self._json(video_progress(query.get("id", [""])[0]))
+            except BadRequest as exc:
+                self._json({"error": str(exc)}, 400)
+        elif url.path == "/api/still/video/preview":
+            # The newest processed frame, or the source frame it came from.
+            try:
+                state = video_state(query.get("id", [""])[0])
+            except BadRequest as exc:
+                self._json({"error": str(exc)}, 400)
+                return
+            pair = state["preview"]
+            data = pair and (pair[2] if query.get("which", ["out"])[0] == "out" else pair[1])
+            if not data:
+                self._json({"error": "no frame yet"}, 404)
+                return
+            self._sent = True
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Width", str(state["width"]))
+            self.send_header("X-Height", str(state["height"]))
+            self.send_header("X-Frame", str(pair[0]))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
         elif url.path.startswith("/api/job/"):
             job_id = url.path.rsplit("/", 1)[-1]
             with JOBS_LOCK:
@@ -1611,7 +1968,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             return
 
-        # The two binary routes, before the JSON body parser sees them.
+        # The binary routes, before the JSON body parser sees them.
+        if url.path == "/api/still/video/upload":
+            try:
+                self._json(video_upload(self, parse_qs(url.query)))
+            except BadRequest as exc:
+                self._json({"error": str(exc)}, 400)
+            return
         if url.path in ("/api/still/run", "/api/still/save"):
             query = parse_qs(url.query)
             try:
@@ -1709,8 +2072,21 @@ class Handler(BaseHTTPRequestHandler):
                     argv.append(str(src))
                 self._json({"job": start_job(argv)})
 
+            elif url.path == "/api/still/video/start":
+                self._json(video_start(body))
+
+            elif url.path == "/api/still/video/cancel":
+                video_state(str_field(body, "id"))["cancel"] = True
+                self._json({"ok": True})
+
+            elif url.path == "/api/still/video/open":
+                state = video_state(str_field(body, "id"))
+                if state["status"] != "done":
+                    raise BadRequest("The video is not finished.")
+                self._json({"opened": open_path(state["output"])})
+
             elif url.path == "/api/still/reveal":
-                folder = still_pictures_dir()
+                folder = videos_dir() if str_field(body, "kind", "") == "video" else still_pictures_dir()
                 folder.mkdir(parents=True, exist_ok=True)
                 self._json({"opened": open_path(folder)})
 
@@ -2073,6 +2449,9 @@ PAGE = r"""<!doctype html>
   .stside pre { white-space:pre-wrap; font-size:11.5px; max-height:220px; overflow:auto;
                 background:var(--bg); padding:8px; border-radius:7px; margin:0; }
   #stSetup { border:1px solid var(--line); border-radius:9px; padding:12px; background:var(--info-bg); }
+  .stside nav.views { align-self:flex-start; }
+  .stside label.chk { display:flex; gap:8px; align-items:flex-start; font-size:12px; color:var(--muted); }
+  .stside progress { width:100%; height:8px; }
 </style>
 </head>
 <body>
@@ -2084,7 +2463,7 @@ PAGE = r"""<!doctype html>
   </div>
   <nav class="views" aria-label="View">
     <button id="viewGames" class="on">Games</button>
-    <button id="viewStill" title="Run DLSS 5 on a picture">Still image</button>
+    <button id="viewStill" title="Run DLSS 5 on a picture or a video">Images &amp; video</button>
   </nav>
   <div id="preflight"></div>
 </header>
@@ -2110,11 +2489,7 @@ PAGE = r"""<!doctype html>
 
 <section id="still" hidden>
   <div class="stage" id="stStage">
-    <div class="stempty" id="stEmpty">
-      <b>Run DLSS 5 on a picture</b>
-      Open an image or drop one here. The model relights it; drag across the result to
-      compare it with the original.
-    </div>
+    <div class="stempty" id="stEmpty"></div>
     <div class="cmp" id="stCmp" hidden>
       <canvas id="stOut"></canvas>
       <canvas id="stIn"></canvas>
@@ -2124,9 +2499,9 @@ PAGE = r"""<!doctype html>
     </div>
   </div>
   <aside class="stside">
-    <h2>Still image</h2>
-    <div class="note" style="margin-top:4px">Feeds one picture to the neural rendering model as if it
-      were a game frame (flat depth, no motion). Experimental; needs an RTX 40 GPU and GE-Proton.</div>
+    <h2>Images &amp; video</h2>
+    <div class="note" style="margin-top:4px">Feeds a picture or video to the neural rendering model as if
+      it were a game (flat depth, no motion). Experimental; needs an RTX 40 GPU and GE-Proton.</div>
 
     <div id="stSetup" class="grp" hidden>
       <div id="stSetupMsg"></div>
@@ -2140,11 +2515,21 @@ PAGE = r"""<!doctype html>
     </div>
 
     <div class="grp">
-      <div class="btns">
+      <nav class="views" aria-label="Media">
+        <button id="stModePic" class="on">Picture</button>
+        <button id="stModeVid">Video</button>
+      </nav>
+      <div class="btns pic">
         <button id="stOpen">Open image&hellip;</button>
         <button id="stRun" class="primary" disabled>Run</button>
       </div>
+      <div class="btns vid" hidden>
+        <button id="stOpenVid">Open video&hellip;</button>
+        <button id="stStart" class="primary" disabled>Start</button>
+        <button id="stCancel" class="danger" hidden>Cancel</button>
+      </div>
       <input id="stFile" type="file" accept="image/*" hidden>
+      <input id="stVidFile" type="file" accept="video/*" hidden>
     </div>
 
     <div class="grp">
@@ -2157,16 +2542,28 @@ PAGE = r"""<!doctype html>
       <label class="f">Style
         <select id="stStyle"><option value="0">Default</option><option value="1">Matte (style 1)</option>
           <option value="2">Style 2</option></select></label>
-      <label class="f">Passes &ndash; the same image fed this many times; the last is shown
+      <label class="f pic">Passes &ndash; the same image fed this many times; the last is shown
         <input id="stPasses" type="number" min="1" max="32" value="8"></label>
+      <label class="f vid" hidden>Size
+        <select id="stSize"><option value="0">Original (up to 4K)</option><option value="2160">2160p</option>
+          <option value="1440">1440p</option><option value="1080">1080p</option><option value="720">720p</option></select></label>
+      <label class="f vid" hidden>Length in seconds (0 = the whole video)
+        <input id="stSeconds" type="number" min="0" step="1" value="0"></label>
+      <label class="vid chk" hidden><input id="stHistory" type="checkbox" checked>
+        History between frames: steadier, but fast motion can smear. Resets at scene cuts.</label>
     </div>
 
     <div class="grp">
-      <div class="btns">
+      <progress id="stProgress" class="vid" max="1" value="0" hidden></progress>
+      <div class="btns pic">
         <button id="stSave" disabled>Save PNG</button>
         <button id="stReveal">Show folder</button>
       </div>
-      <div class="note" id="stStatus">No image loaded.</div>
+      <div class="btns vid" hidden>
+        <button id="stPlay" disabled>Open video</button>
+        <button id="stRevealVid">Show folder</button>
+      </div>
+      <div class="note" id="stStatus"></div>
     </div>
   </aside>
 </section>
@@ -3174,12 +3571,17 @@ async function job(path, body) {
 }
 
 
-// ---- still image ---------------------------------------------------------
+// ---- images & video --------------------------------------------------------
 
-// The page decodes the picture and sends raw RGBA8; the server runs the model
-// headless under Wine and answers with raw RGBA8 of the same size.
-const ST = { w: 0, h: 0, name: "", px: null, out: false, params: "", busy: false, split: 0.5,
-             status: null, setupPoll: null };
+// Pictures: the page decodes the image and sends raw RGBA8; the server runs
+// the model headless under Wine and answers with raw RGBA8 of the same size.
+// Video: the file is uploaded, the server runs ffmpeg -> model -> ffmpeg, and
+// the page polls progress and shows the newest frame pair.
+const ST = { mode: "pic", status: null, setupPoll: null, split: 0.5,
+             // picture
+             w: 0, h: 0, name: "", px: null, inData: null, outData: null, params: "", busy: false,
+             // video
+             vid: null, vinfo: null, vrun: null, vIn: null, vOut: null, vFrame: 0, uploading: false };
 const STILL_MAX_SIDE = 3840;
 const $ = id => document.getElementById(id);
 
@@ -3191,6 +3593,16 @@ function showView(which) {
   $("viewStill").classList.toggle("on", still);
   history.replaceState(null, "", still ? "#still" : location.pathname + location.search);
   if (still) stillStatus();
+}
+
+function setMode(mode) {
+  ST.mode = mode;
+  $("stModePic").classList.toggle("on", mode === "pic");
+  $("stModeVid").classList.toggle("on", mode === "vid");
+  for (const el of document.querySelectorAll(".stside .pic")) el.hidden = mode !== "pic";
+  for (const el of document.querySelectorAll(".stside .vid")) el.hidden = mode !== "vid";
+  stillSay(ST.mode === "pic" ? ST.picMsg || "" : ST.vidMsg || "", ST.mode === "pic" ? ST.picKind : ST.vidKind);
+  stillPaint();
 }
 
 function stillParams() {
@@ -3206,22 +3618,60 @@ function stillPaint() {
   for (const k of ["Intensity", "Structure", "Tone"])
     $("st" + k + "V").textContent = Number($("st" + k).value).toFixed(2);
   const ready = ST.status?.ready;
-  $("stRun").disabled = ST.busy || !ST.px || !ready;
-  $("stSave").disabled = ST.busy || !ST.out;
+  const vrunning = ST.vrun?.status === "running";
+  const gpuBusy = ST.busy || vrunning;
+  $("stRun").disabled = gpuBusy || !ST.px || !ready;
+  $("stSave").disabled = ST.busy || !ST.outData;
   $("stOpen").disabled = ST.busy;
-  $("stSetupBtn").disabled = ST.busy || !!ST.setupPoll;
-  $("stTagR").hidden = !ST.out;
-  $("stTagL").textContent = ST.out ? "Original" : "Original (not run yet)";
-  $("stSplit").hidden = !ST.out;
-  const cut = ST.out ? (1 - ST.split) * 100 : 0;
+  $("stOpenVid").disabled = vrunning || ST.uploading || ST.status?.video === false;
+  $("stStart").disabled = gpuBusy || ST.uploading || !ST.vid || !ready;
+  $("stStart").hidden = vrunning;
+  $("stCancel").hidden = !vrunning;
+  $("stPlay").disabled = ST.vrun?.status !== "done";
+  $("stProgress").hidden = ST.mode !== "vid" || !(vrunning || ST.uploading);
+  $("stSetupBtn").disabled = gpuBusy || !!ST.setupPoll;
+
+  // The stage shows whichever mode is active.
+  const [inData, outData] = ST.mode === "pic" ? [ST.inData, ST.outData] : [ST.vIn, ST.vOut];
+  $("stEmpty").hidden = !!inData;
+  $("stCmp").hidden = !inData;
+  $("stEmpty").innerHTML = ST.mode === "pic"
+    ? "<b>Run DLSS 5 on a picture</b>Open an image or drop one here. The model relights it; " +
+      "drag across the result to compare it with the original."
+    : "<b>Run DLSS 5 on a video</b>Open a video or drop one here. It is processed frame by frame " +
+      "and saved with its sound to ~/Videos/DLSS 5. The newest frame shows here while it runs.";
+  $("stTagR").hidden = !outData;
+  $("stTagL").textContent = outData ? "Original" : "Original (not run yet)";
+  $("stSplit").hidden = !outData;
+  const cut = outData ? (1 - ST.split) * 100 : 0;
   $("stIn").style.clipPath = "inset(0 " + cut + "% 0 0)";
   $("stSplit").style.left = (ST.split * 100) + "%";
 }
 
+// Put a mode's frames on the two canvases (only when they changed).
+function stillDraw() {
+  const [inData, outData] = ST.mode === "pic" ? [ST.inData, ST.outData] : [ST.vIn, ST.vOut];
+  if (!inData) { stillPaint(); return; }
+  const cin = $("stIn"), cout = $("stOut");
+  if (cin.width !== inData.width || cin.height !== inData.height) {
+    cin.width = cout.width = inData.width;
+    cin.height = cout.height = inData.height;
+  }
+  cin.getContext("2d").putImageData(inData, 0, 0);
+  cout.getContext("2d").putImageData(outData || inData, 0, 0);
+  stillPaint();
+}
+
 function stillSay(text, kind) {
+  if (ST.mode === "pic") { ST.picMsg = text; ST.picKind = kind; } else { ST.vidMsg = text; ST.vidKind = kind; }
   const el = $("stStatus");
   el.textContent = text;
   el.className = "note" + (kind ? " " + kind : "");
+}
+function sayFor(mode, text, kind) {
+  if (mode === ST.mode) stillSay(text, kind);
+  else if (mode === "pic") { ST.picMsg = text; ST.picKind = kind; }
+  else { ST.vidMsg = text; ST.vidKind = kind; }
 }
 
 async function stillStatus() {
@@ -3236,6 +3686,9 @@ async function stillStatus() {
       : "Not available: " + msg.replace(/^missing: /, "missing ") + ".";
     $("stSetupBtn").hidden = !st.setup;
   }
+  if (st.video === false && !ST.vidMsg) ST.vidMsg = "Video needs ffmpeg (dnf install ffmpeg-free).";
+  if (!ST.picMsg) ST.picMsg = "No image loaded.";
+  stillSay(ST.mode === "pic" ? ST.picMsg : ST.vidMsg || "No video loaded.", ST.mode === "pic" ? ST.picKind : ST.vidKind);
   stillPaint();
 }
 
@@ -3257,31 +3710,30 @@ async function stillSetup() {
   stillPaint();
 }
 
+// ---- picture ----
+
 async function stillLoad(file) {
   if (!file || ST.busy) return;
   let bmp;
   try { bmp = await createImageBitmap(file, { imageOrientation: "from-image" }); }
-  catch (e) { stillSay("Could not open " + file.name + ": not an image this browser can decode.", "warn"); return; }
+  catch (e) { sayFor("pic", "Could not open " + file.name + ": not an image this browser can decode.", "warn"); return; }
   const scale = Math.min(1, STILL_MAX_SIDE / Math.max(bmp.width, bmp.height));
   // Even dimensions; the model takes any size, but odd ones gain nothing.
   const w = Math.max(2, Math.floor(bmp.width * scale / 2) * 2);
   const h = Math.max(2, Math.floor(bmp.height * scale / 2) * 2);
-  const cin = $("stIn"), cout = $("stOut");
-  cin.width = cout.width = w;
-  cin.height = cout.height = h;
-  const ctx = cin.getContext("2d", { willReadFrequently: true });
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
   ctx.fillStyle = "#000";                    // transparent pixels become black, alpha 255
   ctx.fillRect(0, 0, w, h);
   ctx.drawImage(bmp, 0, 0, w, h);
-  ST.px = ctx.getImageData(0, 0, w, h).data;
-  cout.getContext("2d").drawImage(cin, 0, 0);
-  Object.assign(ST, { w, h, name: file.name.replace(/\.[^.]+$/, ""), out: false, params: "", split: 0.5 });
-  $("stEmpty").hidden = true;
-  $("stCmp").hidden = false;
+  const data = ctx.getImageData(0, 0, w, h);
+  Object.assign(ST, { w, h, name: file.name.replace(/\.[^.]+$/, ""), inData: data, px: data.data,
+                      outData: null, params: "" });
   const note = scale < 1 || w !== bmp.width || h !== bmp.height
     ? " (from " + bmp.width + "×" + bmp.height + ")" : "";
-  stillSay(file.name + ": " + w + "×" + h + note + ". Press Run.");
-  stillPaint();
+  sayFor("pic", file.name + ": " + w + "×" + h + note + ". Press Run.");
+  stillDraw();
 }
 
 async function stillRun() {
@@ -3289,7 +3741,7 @@ async function stillRun() {
   ST.busy = true;
   const params = stillParams();
   const passes = new URLSearchParams(params).get("passes");
-  stillSay("Running DLSS 5 on " + ST.w + "×" + ST.h + ", " + passes + " passes…");
+  sayFor("pic", "Running DLSS 5 on " + ST.w + "×" + ST.h + ", " + passes + " passes…");
   stillPaint();
   try {
     const res = await fetch("/api/still/run?" + params, {
@@ -3298,18 +3750,18 @@ async function stillRun() {
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: res.status + " " + res.statusText }));
-      stillSay(err.error || "Failed.", "warn");
+      sayFor("pic", err.error || "Failed.", "warn");
       return;
     }
     const buf = await res.arrayBuffer();
-    $("stOut").getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(buf), ST.w, ST.h), 0, 0);
-    ST.out = true;
+    ST.outData = new ImageData(new Uint8ClampedArray(buf), ST.w, ST.h);
     ST.params = params;
     const ms = res.headers.get("X-Still-Ms");
-    stillSay("Done. " + ST.w + "×" + ST.h + ", " + passes + " passes" + (ms ? ", last pass " + ms + " ms" : "") +
-             ". Drag across the picture to compare.");
+    sayFor("pic", "Done. " + ST.w + "×" + ST.h + ", " + passes + " passes" + (ms ? ", last pass " + ms + " ms" : "") +
+           ". Drag across the picture to compare.");
+    if (ST.mode === "pic") stillDraw();
   } catch (e) {
-    stillSay("Failed: " + e, "warn");
+    sayFor("pic", "Failed: " + e, "warn");
   } finally {
     ST.busy = false;
     stillPaint();
@@ -3317,29 +3769,136 @@ async function stillRun() {
 }
 
 function stillSave() {
-  if (!ST.out) return;
-  $("stOut").toBlob(async blob => {
+  if (!ST.outData) return;
+  const c = document.createElement("canvas");
+  c.width = ST.w; c.height = ST.h;
+  c.getContext("2d").putImageData(ST.outData, 0, 0);
+  c.toBlob(async blob => {
     const res = await fetch("/api/still/save?name=" + encodeURIComponent(ST.name), {
       method: "POST", headers: { "X-Token": TOKEN, "Content-Type": "image/png" }, body: blob,
     });
     const j = await res.json().catch(() => ({ error: "save failed" }));
-    stillSay(j.saved ? "Saved " + j.saved : (j.error || "Save failed."), j.saved ? "" : "warn");
+    sayFor("pic", j.saved ? "Saved " + j.saved : (j.error || "Save failed."), j.saved ? "" : "warn");
   }, "image/png");
+}
+
+// ---- video ----
+
+function fmtTime(secs) {
+  secs = Math.round(secs);
+  const m = Math.floor(secs / 60), s = secs % 60;
+  return m ? m + " min " + s + " s" : s + " s";
+}
+
+function videoOpen(file) {
+  if (!file || ST.uploading || ST.vrun?.status === "running") return;
+  ST.uploading = true;
+  Object.assign(ST, { vid: null, vinfo: null, vrun: null, vIn: null, vOut: null, vFrame: 0 });
+  $("stProgress").value = 0;
+  sayFor("vid", "Loading " + file.name + "…");
+  stillDraw();
+  // XMLHttpRequest rather than fetch: it reports upload progress.
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/still/video/upload?name=" + encodeURIComponent(file.name));
+  xhr.setRequestHeader("X-Token", TOKEN);
+  xhr.setRequestHeader("Content-Type", "application/octet-stream");
+  xhr.upload.onprogress = e => { if (e.lengthComputable) $("stProgress").value = e.loaded / e.total; };
+  xhr.onloadend = () => {
+    ST.uploading = false;
+    let j = {};
+    try { j = JSON.parse(xhr.responseText); } catch (e) { j = { error: "upload failed (" + xhr.status + ")" }; }
+    if (j.error || !j.id) { sayFor("vid", j.error || "Upload failed.", "warn"); stillPaint(); return; }
+    ST.vid = j.id;
+    ST.vinfo = j;
+    sayFor("vid", file.name + ": " + j.width + "×" + j.height + ", " + j.fps + " fps, " + fmtTime(j.duration) +
+           (j.audio ? ", with sound" : ", no sound") + ". Press Start.");
+    stillPaint();
+  };
+  xhr.send(file);
+}
+
+async function videoStart() {
+  if (!ST.vid) return;
+  const body = {
+    id: ST.vid,
+    intensity: Number($("stIntensity").value), structure: Number($("stStructure").value),
+    tone: Number($("stTone").value), style: Number($("stStyle").value),
+    size: Number($("stSize").value), seconds: Math.max(0, Number($("stSeconds").value) || 0),
+    history: $("stHistory").checked,
+  };
+  const res = await api("/api/still/video/start", body);
+  if (res.error) { sayFor("vid", res.error, "warn"); return; }
+  ST.vrun = { status: "running", done: 0, total: res.total };
+  ST.vFrame = 0;
+  sayFor("vid", "Starting the model (a few seconds)…");
+  stillPaint();
+  videoPoll();
+}
+
+async function videoPreview(which) {
+  const res = await fetch("/api/still/video/preview?id=" + ST.vid + "&which=" + which,
+                          { headers: { "X-Token": TOKEN } });
+  if (!res.ok) return null;
+  const w = +res.headers.get("X-Width"), h = +res.headers.get("X-Height");
+  return { frame: +res.headers.get("X-Frame"), data: new ImageData(new Uint8ClampedArray(await res.arrayBuffer()), w, h) };
+}
+
+async function videoPoll() {
+  const id = ST.vid;
+  let lastPreview = 0;
+  while (ST.vid === id) {
+    const p = await api("/api/still/video/progress?id=" + id).catch(() => null);
+    if (!p || p.error) { sayFor("vid", p?.error || "Lost the server.", "warn"); break; }
+    ST.vrun = p;
+    if (p.total) $("stProgress").value = p.done / p.total;
+    // A fresh frame pair at most every two seconds: each is 8 MB at 1080p.
+    if (p.preview && p.preview !== ST.vFrame && Date.now() - lastPreview > 2000) {
+      lastPreview = Date.now();
+      const [o, i] = [await videoPreview("out"), await videoPreview("in")];
+      if (o && i && o.frame === i.frame) { ST.vOut = o.data; ST.vIn = i.data; ST.vFrame = o.frame; }
+      else if (o) { ST.vOut = o.data; ST.vIn = ST.vIn || o.data; ST.vFrame = o.frame; }
+      if (ST.mode === "vid") stillDraw();
+    }
+    if (p.status === "running") {
+      const left = p.total ? " of " + p.total : "";
+      sayFor("vid", p.done ? "Frame " + p.done + left + " · " + p.fps + " fps" +
+             (p.eta != null ? " · about " + fmtTime(p.eta) + " left" : "") +
+             (p.cuts ? " · " + p.cuts + " scene cut" + (p.cuts > 1 ? "s" : "") : "")
+             : "Starting the model (a few seconds)…");
+      stillPaint();
+      await new Promise(r => setTimeout(r, 1000));
+      continue;
+    }
+    if (p.status === "done") sayFor("vid", "Done: " + p.done + " frames, saved to " + p.output);
+    else if (p.status === "cancelled") sayFor("vid", "Cancelled. Nothing was saved.");
+    else sayFor("vid", "Failed: " + (p.error || "unknown error"), "warn");
+    break;
+  }
+  stillPaint();
 }
 
 function stillInit() {
   $("viewGames").onclick = () => showView("games");
   $("viewStill").onclick = () => showView("still");
+  $("stModePic").onclick = () => { setMode("pic"); stillDraw(); };
+  $("stModeVid").onclick = () => { setMode("vid"); stillDraw(); };
   $("stOpen").onclick = () => $("stFile").click();
   $("stFile").onchange = () => { stillLoad($("stFile").files[0]); $("stFile").value = ""; };
+  $("stOpenVid").onclick = () => $("stVidFile").click();
+  $("stVidFile").onchange = () => { videoOpen($("stVidFile").files[0]); $("stVidFile").value = ""; };
   $("stRun").onclick = stillRun;
+  $("stStart").onclick = videoStart;
+  $("stCancel").onclick = () => api("/api/still/video/cancel", { id: ST.vid });
   $("stSave").onclick = stillSave;
+  $("stPlay").onclick = () => api("/api/still/video/open", { id: ST.vid });
   $("stReveal").onclick = () => api("/api/still/reveal", {});
+  $("stRevealVid").onclick = () => api("/api/still/reveal", { kind: "video" });
   $("stSetupBtn").onclick = stillSetup;
   for (const id of ["stIntensity", "stStructure", "stTone", "stStyle", "stPasses"])
     $(id).oninput = () => {
       stillPaint();
-      if (ST.out && stillParams() !== ST.params) stillSay("Settings changed. Press Run to apply them.");
+      if (ST.mode === "pic" && ST.outData && stillParams() !== ST.params)
+        stillSay("Settings changed. Press Run to apply them.");
     };
 
   const stage = $("stStage");
@@ -3348,7 +3907,10 @@ function stillInit() {
   stage.ondrop = e => {
     e.preventDefault();
     stage.classList.remove("drag");
-    stillLoad(e.dataTransfer.files[0]);
+    const file = e.dataTransfer.files[0];
+    if (!file) return;
+    if (file.type.startsWith("video/")) { setMode("vid"); videoOpen(file); }
+    else { setMode("pic"); stillLoad(file); }
   };
 
   const cmp = $("stCmp");
@@ -3357,16 +3919,20 @@ function stillInit() {
     ST.split = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
     stillPaint();
   };
-  cmp.onpointerdown = e => { if (!ST.out) return; cmp.setPointerCapture(e.pointerId); move(e); };
+  cmp.onpointerdown = e => {
+    if (!(ST.mode === "pic" ? ST.outData : ST.vOut)) return;
+    cmp.setPointerCapture(e.pointerId);
+    move(e);
+  };
   cmp.onpointermove = e => { if (cmp.hasPointerCapture(e.pointerId)) move(e); };
 
   window.addEventListener("keydown", e => {
     if ($("still").hidden || !(e.ctrlKey || e.metaKey)) return;
-    if (e.key === "o") { e.preventDefault(); $("stFile").click(); }
-    else if (e.key === "Enter") { e.preventDefault(); stillRun(); }
-    else if (e.key === "s") { e.preventDefault(); stillSave(); }
+    if (e.key === "o") { e.preventDefault(); (ST.mode === "pic" ? $("stFile") : $("stVidFile")).click(); }
+    else if (e.key === "Enter") { e.preventDefault(); ST.mode === "pic" ? stillRun() : videoStart(); }
+    else if (e.key === "s" && ST.mode === "pic") { e.preventDefault(); stillSave(); }
   });
-  stillPaint();
+  setMode("pic");
   if (location.hash === "#still") showView("still");
 }
 

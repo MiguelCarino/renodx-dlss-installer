@@ -69,6 +69,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.0.4" date="2026-10-14">
+      <description>
+        <p>Video in the renamed "Images &amp; video" view: a video is processed frame by frame through the neural rendering model and saved with its sound, with progress, a live before/after preview and scene-cut detection. The AppImage bundles a static FFmpeg 8.1.</p>
+      </description>
+    </release>
     <release version="0.0.3" date="2026-10-14">
       <description>
         <p>Experimental "Still image" view: run the DLSS 5 neural rendering model on a picture in a private, headless Wine prefix, and compare the result with the original.</p>

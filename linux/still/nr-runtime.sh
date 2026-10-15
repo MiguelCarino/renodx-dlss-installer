@@ -5,9 +5,11 @@
 #   nr-runtime.sh status            prints "ready", or what is missing
 #   nr-runtime.sh setup [DLL]       builds the Wine prefix (one time) and installs the NR DLL
 #   nr-runtime.sh run LOG ARGS...   runs nrstill.exe; ARGS use Windows paths under C:\nr
+#   nr-runtime.sh stream LOG ARGS... nrstill.exe --stream: RGBA8 frames on stdin -> stdout
+#   nr-runtime.sh stop              ends every Wine process in the prefix
 #
 # Nothing here opens a window: every Wine process runs with DISPLAY/WAYLAND_DISPLAY unset.
-# The prefix lives in $DLSS5_STILL_DATA (default ~/.local/share/dlss5-still).
+# The prefix lives in $DLSS5_STILL_DATA (default ~/.local/share/dlss5-linux/still).
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -102,9 +104,12 @@ REG
     echo "Runtime ready in $DATA"
 }
 
+# run LOG ARGS...     all output to LOG
+# stream LOG ARGS...  frames through stdin/stdout, everything else to LOG, no time limit
 run() {
-    local log=$1; shift
-    local ge nv rc
+    local mode=$1 log=$2; shift 2
+    local ge nv rc limit=${NRTIMEOUT:-240}
+    [[ $mode == stream ]] && limit=${NRTIMEOUT:-0}
     ge=$(find_proton); nv=$(nv_wine_dir)
     # Keep the exe/shim in step with the app's bin/ (an updated app ships new ones).
     cmp -s "$HERE/bin/nrstill.exe" "$RUN/nrstill.exe" || install -m755 "$HERE/bin/nrstill.exe" "$RUN/"
@@ -114,7 +119,12 @@ run() {
         WINEPREFIX="$PFX" WINEDEBUG=-all \
         WINEDLLOVERRIDES='mscoree,mshtml,winemenubuilder.exe=;d3d12,d3d12core,dxgi,d3d11,nvapi64,nvofapi64=n' \
         DXVK_ENABLE_NVAPI=1 NVIDIA_WINE_DLL_DIR="$nv" DLSSNR_DISABLE=1 \
-        timeout "${NRTIMEOUT:-240}" "$ge/files/bin/wine" 'C:\nr\nrstill.exe' "$@" >"$log" 2>&1
+        WINE="$ge/files/bin/wine" LIMIT="$limit" MODE="$mode" LOG="$log" \
+        bash -c 'if [[ $MODE == stream ]]; then
+                     exec timeout "$LIMIT" "$WINE" "C:\\nr\\nrstill.exe" --stream "$@" 2>"$LOG"
+                 else
+                     exec timeout "$LIMIT" "$WINE" "C:\\nr\\nrstill.exe" "$@" >"$LOG" 2>&1
+                 fi' nrstill "$@"
     rc=$?
     WINEPREFIX="$PFX" "$ge/files/bin/wineserver" -k 2>/dev/null
     echo "exit code: $rc" >>"$log"
@@ -124,6 +134,8 @@ run() {
 case "${1:-}" in
     status) status ;;
     setup) shift; setup "${1:-}" ;;
-    run) shift; run "$@" ;;
+    run) shift; run run "$@" ;;
+    stream) shift; run stream "$@" ;;
+    stop) ge=$(find_proton); [[ -n "$ge" && -d "$PFX" ]] && WINEPREFIX="$PFX" "$ge/files/bin/wineserver" -k 2>/dev/null; exit 0 ;;
     *) sed -n '2,9p' "$0"; exit 64 ;;
 esac

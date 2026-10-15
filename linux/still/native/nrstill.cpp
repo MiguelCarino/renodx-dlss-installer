@@ -16,6 +16,8 @@
 // vtable (checked by a start-up self-test): Set void*=0 D3D12=1 D3D11=2 int=3 uint=4 double=5 float=6 ull=7,
 // Gets = +8, Reset = 16.
 #include <windows.h>
+#include <io.h>
+#include <fcntl.h>
 #include <dxgi1_6.h>
 #include <d3d12.h>
 #include <cstdio>
@@ -111,7 +113,7 @@ struct Args {
   int preset = 0, style = 0, autoMask = 1, uiCorr = 1, depthInverted = 1;
   float mvx = 0, mvy = 0;
   float intensity = 1.0f, lstruct = 1.0f, ltone = 1.0f, skin = -1.0f, flatDepth = 0.01f;
-  bool resetEvery = false, verbose = false, noTunables = false, queryRatio = true;
+  bool resetEvery = false, verbose = false, noTunables = false, queryRatio = true, stream = false;
   std::string fmt = "rgba8";  // rgba8 | rgba16f (colour + output format)
 };
 
@@ -217,7 +219,52 @@ static ID3D12Resource* stageUpload(Gpu& g, ID3D12Resource* tex, const uint8_t* s
   return up;  // caller releases after the fence
 }
 
+// --stream: RGBA8 frames in on stdin, each preceded by a 16-byte header ("NRINPUT1", uint32 flags,
+// uint32 reserved; flag 1 = reset the history, e.g. at a scene cut). Processed frames out on stdout,
+// each preceded by "NRFRAME1", uint32 frame number from 1, uint32 NGX result. Everything else this
+// process (and anything it loads) prints goes to stderr, so the frame pipe carries frames only.
+static HANDLE g_frameIn = nullptr, g_frameOut = nullptr;
+
+// Reads one input header + frame. Returns 1 ok, 0 clean end of stream, -1 error.
+static bool readExact(HANDLE h, uint8_t* p, size_t n, bool* eofAtStart);
+static int readFrame(std::vector<uint8_t>& px, uint32_t* flags) {
+  uint8_t hdr[16]; bool eof = false;
+  if (!readExact(g_frameIn, hdr, sizeof hdr, &eof)) return eof ? 0 : -1;
+  if (memcmp(hdr, "NRINPUT1", 8)) { printf("stream: bad input header\n"); return -1; }
+  memcpy(flags, hdr + 8, 4);
+  return readExact(g_frameIn, px.data(), px.size(), nullptr) ? 1 : -1;
+}
+
+static bool readExact(HANDLE h, uint8_t* p, size_t n, bool* eofAtStart) {
+  size_t got = 0;
+  while (got < n) {
+    DWORD chunk = (DWORD)((n - got) > (1u << 24) ? (1u << 24) : (n - got)), rd = 0;
+    if (!ReadFile(h, p + got, chunk, &rd, nullptr) || rd == 0) break;
+    got += rd;
+  }
+  if (eofAtStart) *eofAtStart = got == 0;
+  return got == n;
+}
+static bool writeExact(HANDLE h, const uint8_t* p, size_t n) {
+  while (n) {
+    DWORD chunk = (DWORD)(n > (1u << 24) ? (1u << 24) : n), wr = 0;
+    if (!WriteFile(h, p, chunk, &wr, nullptr) || wr == 0) return false;
+    p += wr; n -= wr;
+  }
+  return true;
+}
+
 int main(int argc, char** argv) {
+  for (int i = 1; i < argc; ++i)
+    if (!strcmp(argv[i], "--stream")) {
+      // Keep the real stdout for frames, then point fd 1 and STD_OUTPUT_HANDLE at stderr.
+      HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE), err = GetStdHandle(STD_ERROR_HANDLE);
+      DuplicateHandle(GetCurrentProcess(), out, GetCurrentProcess(), &g_frameOut, 0, FALSE, DUPLICATE_SAME_ACCESS);
+      g_frameIn = GetStdHandle(STD_INPUT_HANDLE);
+      _setmode(_fileno(stdin), _O_BINARY);
+      _dup2(_fileno(stderr), _fileno(stdout));
+      SetStdHandle(STD_OUTPUT_HANDLE, err);
+    }
   setvbuf(stdout, nullptr, _IONBF, 0);
   {  // headless-wine deadlock workaround (without it the first D3D12 call can hang)
     HWND desk = GetDesktopWindow();
@@ -248,6 +295,7 @@ int main(int argc, char** argv) {
     else if (k == "--automask") a.autoMask = atoi(nx());
     else if (k == "--ui-correction") a.uiCorr = atoi(nx());
     else if (k == "--reset-every") a.resetEvery = true;
+    else if (k == "--stream") a.stream = true;
     else if (k == "--no-tunables") a.noTunables = true;
     else if (k == "--no-ratio") a.queryRatio = false;
     else if (k == "--fmt") a.fmt = nx();
@@ -256,14 +304,24 @@ int main(int argc, char** argv) {
     else if (k == "--verbose") { a.verbose = true; g_ngxLogLevel = 2; }
     else { printf("unknown arg %s\n", k.c_str()); return 64; }
   }
-  if (a.color.empty() || !a.w || !a.h) { printf("usage: nrstill --color f.rgba --size W H [--depth flat|none|f.f32] ...\n"); return 64; }
+  if ((a.color.empty() && !a.stream) || !a.w || !a.h) {
+    printf("usage: nrstill --color f.rgba --size W H [--depth flat|none|f.f32] ...\n"
+           "       nrstill --stream --size W H [...]   (RGBA8 frames on stdin -> stdout)\n");
+    return 64;
+  }
+  if (a.stream && a.fmt != "rgba8") { printf("--stream supports --fmt rgba8 only\n"); return 64; }
   const unsigned W = a.w, H = a.h;
   printf("config: color=%s %ux%u depth=%s mv=%s mvconst=%g,%g frames=%u preset=%d style=%d intensity=%g lstruct=%g ltone=%g skin=%g automask=%d fmt=%s uintSlot=%d resSlot=%d\n",
          a.color.c_str(), W, H, a.mode == "file" ? a.depthFile.c_str() : a.mode.c_str(), a.mv.c_str(), a.mvx, a.mvy, a.frames, a.preset,
          a.style, a.intensity, a.lstruct, a.ltone, a.skin, a.autoMask, a.fmt.c_str(), g_uintSlot, g_resSlot);
 
   std::vector<uint8_t> rgba, depthRaw;
-  if (!readFile(a.color, rgba, (size_t)W * H * 4)) return 2;
+  uint32_t inFlags = 0;
+  if (a.stream) {
+    rgba.resize((size_t)W * H * 4);
+    int got = readFrame(rgba, &inFlags);
+    if (got != 1) { printf(got == 0 ? "stream: no frames\n" : "stream: bad first frame\n"); return 2; }
+  } else if (!readFile(a.color, rgba, (size_t)W * H * 4)) return 2;
   if (a.mode == "file" && !readFile(a.depthFile, depthRaw, (size_t)W * H * 4)) return 2;
   CreateDirectoryA(a.outDir.c_str(), nullptr);
 
@@ -390,6 +448,11 @@ int main(int argc, char** argv) {
   ID3D12Resource* tMv = makeTex(g.dev, DXGI_FORMAT_R16G16_FLOAT, W, H, false, D3D12_RESOURCE_STATE_COPY_DEST);
   ID3D12Resource* tOut = makeTex(g.dev, cfmt, W, H, true, D3D12_RESOURCE_STATE_COPY_DEST);
   if (!tColor || !tDepth || !tMv || !tOut) return 6;
+  // Stream mode re-uploads the colour every frame from one persistent upload buffer.
+  D3D12_RESOURCE_DESC cd = tColor->GetDesc();
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT cfp; UINT64 ctotal = 0;
+  g.dev->GetCopyableFootprints(&cd, 0, 1, 0, &cfp, nullptr, nullptr, &ctotal);
+  ID3D12Resource* upColor = a.stream ? makeBuf(g.dev, ctotal, D3D12_HEAP_TYPE_UPLOAD) : nullptr;
   // Output pre-filled with a sentinel (pure magenta, alpha 0) so "model wrote nothing" is detectable.
   std::vector<uint8_t> sentinel((size_t)W * H * cbpp);
   for (size_t i = 0; i < (size_t)W * H; ++i) {
@@ -444,10 +507,18 @@ int main(int argc, char** argv) {
   // ---- evaluate N times on the same still ----
   std::vector<uint8_t> frame((size_t)W * H * cbpp);
   double sumMs = 0;
-  for (unsigned fi = 1; fi <= a.frames; ++fi) {
-    bool dumpIt = false;
+  for (unsigned fi = 1; a.stream || fi <= a.frames; ++fi) {
+    bool dumpIt = a.stream;
     for (unsigned d : a.dump) if (d == fi) dumpIt = true;
     if (fi == a.frames) dumpIt = true;
+    if (a.stream && fi > 1) {
+      int got = readFrame(rgba, &inFlags);
+      if (got != 1) {
+        if (got < 0) printf("stream: bad frame %u\n", fi);
+        printf("stream: %u frames\n", fi - 1);
+        break;
+      }
+    }
     setR(caps, "DLSSNR.Color", tColor);
     setR(caps, "DLSSNR.Output", tOut);
     setR(caps, "DLSSNR.Depth", a.mode == "none" ? nullptr : tDepth);
@@ -459,7 +530,7 @@ int main(int argc, char** argv) {
     setU(caps, "DLSSNR.Width", W);
     setU(caps, "DLSSNR.Height", H);
     setU(caps, "DLSSNR.DepthInverted", (unsigned)a.depthInverted);
-    setU(caps, "DLSSNR.Reset", (fi == 1 || a.resetEvery) ? 1u : 0u);
+    setU(caps, "DLSSNR.Reset", (fi == 1 || a.resetEvery || (inFlags & 1)) ? 1u : 0u);
     for (const char* base : {"Color", "Output", "Depth", "MVec"}) {
       char k[96];
       snprintf(k, sizeof k, "DLSSNR.%sSubrectBaseX", base); setU(caps, k, 0);
@@ -471,6 +542,17 @@ int main(int argc, char** argv) {
     setF(caps, "DLSSNR.MVecScaleY", 1.0f);
     setTunables();
     g.begin();
+    if (a.stream && fi > 1) {
+      uint8_t* m = nullptr;
+      upColor->Map(0, nullptr, (void**)&m);
+      for (unsigned y = 0; y < H; ++y) memcpy(m + cfp.Offset + (size_t)y * cfp.Footprint.RowPitch, rgba.data() + (size_t)y * W * 4, (size_t)W * 4);
+      upColor->Unmap(0, nullptr);
+      barrier(g.cl, tColor, SRV, D3D12_RESOURCE_STATE_COPY_DEST);
+      D3D12_TEXTURE_COPY_LOCATION dst = {}; dst.pResource = tColor; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      D3D12_TEXTURE_COPY_LOCATION src = {}; src.pResource = upColor; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = cfp;
+      g.cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+      barrier(g.cl, tColor, D3D12_RESOURCE_STATE_COPY_DEST, SRV);
+    }
     r = (NGXResult)call(sEval, (uintptr_t)g.cl, (uintptr_t)feature, (uintptr_t)caps, 0, 0);
     uavBarrier(g.cl, tOut);
     if (dumpIt) {
@@ -483,11 +565,25 @@ int main(int argc, char** argv) {
     double ms = g.submitWait();
     HRESULT dr = g.dev->GetDeviceRemovedReason();
     if (fi > 1) sumMs += ms;
-    if (r != NGX_OK || FAILED(dr) || dumpIt || fi <= 2)
+    if (r != NGX_OK || FAILED(dr) || (dumpIt && !a.stream) || fi <= 2 || (a.stream && fi % 300 == 0))
       printf("frame %3u: evaluate -> 0x%08x %s, gpu+wait %.2f ms%s\n", fi, (unsigned)r, ngxName(r), ms,
              FAILED(dr) ? " DEVICE REMOVED" : "");
     if (FAILED(dr)) { printf("device removed reason 0x%08lx\n", (unsigned long)dr); return 8; }
     if (r != NGX_OK) break;
+    if (a.stream) {
+      uint8_t* m = nullptr; D3D12_RANGE rr = {0, (SIZE_T)ototal};
+      rb->Map(0, &rr, (void**)&m);
+      for (unsigned y = 0; y < H; ++y) memcpy(frame.data() + (size_t)y * W * 4, m + ofp.Offset + (size_t)y * ofp.Footprint.RowPitch, (size_t)W * 4);
+      D3D12_RANGE wr = {0, 0}; rb->Unmap(0, &wr);
+      uint8_t hdr[16] = {'N', 'R', 'F', 'R', 'A', 'M', 'E', '1'};
+      uint32_t idx = fi, res = (uint32_t)r;
+      memcpy(hdr + 8, &idx, 4); memcpy(hdr + 12, &res, 4);
+      if (!writeExact(g_frameOut, hdr, sizeof hdr) || !writeExact(g_frameOut, frame.data(), frame.size())) {
+        printf("stream: output closed at frame %u\n", fi);
+        break;
+      }
+      continue;
+    }
     if (dumpIt) {
       uint8_t* m = nullptr; D3D12_RANGE rr = {0, (SIZE_T)ototal};
       rb->Map(0, &rr, (void**)&m);
@@ -511,7 +607,7 @@ int main(int argc, char** argv) {
       printf("  dumped %s  mean|out-in| (0..255) = %.3f  untouched(sentinel) px = %zu\n", fn, mad, sentinelPx);
     }
   }
-  if (a.frames > 1) printf("mean per-evaluate submit+fence time (frames 2..%u): %.2f ms\n", a.frames, sumMs / (a.frames - 1));
+  if (!a.stream && a.frames > 1) printf("mean per-evaluate submit+fence time (frames 2..%u): %.2f ms\n", a.frames, sumMs / (a.frames - 1));
 
   if (sRelease) { NGXResult rr = (NGXResult)call(sRelease, (uintptr_t)feature, 0, 0, 0, 0); printf("snippet ReleaseFeature -> 0x%08x\n", (unsigned)rr); }
   g.begin(); g.submitWait();

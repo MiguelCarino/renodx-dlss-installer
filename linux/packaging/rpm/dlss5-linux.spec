@@ -46,6 +46,8 @@ Recommends:     python3-gobject
 Recommends:     gtk4
 Recommends:     libadwaita
 Recommends:     webkitgtk6.0
+# Video in the "Images & video" view; pictures work without it.
+Recommends:     /usr/bin/ffmpeg
 
 %description
 A Linux port of renodx-dlss-installer. It walks every Steam library, probes
@@ -120,6 +122,11 @@ python3 -c 'import sys; [compile(open(f).read(), f, "exec") for f in sys.argv[1:
 %{_metainfodir}/%{app_id}.metainfo.xml
 
 %changelog
+* Wed Oct 14 2026 MiguelCarino <miguel.carino1994@outlook.com> - 0.0.4-1
+- Video in the "Images & video" view: ffmpeg -> nrstill.exe --stream ->
+  ffmpeg with the original audio, progress, preview and scene-cut resets.
+- Recommend /usr/bin/ffmpeg (the AppImage bundles a static FFmpeg 8.1).
+
 * Wed Oct 14 2026 MiguelCarino <miguel.carino1994@outlook.com> - 0.0.3-1
 - Experimental "Still image" view: run the DLSS 5 NR model on a picture
   through a headless Wine helper (still/), with a before/after comparison.
