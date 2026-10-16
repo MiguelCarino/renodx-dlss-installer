@@ -686,7 +686,29 @@ STILL_MAX_SIDE = 3840
 STILL_MAX_BODY = STILL_MAX_SIDE * 2160 * 4 + (1 << 20)
 # One GPU run at a time: the prefix, input file and output folder are shared.
 STILL_LOCK = threading.Lock()
+# Style 0 is the model's plain look, 2 its "cinematic" one; 1 ("natural") is mostly a global
+# darkening, i.e. a colour grade.
 STILL_STYLES = (0, 1, 2)
+
+
+def still_effect(query):
+    """The model and post-processing settings shared by pictures and video, as nrstill args.
+
+    The DLL holds one network; its strength comes from Structure and Tone (Intensity only blends
+    back toward the input). Above about 4 / 3 the network breaks down (grey-green skin, noise).
+    Grade is how much of the model's global colour shift to keep: most of its change on ordinary
+    footage is one colour map for the whole frame, which reads as a colour grade, so the default
+    keeps only the spatially varying part (relighting, local contrast, detail). Detail scales that
+    part."""
+    style = int(still_number(query, "style", 0, 0, 2))
+    if style not in STILL_STYLES:
+        raise BadRequest("unknown style")
+    return ["--intensity", "%g" % still_number(query, "intensity", 1, 0, 1),
+            "--local-structure", "%g" % still_number(query, "structure", 2, 0, 4),
+            "--local-tone", "%g" % still_number(query, "tone", 2, 0, 3),
+            "--style", str(style),
+            "--grade", "%g" % still_number(query, "grade", 0, 0, 1),
+            "--detail", "%g" % still_number(query, "detail", 1, 0, 2)]
 
 
 def still_status():
@@ -725,6 +747,12 @@ def still_number(query, key, default, lo, hi):
     return value
 
 
+def _own_log(log):
+    """nrstill's part of a run log: nr-runtime.sh appends the NR DLL's own log after a
+    "--- nvngx_dlssnr" marker, and its harmless lines must not read as the failure."""
+    return log.split("\n--- nvngx_dlssnr", 1)[0]
+
+
 def still_run(query, rgba):
     """Run the model on one RGBA8 frame; returns (output bytes, info) or raises."""
     width = int(still_number(query, "w", 0, 2, STILL_MAX_SIDE))
@@ -732,13 +760,8 @@ def still_run(query, rgba):
     if len(rgba) != width * height * 4:
         raise BadRequest("expected %d bytes for %dx%d, got %d"
                          % (width * height * 4, width, height, len(rgba)))
-    intensity = still_number(query, "intensity", 1, 0, 1)
-    structure = still_number(query, "structure", 1, 0, 1)
-    tone = still_number(query, "tone", 1, 0, 1)
-    style = int(still_number(query, "style", 0, 0, 2))
+    effect = still_effect(query)
     passes = int(still_number(query, "passes", 8, 1, 32))
-    if style not in STILL_STYLES:
-        raise BadRequest("unknown style")
 
     if not STILL_LOCK.acquire(blocking=False):
         raise Busy("The GPU is busy with another picture or video.")
@@ -753,14 +776,12 @@ def still_run(query, rgba):
             old.unlink()
         argv = [str(STILL_RUNTIME), "run", str(STILL_LOG),
                 "--color", r"C:\nr\in\gui.rgba", "--size", str(width), str(height),
-                "--frames", str(passes), "--dump", str(passes), "--out", r"C:\nr\out\gui",
-                "--intensity", "%g" % intensity, "--local-structure", "%g" % structure,
-                "--local-tone", "%g" % tone, "--style", str(style)]
+                "--frames", str(passes), "--dump", str(passes), "--out", r"C:\nr\out\gui"] + effect
         subprocess.run(argv, capture_output=True, timeout=300)
         result = out_dir / ("frame_%03d.rgba" % passes)
         log = STILL_LOG.read_text(errors="replace") if STILL_LOG.is_file() else ""
         if not result.is_file() or result.stat().st_size != len(rgba):
-            keep = [ln for ln in log.splitlines()
+            keep = [ln for ln in _own_log(log).splitlines()
                     if any(k in ln for k in ("FAILED", "->", "failed", "exit code", "removed", "no NVIDIA"))]
             raise BadRequest("DLSS 5 did not produce an image.\n" + "\n".join(keep[-6:]))
         ms = re.findall(r"gpu\+wait ([0-9.]+) ms", log)
@@ -797,9 +818,9 @@ STILL_VIDEO_LOG = STILL_DATA / "last-video.log"
 VIDEO_MAX_UPLOAD = 64 << 30
 VIDEOS = {}
 VIDEOS_LOCK = threading.Lock()
-# Mean |difference| (0-255) between sparse samples of two frames that counts as
-# a scene cut. A false positive only resets the history for one frame.
-VIDEO_CUT = 45.0
+# Mean |difference| (0-255) of the colour channels at sparse pixels of two frames
+# that counts as a scene cut. A false positive only resets the history for one frame.
+VIDEO_CUT = 60.0
 VIDEO_SIZES = (0, 720, 1080, 1440, 2160)
 
 
@@ -821,7 +842,8 @@ def video_probe(path):
         raise BadRequest("Video needs ffmpeg and ffprobe (dnf install ffmpeg-free).")
     run = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries",
-         "stream=codec_type,width,height,avg_frame_rate,r_frame_rate,color_space:format=duration",
+         "stream=codec_type,width,height,avg_frame_rate,r_frame_rate,color_space,color_transfer,"
+         "color_primaries,color_range:format=duration",
          "-of", "json", str(path)], capture_output=True, text=True, timeout=60)
     try:
         data = json.loads(run.stdout or "{}")
@@ -840,7 +862,41 @@ def video_probe(path):
             "rate": rate, "duration": round(duration, 2),
             "frames": int(duration * fps) if duration else 0,
             "audio": any(st.get("codec_type") == "audio" for st in streams),
-            "matrix": video.get("color_space") or ""}
+            "matrix": video.get("color_space") or "", "transfer": video.get("color_transfer") or "",
+            "primaries": video.get("color_primaries") or "", "range": video.get("color_range") or ""}
+
+
+HDR_TRANSFERS = ("smpte2084", "arib-std-b67")
+
+
+def video_decode_filter(info, w, h):
+    """The -vf that turns a frame into display-referred BT.709 sRGB-ish RGBA8 at w x h.
+
+    The model was trained on SDR game frames. HDR (PQ/HLG) is tone-mapped to SDR and wide-gamut
+    BT.2020 converted to BT.709 primaries with zscale; anything else is plain SDR and only needs
+    the right YUV matrix."""
+    hdr = info.get("transfer") in HDR_TRANSFERS
+    if hdr or info.get("primaries") == "bt2020":
+        filters = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True,
+                                 text=True, timeout=30).stdout
+        if not (re.search(r"\szscale\s", filters) and re.search(r"\stonemap\s", filters)):
+            raise BadRequest("This is %s video; converting it to SDR needs an ffmpeg with zscale "
+                             "(libzimg)." % ("HDR" if hdr else "wide-gamut BT.2020"))
+        tin = info.get("transfer") or "bt709"
+        tin = tin if tin in HDR_TRANSFERS + ("bt709", "bt2020-10", "bt2020-12", "smpte170m") else "bt709"
+        src = "tin=%s:min=%s:pin=bt2020:rin=%s" % (
+            tin, info["matrix"] if info.get("matrix") in ("bt2020nc", "bt2020c", "bt709") else "bt2020nc",
+            "full" if info.get("range") == "pc" else "limited")
+        chain = ["zscale=w=%d:h=%d:filter=lanczos:%s:t=linear:npl=100" % (w, h, src),
+                 "format=gbrpf32le", "zscale=p=bt709"]
+        if hdr:
+            chain.append("tonemap=tonemap=mobius")  # keeps the SDR range, rolls off highlights
+        return ",".join(chain + ["zscale=t=bt709", "format=rgba"])
+    # Untagged HD video is BT.709 in every player, so decode it that way too.
+    matrix = info["matrix"] if info["matrix"] in ("bt709", "bt470bg", "smpte170m", "bt2020nc") else (
+        "bt709" if info["height"] >= 720 else "smpte170m")
+    matrix = {"bt470bg": "bt601", "smpte170m": "bt601", "bt2020nc": "bt2020"}.get(matrix, matrix)
+    return "scale=%d:%d:flags=lanczos:in_color_matrix=%s,format=rgba" % (w, h, matrix)
 
 
 def video_size(info, short_side):
@@ -855,10 +911,12 @@ def video_encoder():
     listing = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True,
                              text=True, timeout=30).stdout
     for name, args, ext, audio in (
-            ("libx264", ["-c:v", "libx264", "-preset", "medium", "-crf", "17"], "mp4", "aac"),
-            ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "19"], "mp4", "aac"),
+            # Near-transparent quality: at crf 17 the codec's own noise was as large as the
+            # fine detail the model adds.
+            ("libx264", ["-c:v", "libx264", "-preset", "medium", "-crf", "14"], "mp4", "aac"),
+            ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "16"], "mp4", "aac"),
             ("libopenh264", ["-c:v", "libopenh264", "-b:v", "20M"], "mp4", "aac"),
-            ("libvpx-vp9", ["-c:v", "libvpx-vp9", "-crf", "24", "-b:v", "0", "-row-mt", "1"], "webm", "libopus")):
+            ("libvpx-vp9", ["-c:v", "libvpx-vp9", "-crf", "20", "-b:v", "0", "-row-mt", "1"], "webm", "libopus")):
         if re.search(r"^\s*V\S*\s+%s\s" % re.escape(name), listing, re.M):
             return name, args, ext, audio
     raise BadRequest("ffmpeg has no usable encoder (libx264, h264_nvenc, libopenh264 or libvpx-vp9).")
@@ -930,10 +988,7 @@ def video_start(body):
         raise Busy("This video is already being processed.")
     q = {k: [str(v)] for k, v in body.items() if isinstance(v, (int, float, str))}
     opts = {
-        "intensity": still_number(q, "intensity", 1, 0, 1),
-        "structure": still_number(q, "structure", 1, 0, 1),
-        "tone": still_number(q, "tone", 1, 0, 1),
-        "style": int(still_number(q, "style", 0, 0, 2)),
+        "effect": still_effect(q),
         "seconds": still_number(q, "seconds", 0, 0, 86400),
         "short": int(still_number(q, "size", 0, 0, 2160)),
         "history": bool(body.get("history", True)),
@@ -944,10 +999,11 @@ def video_start(body):
     if not status["ready"]:
         raise BadRequest("Images & video is not set up: %s" % status["message"])
     encoder = video_encoder()
-    if not STILL_LOCK.acquire(blocking=False):
-        raise Busy("The GPU is busy with another picture or video.")
     info = state["info"]
     w, h = video_size(info, opts["short"])
+    opts["vf"] = video_decode_filter(info, w, h)
+    if not STILL_LOCK.acquire(blocking=False):
+        raise Busy("The GPU is busy with another picture or video.")
     length = min(info["duration"], opts["seconds"]) if opts["seconds"] and info["duration"] else (
         opts["seconds"] or info["duration"])
     out_dir = videos_dir()
@@ -957,7 +1013,7 @@ def video_start(body):
     while target.exists():
         target = out_dir / ("%s-dlss5-%d.%s" % (state["name"], n, encoder[2]))
         n += 1
-    state.update(status="running", done=0, total=int(length * info["fps"]) if length else 0,
+    state.update(status="running", done=0, total=int(round(length * info["fps"])) if length else 0,
                  error="", output=str(target), cuts=0, cancel=False, preview=None,
                  width=w, height=h, started=time.time(), finished=None, encoder=encoder[0])
     threading.Thread(target=video_worker, args=(state, opts, encoder, w, h, target),
@@ -977,8 +1033,14 @@ def _read_exact(stream, n):
 
 
 def _sample_diff(a, b):
-    sa, sb = a[::1999], b[::1999]
-    return sum(abs(x - y) for x, y in zip(sa, sb)) / max(1, len(sa))
+    """Mean |difference| of R, G and B at every 997th pixel (alpha is always 255)."""
+    step = 997 * 4
+    total = count = 0
+    for ch in range(3):
+        sa, sb = a[ch::step], b[ch::step]
+        total += sum(abs(x - y) for x, y in zip(sa, sb))
+        count += len(sa)
+    return total / max(1, count)
 
 
 def video_worker(state, opts, encoder, w, h, target):
@@ -989,21 +1051,18 @@ def video_worker(state, opts, encoder, w, h, target):
     procs = []
     try:
         limit = ["-t", "%g" % opts["seconds"]] if opts["seconds"] else []
-        # Untagged HD video is BT.709 in every player, so decode it that way too.
-        matrix = info["matrix"] if info["matrix"] in ("bt709", "bt470bg", "smpte170m", "bt2020nc") else (
-            "bt709" if info["height"] >= 720 else "smpte170m")
-        matrix = {"bt470bg": "bt601", "smpte170m": "bt601", "bt2020nc": "bt2020"}.get(matrix, matrix)
+        # Constant frame rate: the raw pipe carries no timestamps, and this keeps the sound in step.
         dec = subprocess.Popen(
             ["ffmpeg", "-v", "error", "-nostdin"] + limit + ["-i", src, "-map", "0:v:0",
-             "-vf", "scale=%d:%d:flags=lanczos:in_color_matrix=%s,format=rgba" % (w, h, matrix),
+             "-vf", opts["vf"],
              "-fps_mode", "cfr", "-r", info["rate"], "-f", "rawvideo", "-pix_fmt", "rgba", "-"],
             stdout=subprocess.PIPE, stderr=open(logs / "decode.log", "wb"))
         procs.append(dec)
+        # With history the model reprojects its previous output: give it motion vectors
+        # estimated from the frames (nrstill's block matcher). Without, every frame stands alone.
         nr = subprocess.Popen(
-            [str(STILL_RUNTIME), "stream", str(STILL_VIDEO_LOG), "--size", str(w), str(h),
-             "--intensity", "%g" % opts["intensity"], "--local-structure", "%g" % opts["structure"],
-             "--local-tone", "%g" % opts["tone"], "--style", str(opts["style"])]
-            + ([] if opts["history"] else ["--reset-every"]),
+            [str(STILL_RUNTIME), "stream", str(STILL_VIDEO_LOG), "--size", str(w), str(h)]
+            + opts["effect"] + (["--mv", "flow"] if opts["history"] else ["--reset-every"]),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         procs.append(nr)
         _, vargs, ext, acodec = encoder
@@ -1018,7 +1077,8 @@ def video_worker(state, opts, encoder, w, h, target):
         enc_cmd += ["-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,"
                            "setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
                     "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"] + vargs
-        enc_cmd += (["-c:a", acodec, "-b:a", "192k"] if audio else [])
+        # apad: -shortest then ends on the last video frame, not on audio that stops a few ms early.
+        enc_cmd += (["-af", "apad", "-c:a", acodec, "-b:a", "192k"] if audio else [])
         enc_cmd += (["-movflags", "+faststart"] if ext == "mp4" else []) + ["-shortest", str(part)]
         enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, stderr=open(logs / "encode.log", "wb"))
         procs.append(enc)
@@ -1086,7 +1146,7 @@ def video_worker(state, opts, encoder, w, h, target):
         state["status"] = "cancelled"
     except Exception as exc:                          # noqa: BLE001 - reported to the page
         log = STILL_VIDEO_LOG.read_text(errors="replace") if STILL_VIDEO_LOG.is_file() else ""
-        keep = [ln for ln in log.splitlines()
+        keep = [ln for ln in _own_log(log).splitlines()
                 if any(k in ln for k in ("FAILED", "failed", "stream:", "removed", "no NVIDIA"))]
         state["error"] = "%s\n%s" % (exc, "\n".join(keep[-5:]))
         state["status"] = "failed"
@@ -2501,7 +2561,9 @@ PAGE = r"""<!doctype html>
   <aside class="stside">
     <h2>Images &amp; video</h2>
     <div class="note" style="margin-top:4px">Feeds a picture or video to the neural rendering model as if
-      it were a game (flat depth, no motion). Experimental; needs an RTX 40 GPU and GE-Proton.</div>
+      it were a game (no depth; for video, motion estimated from the frames). It relights and redraws
+      people and materials, so photos, live action and game captures change most; flat 2D cartoons and
+      anime only get a subtle change. Experimental; needs an RTX 40 GPU and GE-Proton.</div>
 
     <div id="stSetup" class="grp" hidden>
       <div id="stSetupMsg"></div>
@@ -2533,15 +2595,19 @@ PAGE = r"""<!doctype html>
     </div>
 
     <div class="grp">
-      <label class="f">Intensity <span class="v" id="stIntensityV"></span>
+      <label class="f">Structure &ndash; how much faces and materials are redrawn <span class="v" id="stStructureV"></span>
+        <input id="stStructure" type="range" min="0" max="4" step="0.1" value="2"></label>
+      <label class="f">Tone &ndash; how much the lighting changes <span class="v" id="stToneV"></span>
+        <input id="stTone" type="range" min="0" max="3" step="0.1" value="2"></label>
+      <label class="f">Detail &ndash; scales the model's local changes <span class="v" id="stDetailV"></span>
+        <input id="stDetail" type="range" min="0" max="2" step="0.05" value="1"></label>
+      <label class="f">Colour grade &ndash; keep the model's overall colour shift <span class="v" id="stGradeV"></span>
+        <input id="stGrade" type="range" min="0" max="1" step="0.05" value="0"></label>
+      <label class="f">Intensity &ndash; 0 is the original, 1 the model <span class="v" id="stIntensityV"></span>
         <input id="stIntensity" type="range" min="0" max="1" step="0.05" value="1"></label>
-      <label class="f">Structure (lower keeps more detail) <span class="v" id="stStructureV"></span>
-        <input id="stStructure" type="range" min="0" max="1" step="0.05" value="1"></label>
-      <label class="f">Tone (lighting and colour) <span class="v" id="stToneV"></span>
-        <input id="stTone" type="range" min="0" max="1" step="0.05" value="1"></label>
       <label class="f">Style
-        <select id="stStyle"><option value="0">Default</option><option value="1">Matte (style 1)</option>
-          <option value="2">Style 2</option></select></label>
+        <select id="stStyle"><option value="0">Default</option><option value="2">Cinematic</option>
+          <option value="1">Natural (a darker grade)</option></select></label>
       <label class="f pic">Passes &ndash; the same image fed this many times; the last is shown
         <input id="stPasses" type="number" min="1" max="32" value="8"></label>
       <label class="f vid" hidden>Size
@@ -2550,7 +2616,7 @@ PAGE = r"""<!doctype html>
       <label class="f vid" hidden>Length in seconds (0 = the whole video)
         <input id="stSeconds" type="number" min="0" step="1" value="0"></label>
       <label class="vid chk" hidden><input id="stHistory" type="checkbox" checked>
-        History between frames: steadier, but fast motion can smear. Resets at scene cuts.</label>
+        History between frames, steered by motion estimated from the picture. Resets at scene cuts.</label>
     </div>
 
     <div class="grp">
@@ -3609,13 +3675,13 @@ function stillParams() {
   return new URLSearchParams({
     w: ST.w, h: ST.h,
     intensity: $("stIntensity").value, structure: $("stStructure").value, tone: $("stTone").value,
-    style: $("stStyle").value,
+    detail: $("stDetail").value, grade: $("stGrade").value, style: $("stStyle").value,
     passes: Math.max(1, Math.min(32, parseInt($("stPasses").value, 10) || 8)),
   }).toString();
 }
 
 function stillPaint() {
-  for (const k of ["Intensity", "Structure", "Tone"])
+  for (const k of ["Intensity", "Structure", "Tone", "Detail", "Grade"])
     $("st" + k + "V").textContent = Number($("st" + k).value).toFixed(2);
   const ready = ST.status?.ready;
   const vrunning = ST.vrun?.status === "running";
@@ -3823,6 +3889,7 @@ async function videoStart() {
     id: ST.vid,
     intensity: Number($("stIntensity").value), structure: Number($("stStructure").value),
     tone: Number($("stTone").value), style: Number($("stStyle").value),
+    detail: Number($("stDetail").value), grade: Number($("stGrade").value),
     size: Number($("stSize").value), seconds: Math.max(0, Number($("stSeconds").value) || 0),
     history: $("stHistory").checked,
   };
@@ -3894,7 +3961,7 @@ function stillInit() {
   $("stReveal").onclick = () => api("/api/still/reveal", {});
   $("stRevealVid").onclick = () => api("/api/still/reveal", { kind: "video" });
   $("stSetupBtn").onclick = stillSetup;
-  for (const id of ["stIntensity", "stStructure", "stTone", "stStyle", "stPasses"])
+  for (const id of ["stIntensity", "stStructure", "stTone", "stDetail", "stGrade", "stStyle", "stPasses"])
     $(id).oninput = () => {
       stillPaint();
       if (ST.mode === "pic" && ST.outData && stillParams() !== ST.params)

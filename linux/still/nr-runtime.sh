@@ -8,6 +8,10 @@
 #   nr-runtime.sh stream LOG ARGS... nrstill.exe --stream: RGBA8 frames on stdin -> stdout
 #   nr-runtime.sh stop              ends every Wine process in the prefix
 #
+# run/stream append the NR DLL's own log (C:\nr\logs\nvngx_dlssnr_*.log: network config, the
+# resolution it runs at, warnings) to LOG. DLSS5_NGX_LOG_LEVEL sets its detail: 0 off, 1 (default)
+# create-time lines, 2 two more lines per frame.
+#
 # Nothing here opens a window: every Wine process runs with DISPLAY/WAYLAND_DISPLAY unset.
 # The prefix lives in $DLSS5_STILL_DATA (default ~/.local/share/dlss5-linux/still).
 set -uo pipefail
@@ -115,10 +119,12 @@ run() {
     cmp -s "$HERE/bin/nrstill.exe" "$RUN/nrstill.exe" || install -m755 "$HERE/bin/nrstill.exe" "$RUN/"
     cmp -s "$HERE/bin/nvngx.dll_nrshim.dll" "$RUN/nvngx.dll_nrshim.dll" || install -m755 "$HERE/bin/nvngx.dll_nrshim.dll" "$RUN/"
     cd "$RUN" || return 1
+    mkdir -p "$RUN/logs" && rm -f "$RUN"/logs/nvngx_dlssnr_*.log
     env -u DISPLAY -u WAYLAND_DISPLAY -u VK_INSTANCE_LAYERS -u DLSSNR_LAYER_OBJECT \
         WINEPREFIX="$PFX" WINEDEBUG=-all \
         WINEDLLOVERRIDES='mscoree,mshtml,winemenubuilder.exe=;d3d12,d3d12core,dxgi,d3d11,nvapi64,nvofapi64=n' \
         DXVK_ENABLE_NVAPI=1 NVIDIA_WINE_DLL_DIR="$nv" DLSSNR_DISABLE=1 \
+        __NGX_LOG_LEVEL="${DLSS5_NGX_LOG_LEVEL:-1}" __NGX_ENABLE_OVERRIDE_LOG_PATH=1 __NGX_LOG_PATH_OVERRIDE='C:\nr\logs' \
         WINE="$ge/files/bin/wine" LIMIT="$limit" MODE="$mode" LOG="$log" \
         bash -c 'if [[ $MODE == stream ]]; then
                      exec timeout "$LIMIT" "$WINE" "C:\\nr\\nrstill.exe" --stream "$@" 2>"$LOG"
@@ -127,7 +133,13 @@ run() {
                  fi' nrstill "$@"
     rc=$?
     WINEPREFIX="$PFX" "$ge/files/bin/wineserver" -k 2>/dev/null
+    # Exit code first: the GUI reads nrstill's part of the log, everything before the DLL log.
     echo "exit code: $rc" >>"$log"
+    local snip
+    for snip in "$RUN"/logs/nvngx_dlssnr_*.log; do
+        [[ -f $snip ]] || continue
+        { echo "--- $(basename "$snip") (last 300 lines)"; tail -n 300 "$snip" | tr -d '\r'; } >>"$log"
+    done
     return $rc
 }
 

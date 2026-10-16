@@ -69,6 +69,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.0.5" date="2026-10-15">
+      <description>
+        <p>Pictures and video now show the model's real neural rendering instead of what looked like a colour grade: its whole-frame colour shift is removed by default, structure and tone default to 2, video gets estimated motion vectors, and HDR sources are tone-mapped to BT.709 before processing.</p>
+      </description>
+    </release>
     <release version="0.0.4" date="2026-10-14">
       <description>
         <p>Video in the renamed "Images &amp; video" view: a video is processed frame by frame through the neural rendering model and saved with its sound, with progress, a live before/after preview and scene-cut detection. The AppImage bundles a static FFmpeg 8.1.</p>

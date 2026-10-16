@@ -122,6 +122,12 @@ python3 -c 'import sys; [compile(open(f).read(), f, "exec") for f in sys.argv[1:
 %{_metainfodir}/%{app_id}.metainfo.xml
 
 %changelog
+* Thu Oct 15 2026 MiguelCarino <miguel.carino1994@outlook.com> - 0.0.5-1
+- Images & video: remove the model's whole-frame colour grade by default
+  (nrstill --grade/--detail), structure/tone default 2, estimated motion
+  vectors for video (--mv flow), HDR sources tone-mapped to BT.709, the NR
+  DLL's own log in last-run.log / last-video.log.
+
 * Wed Oct 14 2026 MiguelCarino <miguel.carino1994@outlook.com> - 0.0.4-1
 - Video in the "Images & video" view: ffmpeg -> nrstill.exe --stream ->
   ffmpeg with the original audio, progress, preview and scene-cut resets.

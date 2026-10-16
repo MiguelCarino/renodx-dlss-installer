@@ -12,6 +12,11 @@
 // Inputs are raw files written by the caller (dlss5-gui.py): RGBA8 colour (sRGB-encoded, display-referred) and
 // optionally float32 device depth (reverse-Z). Outputs: raw RGBA8 frames + a log line per frame.
 //
+// What the DLL (v310.8.0) reads, measured: one network config whatever the preset; Intensity is a 0..1 blend
+// back toward the input; the effect's strength is LocalStructureStrength / LocalToneStrength (and Style).
+// Feature_Flags, SDR/HDR hints, PreExposure, Sharpness, the AppID and a flat depth's value change nothing.
+// --grade/--detail post-process the output (see Post); --mv flow estimates motion vectors (see Flow).
+//
 // NVSDK_NGX_Parameter is an MSVC object; its overloads sit in reverse declaration order in the
 // vtable (checked by a start-up self-test): Set void*=0 D3D12=1 D3D11=2 int=3 uint=4 double=5 float=6 ull=7,
 // Gets = +8, Reset = 16.
@@ -29,6 +34,7 @@
 #include <vector>
 #include <string>
 #include <initializer_list>
+#include <algorithm>
 
 typedef int NGXResult;
 static const NGXResult NGX_OK = 1;
@@ -107,12 +113,14 @@ static const char* ngxName(unsigned r) {
 
 struct Args {
   std::string color, depthFile, outDir = "out", mode = "flat";  // depth mode: flat|file|none
-  std::string mv = "zero";                                       // zero|none
+  std::string mv = "zero";                                       // zero|none|flow (flow: --stream only)
   unsigned w = 0, h = 0, frames = 32;
   std::vector<unsigned> dump = {1, 2, 4, 8, 16, 32};
-  int preset = 0, style = 0, autoMask = 1, uiCorr = 1, depthInverted = 1;
+  // preset: the DLL holds one network config and maps every preset to it; kept for experiments.
+  int preset = 1, style = 0, autoMask = 1, uiCorr = 0, depthInverted = 1;
   float mvx = 0, mvy = 0;
   float intensity = 1.0f, lstruct = 1.0f, ltone = 1.0f, skin = -1.0f, flatDepth = 0.01f;
+  float grade = 1.0f, detail = 1.0f;  // post split of the model's change, see Post; 1,1 = model output as is
   bool resetEvery = false, verbose = false, noTunables = false, queryRatio = true, stream = false;
   std::string fmt = "rgba8";  // rgba8 | rgba16f (colour + output format)
 };
@@ -133,7 +141,7 @@ static bool readFile(const std::string& path, std::vector<uint8_t>& out, size_t 
   return true;
 }
 
-static uint16_t f2h(float f) {  // float -> half (no denormal/NaN care needed for [0,1])
+static uint16_t f2h(float f) {  // float -> half (tiny values flush to 0; no NaN care needed)
   uint32_t x; memcpy(&x, &f, 4);
   uint32_t sign = (x >> 16) & 0x8000;
   int e = (int)((x >> 23) & 0xff) - 127 + 15;
@@ -245,6 +253,10 @@ static bool readExact(HANDLE h, uint8_t* p, size_t n, bool* eofAtStart) {
   if (eofAtStart) *eofAtStart = got == 0;
   return got == n;
 }
+static double nowMs() {
+  LARGE_INTEGER t, f; QueryPerformanceCounter(&t); QueryPerformanceFrequency(&f);
+  return t.QuadPart * 1000.0 / f.QuadPart;
+}
 static bool writeExact(HANDLE h, const uint8_t* p, size_t n) {
   while (n) {
     DWORD chunk = (DWORD)(n > (1u << 24) ? (1u << 24) : n), wr = 0;
@@ -253,6 +265,353 @@ static bool writeExact(HANDLE h, const uint8_t* p, size_t n) {
   }
   return true;
 }
+
+// Runs fn(y0, y1) over row bands on a small pool of persistent threads (creating threads per call
+// costs milliseconds under Wine, and this runs several times per video frame).
+struct RowPool {
+  static const unsigned N = 8;
+  HANDLE start[N] = {}, done[N] = {};
+  void (*call)(void* ctx, unsigned y0, unsigned y1) = nullptr;
+  void* ctx = nullptr;
+  unsigned rows = 0;
+  bool ready = false, failed = false;
+  struct Arg { RowPool* pool; unsigned i; } args[N];
+  static DWORD WINAPI worker(void* p) {
+    Arg* a = (Arg*)p; RowPool* pool = a->pool;
+    for (;;) {
+      WaitForSingleObject(pool->start[a->i], INFINITE);
+      pool->call(pool->ctx, pool->rows * a->i / N, pool->rows * (a->i + 1) / N);
+      SetEvent(pool->done[a->i]);
+    }
+  }
+  bool init() {
+    if (ready || failed) return ready;
+    for (unsigned i = 0; i < N; ++i) {
+      start[i] = CreateEventW(nullptr, FALSE, FALSE, nullptr); done[i] = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      args[i] = {this, i};
+      HANDLE t = CreateThread(nullptr, 0, worker, &args[i], 0, nullptr);
+      if (!t) { failed = true; return false; }  // threads already started just wait forever
+      CloseHandle(t);
+    }
+    return ready = true;
+  }
+};
+static RowPool g_pool, g_writerPool;  // one per calling thread: a pool runs one job at a time
+template <typename F> static void parallelRows(RowPool& pool, unsigned H, F fn) {
+  if (!pool.init()) { fn(0, H); return; }
+  pool.call = [](void* c, unsigned y0, unsigned y1) { if (y1 > y0) (*(F*)c)(y0, y1); };
+  pool.ctx = &fn; pool.rows = H;
+  for (unsigned i = 0; i < RowPool::N; ++i) SetEvent(pool.start[i]);
+  WaitForMultipleObjects(RowPool::N, pool.done, TRUE, INFINITE);
+}
+
+// ---- Post: split the model's change into a global colour map and the rest ----
+// Most of what the model changes on ordinary footage is one colour map for the whole frame (darker
+// midtones, less saturation, a hue shift), which reads as a colour grade. A least-squares cubic
+// polynomial in (r,g,b) fitted from input to output captures that map; whatever it cannot explain
+// is the spatially varying part: relit faces and materials, local contrast, detail.
+//   final = in + grade * map(in) + detail * (out - in - map(in))      (map = fitted change)
+// grade 1, detail 1 is the model's output unchanged. In a stream the fit is averaged over recent
+// frames (reset with the history) so the removed grade cannot flicker.
+struct Post {
+  static const int K = 20;
+  double A[K][K] = {}, B[K][3] = {}, c[K][3] = {};
+  bool have = false;
+  std::vector<float> lut;
+  RowPool* pool = &g_pool;
+  static void monos(float r, float g, float b, float* m) {
+    m[0] = 1; m[1] = r; m[2] = g; m[3] = b;
+    m[4] = r * r; m[5] = r * g; m[6] = r * b; m[7] = g * g; m[8] = g * b; m[9] = b * b;
+    m[10] = r * r * r; m[11] = r * r * g; m[12] = r * r * b; m[13] = r * g * g; m[14] = r * g * b;
+    m[15] = r * b * b; m[16] = g * g * g; m[17] = g * g * b; m[18] = g * b * b; m[19] = b * b * b;
+  }
+  // in/out: RGBA8 W*H. Rewrites out in place.
+  void apply(const uint8_t* in, uint8_t* out, unsigned W, unsigned H, float grade, float detail, bool reset) {
+    // Normal equations from every 6th pixel of every 6th row, one partial sum per thread band.
+    struct Part { double a[K][K], b[K][3]; size_t n; };
+    std::vector<Part> parts(RowPool::N);
+    const unsigned rows = (H + 3) / 6;
+    for (auto& pt : parts) memset(&pt, 0, sizeof pt);
+    parallelRows(*pool, rows, [&](unsigned r0, unsigned r1) {
+      unsigned band = 0;
+      while (band < RowPool::N - 1 && rows * (band + 1) / RowPool::N <= r0) ++band;  // the band parallelRows gave us
+      Part& pt = parts[band];
+      float m[K];
+      for (unsigned y = 3 + r0 * 6; y < H && y < 3 + r1 * 6; y += 6)
+        for (unsigned x = 3; x < W; x += 6) {
+          const uint8_t* pi = in + ((size_t)y * W + x) * 4; const uint8_t* po = out + ((size_t)y * W + x) * 4;
+          monos(pi[0] / 255.0f, pi[1] / 255.0f, pi[2] / 255.0f, m);
+          float d[3] = {(po[0] - pi[0]) / 255.0f, (po[1] - pi[1]) / 255.0f, (po[2] - pi[2]) / 255.0f};
+          for (int i = 0; i < K; ++i) {
+            for (int j = i; j < K; ++j) pt.a[i][j] += (double)m[i] * m[j];
+            for (int ch = 0; ch < 3; ++ch) pt.b[i][ch] += (double)m[i] * d[ch];
+          }
+          ++pt.n;
+        }
+    });
+    double a[K][K] = {}, b[K][3] = {}; size_t n = 0;
+    for (auto& pt : parts) {
+      n += pt.n;
+      for (int i = 0; i < K; ++i) {
+        for (int j = i; j < K; ++j) a[i][j] += pt.a[i][j];
+        for (int ch = 0; ch < 3; ++ch) b[i][ch] += pt.b[i][ch];
+      }
+    }
+    if (!n) return;
+    const double keep = (have && !reset) ? 0.5 : 0.0;
+    for (int i = 0; i < K; ++i) {
+      for (int j = i; j < K; ++j) A[i][j] = A[j][i] = keep * A[i][j] + (1 - keep) * a[i][j] / n;
+      for (int ch = 0; ch < 3; ++ch) B[i][ch] = keep * B[i][ch] + (1 - keep) * b[i][ch] / n;
+    }
+    have = true;
+    // Solve (A + ridge) c = B by Gaussian elimination; the ridge keeps rare colours from swinging.
+    double M[K][K + 3];
+    for (int i = 0; i < K; ++i) {
+      for (int j = 0; j < K; ++j) M[i][j] = A[i][j] + (i == j ? 1e-3 : 0);
+      for (int ch = 0; ch < 3; ++ch) M[i][K + ch] = B[i][ch];
+    }
+    for (int col = 0; col < K; ++col) {
+      int piv = col;
+      for (int r = col + 1; r < K; ++r) if (fabs(M[r][col]) > fabs(M[piv][col])) piv = r;
+      if (piv != col) for (int j = 0; j < K + 3; ++j) { double t = M[col][j]; M[col][j] = M[piv][j]; M[piv][j] = t; }
+      if (fabs(M[col][col]) < 1e-12) continue;
+      for (int r = 0; r < K; ++r) {
+        if (r == col) continue;
+        double f = M[r][col] / M[col][col];
+        if (f != 0) for (int j = col; j < K + 3; ++j) M[r][j] -= f * M[col][j];
+      }
+    }
+    for (int i = 0; i < K; ++i)
+      for (int ch = 0; ch < 3; ++ch) c[i][ch] = fabs(M[i][i]) < 1e-12 ? 0 : M[i][K + ch] / M[i][i];
+    // The map sampled on a 33^3 grid (in 0..255 units, pre-scaled by grade - detail), then
+    // trilinear per pixel: a fraction of the cost of the polynomial, and the map is smooth.
+    const int G = 33;
+    const float gd = (grade - detail) * 255.0f;
+    lut.resize((size_t)G * G * G * 3);
+    for (int ri = 0; ri < G; ++ri)
+      for (int gi = 0; gi < G; ++gi)
+        for (int bi = 0; bi < G; ++bi) {
+          float mm[K]; monos(ri / (G - 1.0f), gi / (G - 1.0f), bi / (G - 1.0f), mm);
+          float* L = &lut[(((size_t)ri * G + gi) * G + bi) * 3];
+          for (int ch = 0; ch < 3; ++ch) {
+            double v = 0;
+            for (int i = 0; i < K; ++i) v += mm[i] * c[i][ch];
+            L[ch] = (float)v * gd;
+          }
+        }
+    const float* lt = lut.data();
+    parallelRows(*pool, H, [&](unsigned y0, unsigned y1) {
+      for (size_t p = (size_t)y0 * W; p < (size_t)y1 * W; ++p) {
+        const uint8_t* pi = in + p * 4; uint8_t* po = out + p * 4;
+        float fr = pi[0] * ((G - 1) / 255.0f), fg = pi[1] * ((G - 1) / 255.0f), fb = pi[2] * ((G - 1) / 255.0f);
+        int r0 = (int)fr, g0 = (int)fg, b0 = (int)fb;
+        r0 -= r0 == G - 1; g0 -= g0 == G - 1; b0 -= b0 == G - 1;
+        float tr = fr - r0, tg = fg - g0, tb = fb - b0;
+        const float* c000 = lt + (((size_t)r0 * G + g0) * G + b0) * 3;
+        const size_t sR = (size_t)G * G * 3, sG = (size_t)G * 3, sB = 3;
+        for (int ch = 0; ch < 3; ++ch) {
+          const float* q = c000 + ch;
+          float x00 = q[0] + (q[sB] - q[0]) * tb, x01 = q[sG] + (q[sG + sB] - q[sG]) * tb;
+          float x10 = q[sR] + (q[sR + sB] - q[sR]) * tb, x11 = q[sR + sG] + (q[sR + sG + sB] - q[sR + sG]) * tb;
+          float y0v = x00 + (x01 - x00) * tg, y1v = x10 + (x11 - x10) * tg;
+          float v = pi[ch] + detail * (float)(po[ch] - pi[ch]) + y0v + (y1v - y0v) * tr;
+          v = v < 0 ? 0 : v > 255 ? 255 : v;
+          po[ch] = (uint8_t)(v + 0.5f);
+        }
+      }
+    });
+  }
+};
+
+// ---- Flow: motion vectors estimated from the frames (--stream --mv flow) ----
+// Hierarchical block matching on half-resolution luma (levels 1/2, 1/4, 1/8, 1/16 of the frame, 12x12
+// blocks): a full +-4 search on the coarsest level, then each finer level tries the doubled vectors of
+// the parent block and its four neighbours, and zero, and refines the best by +-1 steps; sub-pixel by
+// a parabola through the costs. Every cost carries a small penalty for leaving the parent's vector, so
+// flat areas follow their surroundings instead of noise. Then a 3x3 median and bilinear upsampling to
+// every pixel, with a 0.5 px dead zone. Vectors follow the DLSS convention: previous position minus
+// current position, in pixels (MVecScale 1); content that came from 8 px to the left gets (-8, 0).
+// Checked against OpenCV's Farneback flow on live-action pairs: the same or lower warp error.
+struct Flow {
+  static const int L = 4, BS = 12;
+  unsigned W = 0, H = 0, lw[L] = {}, lh[L] = {}, bw[L] = {}, bh[L] = {};
+  std::vector<float> cur[L], prev[L], vx[L], vy[L];
+  std::vector<float> fx, fy;  // level-0 vectors after the median, in level-0 pixels
+  bool havePrev = false;
+  double meanX = 0, meanY = 0, still = 0;  // mean vector (px) and share of blocks without motion
+  void init(unsigned w, unsigned h) {
+    W = w; H = h;
+    for (int l = 0; l < L; ++l) {
+      lw[l] = l ? (lw[l - 1] + 1) / 2 : (W + 1) / 2; lh[l] = l ? (lh[l - 1] + 1) / 2 : (H + 1) / 2;
+      bw[l] = (lw[l] + BS - 1) / BS; bh[l] = (lh[l] + BS - 1) / BS;
+      cur[l].assign((size_t)lw[l] * lh[l], 0); prev[l] = cur[l];
+      vx[l].assign((size_t)bw[l] * bh[l], 0); vy[l] = vx[l];
+    }
+  }
+  void pyramid(const uint8_t* rgba) {
+    std::vector<float>& c0 = cur[0];
+    parallelRows(g_pool, lh[0], [&](unsigned y0, unsigned y1) {
+      for (unsigned y = y0; y < y1; ++y)
+        for (unsigned x = 0; x < lw[0]; ++x) {
+          float s = 0;
+          for (unsigned dy = 0; dy < 2; ++dy)
+            for (unsigned dx = 0; dx < 2; ++dx) {
+              unsigned sx = x * 2 + dx < W ? x * 2 + dx : W - 1, sy = y * 2 + dy < H ? y * 2 + dy : H - 1;
+              const uint8_t* p = rgba + ((size_t)sy * W + sx) * 4;
+              s += 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2];
+            }
+          c0[(size_t)y * lw[0] + x] = s * 0.25f;
+        }
+    });
+    for (int l = 1; l < L; ++l)
+      for (unsigned y = 0; y < lh[l]; ++y)
+        for (unsigned x = 0; x < lw[l]; ++x) {
+          float s = 0;
+          for (unsigned dy = 0; dy < 2; ++dy)
+            for (unsigned dx = 0; dx < 2; ++dx) {
+              unsigned sx = x * 2 + dx < lw[l - 1] ? x * 2 + dx : lw[l - 1] - 1, sy = y * 2 + dy < lh[l - 1] ? y * 2 + dy : lh[l - 1] - 1;
+              s += cur[l - 1][(size_t)sy * lw[l - 1] + sx];
+            }
+          cur[l][(size_t)y * lw[l] + x] = s * 0.25f;
+        }
+  }
+  float cost(int l, unsigned bx, unsigned by, int dx, int dy) const {
+    const int w = (int)lw[l], h = (int)lh[l];
+    const float* c = cur[l].data(); const float* p = prev[l].data();
+    float s = 0;
+    for (int y = (int)by * BS; y < (int)by * BS + BS && y < h; ++y) {
+      int py = y + dy; py = py < 0 ? 0 : py >= h ? h - 1 : py;
+      for (int x = (int)bx * BS; x < (int)bx * BS + BS && x < w; ++x) {
+        int px = x + dx; px = px < 0 ? 0 : px >= w ? w - 1 : px;
+        s += fabsf(c[y * w + x] - p[py * w + px]);
+      }
+    }
+    return s;
+  }
+  // Fills mv (R16G16 halves, W*H*2) for the frame; zero when there is no usable previous frame.
+  void estimate(const uint8_t* rgba, bool reset, std::vector<uint16_t>& mv) {
+    for (int l = 0; l < L; ++l) cur[l].swap(prev[l]);
+    pyramid(rgba);
+    std::fill(mv.begin(), mv.end(), (uint16_t)0);
+    meanX = meanY = still = 0;
+    if (reset || !havePrev) { havePrev = true; return; }
+    for (int l = L - 1; l >= 0; --l)
+      parallelRows(g_pool, bh[l], [&](unsigned b0, unsigned b1) {
+        for (unsigned by = b0; by < b1; ++by)
+          for (unsigned bx = 0; bx < bw[l]; ++bx) {
+            int cx = 0, cy = 0;
+            unsigned px = 0, py = 0;
+            if (l < L - 1) {
+              px = bx / 2 < bw[l + 1] ? bx / 2 : bw[l + 1] - 1; py = by / 2 < bh[l + 1] ? by / 2 : bh[l + 1] - 1;
+              cx = (int)lroundf(vx[l + 1][py * bw[l + 1] + px] * 2); cy = (int)lroundf(vy[l + 1][py * bw[l + 1] + px] * 2);
+            }
+            auto pen = [&](int dx, int dy) { return 8.0f * (abs(dx - cx) + abs(dy - cy)); };
+            int bestX = cx, bestY = cy; float best = cost(l, bx, by, cx, cy);
+            auto tryv = [&](int dx, int dy) { float cc = cost(l, bx, by, dx, dy) + pen(dx, dy); if (cc < best) { best = cc; bestX = dx; bestY = dy; } };
+            tryv(0, 0);
+            if (l == L - 1) {
+              for (int dy = -4; dy <= 4; ++dy) for (int dx = -4; dx <= 4; ++dx) tryv(dx, dy);
+            } else {
+              // the parent level's neighbours too, so a block on a motion edge can pick the right side
+              for (int k = 0; k < 4; ++k) {
+                int nx = (int)px + (k == 0 ? -1 : k == 1 ? 1 : 0), ny = (int)py + (k == 2 ? -1 : k == 3 ? 1 : 0);
+                if (nx < 0 || ny < 0 || nx >= (int)bw[l + 1] || ny >= (int)bh[l + 1]) continue;
+                tryv((int)lroundf(vx[l + 1][ny * bw[l + 1] + nx] * 2), (int)lroundf(vy[l + 1][ny * bw[l + 1] + nx] * 2));
+              }
+            }
+            for (int it = 0; it < 3; ++it) {
+              int ox = bestX, oy = bestY;
+              for (int dy = -1; dy <= 1; ++dy) for (int dx = -1; dx <= 1; ++dx) if (dx || dy) tryv(ox + dx, oy + dy);
+              if (ox == bestX && oy == bestY) break;
+            }
+            float fxv = (float)bestX, fyv = (float)bestY;
+            if (l == 0) {  // sub-pixel: parabola through the costs either side
+              float c0 = cost(l, bx, by, bestX, bestY);
+              float cl = cost(l, bx, by, bestX - 1, bestY), cr = cost(l, bx, by, bestX + 1, bestY);
+              float cu = cost(l, bx, by, bestX, bestY - 1), cd = cost(l, bx, by, bestX, bestY + 1);
+              float ddx = cl + cr - 2 * c0, ddy = cu + cd - 2 * c0;
+              if (ddx > 0) fxv += fmaxf(-0.5f, fminf(0.5f, 0.5f * (cl - cr) / ddx));
+              if (ddy > 0) fyv += fmaxf(-0.5f, fminf(0.5f, 0.5f * (cu - cd) / ddy));
+            }
+            vx[l][by * bw[l] + bx] = fxv; vy[l][by * bw[l] + bx] = fyv;
+          }
+      });
+    // 3x3 median per component on level 0, then bilinear between block centres, scaled to full res.
+    const unsigned BW = bw[0], BH = bh[0];
+    fx.assign((size_t)BW * BH, 0); fy = fx;
+    for (unsigned by = 0; by < BH; ++by)
+      for (unsigned bx = 0; bx < BW; ++bx)
+        for (int comp = 0; comp < 2; ++comp) {
+          const std::vector<float>& v = comp ? vy[0] : vx[0];
+          float t[9]; int k = 0;
+          for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+              int x = (int)bx + dx, y = (int)by + dy;
+              x = x < 0 ? 0 : x >= (int)BW ? BW - 1 : x; y = y < 0 ? 0 : y >= (int)BH ? BH - 1 : y;
+              t[k++] = v[y * BW + x];
+            }
+          std::nth_element(t, t + 4, t + 9);
+          (comp ? fy : fx)[by * BW + bx] = t[4];
+        }
+    const float blk = 2.0f * BS;  // block size in full-res pixels
+    double sx = 0, sy = 0;
+    for (size_t i = 0; i < fx.size(); ++i) { sx += fx[i]; sy += fy[i]; still += fx[i] * fx[i] + fy[i] * fy[i] < 0.0625f; }
+    meanX = 2 * sx / fx.size(); meanY = 2 * sy / fy.size(); still /= fx.size();
+    parallelRows(g_pool, H, [&](unsigned y0, unsigned y1) {
+      for (unsigned y = y0; y < y1; ++y) {
+        float gy = (y + 0.5f) / blk - 0.5f; gy = gy < 0 ? 0 : gy > BH - 1 ? (float)(BH - 1) : gy;
+        unsigned y0b = (unsigned)gy, y1b = y0b + 1 < BH ? y0b + 1 : y0b; float ty = gy - y0b;
+        for (unsigned x = 0; x < W; ++x) {
+          float gx = (x + 0.5f) / blk - 0.5f; gx = gx < 0 ? 0 : gx > BW - 1 ? (float)(BW - 1) : gx;
+          unsigned x0b = (unsigned)gx, x1b = x0b + 1 < BW ? x0b + 1 : x0b; float tx = gx - x0b;
+          float out[2];
+          for (int comp = 0; comp < 2; ++comp) {
+            const float* v = (comp ? fy : fx).data();
+            float a = v[y0b * BW + x0b] + (v[y0b * BW + x1b] - v[y0b * BW + x0b]) * tx;
+            float b = v[y1b * BW + x0b] + (v[y1b * BW + x1b] - v[y1b * BW + x0b]) * tx;
+            out[comp] = 2.0f * (a + (b - a) * ty);
+          }
+          if (out[0] * out[0] + out[1] * out[1] < 0.25f) out[0] = out[1] = 0;  // 0.5 px dead zone
+          mv[((size_t)y * W + x) * 2] = f2h(out[0]); mv[((size_t)y * W + x) * 2 + 1] = f2h(out[1]);
+        }
+      }
+    });
+  }
+};
+
+// --stream output on its own thread: the grade/detail pass and the pipe write of one frame overlap
+// the motion estimate and evaluate of the next.
+struct Writer {
+  std::vector<uint8_t> in, out;
+  uint32_t idx = 0, res = 0;
+  bool reset = false, post = false, busy = false;  // busy: handed a frame, idle not yet seen
+  float grade = 1, detail = 1;
+  unsigned W = 0, H = 0;
+  Post fx;
+  HANDLE full = nullptr, idle = nullptr;
+  volatile LONG closed = 0;
+  double ms = 0;
+  bool start(unsigned w, unsigned h) {
+    W = w; H = h; in.resize((size_t)W * H * 4); out.resize(in.size()); fx.pool = &g_writerPool;
+    full = CreateEventW(nullptr, FALSE, FALSE, nullptr); idle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE t = CreateThread(nullptr, 0, run, this, 0, nullptr);
+    if (t) CloseHandle(t);
+    return t != nullptr;
+  }
+  static DWORD WINAPI run(void* p) {
+    Writer* w = (Writer*)p;
+    for (;;) {
+      WaitForSingleObject(w->full, INFINITE);
+      double t0 = nowMs();
+      if (w->post) w->fx.apply(w->in.data(), w->out.data(), w->W, w->H, w->grade, w->detail, w->reset);
+      w->ms += nowMs() - t0;
+      uint8_t hdr[16] = {'N', 'R', 'F', 'R', 'A', 'M', 'E', '1'};
+      memcpy(hdr + 8, &w->idx, 4); memcpy(hdr + 12, &w->res, 4);
+      if (!writeExact(g_frameOut, hdr, sizeof hdr) || !writeExact(g_frameOut, w->out.data(), w->out.size())) w->closed = 1;
+      SetEvent(w->idle);
+    }
+  }
+};
 
 int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i)
@@ -294,6 +653,8 @@ int main(int argc, char** argv) {
     else if (k == "--skin") a.skin = (float)atof(nx());
     else if (k == "--automask") a.autoMask = atoi(nx());
     else if (k == "--ui-correction") a.uiCorr = atoi(nx());
+    else if (k == "--grade") a.grade = (float)atof(nx());
+    else if (k == "--detail") a.detail = (float)atof(nx());
     else if (k == "--reset-every") a.resetEvery = true;
     else if (k == "--stream") a.stream = true;
     else if (k == "--no-tunables") a.noTunables = true;
@@ -306,14 +667,20 @@ int main(int argc, char** argv) {
   }
   if ((a.color.empty() && !a.stream) || !a.w || !a.h) {
     printf("usage: nrstill --color f.rgba --size W H [--depth flat|none|f.f32] ...\n"
-           "       nrstill --stream --size W H [...]   (RGBA8 frames on stdin -> stdout)\n");
+           "       nrstill --stream --size W H [--mv zero|none|flow] [...]   (RGBA8 frames on stdin -> stdout)\n"
+           "  effect: --style 0|1|2 --local-structure S --local-tone T --intensity 0..1 --grade 0..1 --detail D\n");
     return 64;
   }
   if (a.stream && a.fmt != "rgba8") { printf("--stream supports --fmt rgba8 only\n"); return 64; }
+  if (a.mv != "zero" && a.mv != "none" && a.mv != "flow") { printf("--mv takes zero, none or flow\n"); return 64; }
+  if (a.mv == "flow" && !a.stream) a.mv = "zero";  // one still has no motion
+  // The model treats intensity as a blend toward the input: values above 1 act as 1.
+  a.intensity = a.intensity < 0 ? 0 : a.intensity > 1 ? 1 : a.intensity;
+  const bool post = a.grade != 1.0f || a.detail != 1.0f;
   const unsigned W = a.w, H = a.h;
-  printf("config: color=%s %ux%u depth=%s mv=%s mvconst=%g,%g frames=%u preset=%d style=%d intensity=%g lstruct=%g ltone=%g skin=%g automask=%d fmt=%s uintSlot=%d resSlot=%d\n",
+  printf("config: color=%s %ux%u depth=%s mv=%s mvconst=%g,%g frames=%u preset=%d style=%d intensity=%g lstruct=%g ltone=%g skin=%g automask=%d uicorr=%d grade=%g detail=%g fmt=%s uintSlot=%d resSlot=%d\n",
          a.color.c_str(), W, H, a.mode == "file" ? a.depthFile.c_str() : a.mode.c_str(), a.mv.c_str(), a.mvx, a.mvy, a.frames, a.preset,
-         a.style, a.intensity, a.lstruct, a.ltone, a.skin, a.autoMask, a.fmt.c_str(), g_uintSlot, g_resSlot);
+         a.style, a.intensity, a.lstruct, a.ltone, a.skin, a.autoMask, a.uiCorr, a.grade, a.detail, a.fmt.c_str(), g_uintSlot, g_resSlot);
 
   std::vector<uint8_t> rgba, depthRaw;
   uint32_t inFlags = 0;
@@ -453,6 +820,19 @@ int main(int argc, char** argv) {
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT cfp; UINT64 ctotal = 0;
   g.dev->GetCopyableFootprints(&cd, 0, 1, 0, &cfp, nullptr, nullptr, &ctotal);
   ID3D12Resource* upColor = a.stream ? makeBuf(g.dev, ctotal, D3D12_HEAP_TYPE_UPLOAD) : nullptr;
+  // ... and, with --mv flow, the motion vectors from a second one.
+  const bool flow = a.mv == "flow";
+  D3D12_RESOURCE_DESC md = tMv->GetDesc();
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT mfp; UINT64 mtotal = 0;
+  g.dev->GetCopyableFootprints(&md, 0, 1, 0, &mfp, nullptr, nullptr, &mtotal);
+  ID3D12Resource* upMv = flow ? makeBuf(g.dev, mtotal, D3D12_HEAP_TYPE_UPLOAD) : nullptr;
+  Flow fl; if (flow) fl.init(W, H);
+  Post postFx;
+  Writer writer;
+  if (a.stream) {
+    writer.post = post; writer.grade = a.grade; writer.detail = a.detail;
+    if (!writer.start(W, H)) { printf("stream: cannot start the writer thread\n"); return 6; }
+  }
   // Output pre-filled with a sentinel (pure magenta, alpha 0) so "model wrote nothing" is detectable.
   std::vector<uint8_t> sentinel((size_t)W * H * cbpp);
   for (size_t i = 0; i < (size_t)W * H; ++i) {
@@ -506,8 +886,9 @@ int main(int argc, char** argv) {
 
   // ---- evaluate N times on the same still ----
   std::vector<uint8_t> frame((size_t)W * H * cbpp);
-  double sumMs = 0;
-  for (unsigned fi = 1; a.stream || fi <= a.frames; ++fi) {
+  double sumMs = 0, flowMs = 0, postMs = 0;
+  unsigned fi = 1;
+  for (; a.stream || fi <= a.frames; ++fi) {
     bool dumpIt = a.stream;
     for (unsigned d : a.dump) if (d == fi) dumpIt = true;
     if (fi == a.frames) dumpIt = true;
@@ -530,7 +911,8 @@ int main(int argc, char** argv) {
     setU(caps, "DLSSNR.Width", W);
     setU(caps, "DLSSNR.Height", H);
     setU(caps, "DLSSNR.DepthInverted", (unsigned)a.depthInverted);
-    setU(caps, "DLSSNR.Reset", (fi == 1 || a.resetEvery || (inFlags & 1)) ? 1u : 0u);
+    const bool reset = fi == 1 || a.resetEvery || (inFlags & 1);
+    setU(caps, "DLSSNR.Reset", reset ? 1u : 0u);
     for (const char* base : {"Color", "Output", "Depth", "MVec"}) {
       char k[96];
       snprintf(k, sizeof k, "DLSSNR.%sSubrectBaseX", base); setU(caps, k, 0);
@@ -553,6 +935,20 @@ int main(int argc, char** argv) {
       g.cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
       barrier(g.cl, tColor, D3D12_RESOURCE_STATE_COPY_DEST, SRV);
     }
+    if (flow) {  // zero vectors on the first frame and at every reset
+      double t0 = nowMs();
+      fl.estimate(rgba.data(), reset, mv);
+      flowMs += nowMs() - t0;
+      uint8_t* m = nullptr;
+      upMv->Map(0, nullptr, (void**)&m);
+      for (unsigned y = 0; y < H; ++y) memcpy(m + mfp.Offset + (size_t)y * mfp.Footprint.RowPitch, (uint8_t*)mv.data() + (size_t)y * W * 4, (size_t)W * 4);
+      upMv->Unmap(0, nullptr);
+      barrier(g.cl, tMv, SRV, D3D12_RESOURCE_STATE_COPY_DEST);
+      D3D12_TEXTURE_COPY_LOCATION dst = {}; dst.pResource = tMv; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      D3D12_TEXTURE_COPY_LOCATION src = {}; src.pResource = upMv; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = mfp;
+      g.cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+      barrier(g.cl, tMv, D3D12_RESOURCE_STATE_COPY_DEST, SRV);
+    }
     r = (NGXResult)call(sEval, (uintptr_t)g.cl, (uintptr_t)feature, (uintptr_t)caps, 0, 0);
     uavBarrier(g.cl, tOut);
     if (dumpIt) {
@@ -566,22 +962,25 @@ int main(int argc, char** argv) {
     HRESULT dr = g.dev->GetDeviceRemovedReason();
     if (fi > 1) sumMs += ms;
     if (r != NGX_OK || FAILED(dr) || (dumpIt && !a.stream) || fi <= 2 || (a.stream && fi % 300 == 0))
-      printf("frame %3u: evaluate -> 0x%08x %s, gpu+wait %.2f ms%s\n", fi, (unsigned)r, ngxName(r), ms,
-             FAILED(dr) ? " DEVICE REMOVED" : "");
+      printf("frame %3u: evaluate -> 0x%08x %s, gpu+wait %.2f ms%s%s\n", fi, (unsigned)r, ngxName(r), ms,
+             FAILED(dr) ? " DEVICE REMOVED" : "", reset ? " (reset)" : "");
+    if (flow && (fi <= 3 || fi % 300 == 0)) printf("frame %3u: mean motion vector %.2f, %.2f px, %.0f%% of blocks still\n", fi, fl.meanX, fl.meanY, fl.still * 100);
     if (FAILED(dr)) { printf("device removed reason 0x%08lx\n", (unsigned long)dr); return 8; }
     if (r != NGX_OK) break;
     if (a.stream) {
+      if (writer.busy) WaitForSingleObject(writer.idle, INFINITE);  // the previous frame is out
+      writer.busy = false;
+      if (writer.closed) { printf("stream: output closed at frame %u\n", fi - 1); break; }
       uint8_t* m = nullptr; D3D12_RANGE rr = {0, (SIZE_T)ototal};
       rb->Map(0, &rr, (void**)&m);
-      for (unsigned y = 0; y < H; ++y) memcpy(frame.data() + (size_t)y * W * 4, m + ofp.Offset + (size_t)y * ofp.Footprint.RowPitch, (size_t)W * 4);
+      for (unsigned y = 0; y < H; ++y) memcpy(writer.out.data() + (size_t)y * W * 4, m + ofp.Offset + (size_t)y * ofp.Footprint.RowPitch, (size_t)W * 4);
       D3D12_RANGE wr = {0, 0}; rb->Unmap(0, &wr);
-      uint8_t hdr[16] = {'N', 'R', 'F', 'R', 'A', 'M', 'E', '1'};
-      uint32_t idx = fi, res = (uint32_t)r;
-      memcpy(hdr + 8, &idx, 4); memcpy(hdr + 12, &res, 4);
-      if (!writeExact(g_frameOut, hdr, sizeof hdr) || !writeExact(g_frameOut, frame.data(), frame.size())) {
-        printf("stream: output closed at frame %u\n", fi);
-        break;
-      }
+      if (post) memcpy(writer.in.data(), rgba.data(), rgba.size());
+      // The grade-fit average restarts at real discontinuities only: under --reset-every the model's
+      // history resets every frame, but the removed colour map must still be averaged or it flickers.
+      writer.idx = fi; writer.res = (uint32_t)r; writer.reset = fi == 1 || (inFlags & 1);
+      writer.busy = true;
+      SetEvent(writer.full);
       continue;
     }
     if (dumpIt) {
@@ -602,10 +1001,23 @@ int main(int argc, char** argv) {
         for (int c = 0; c < 3; ++c) mad += fabsf((float)o8[i * 4 + c] - (float)rgba[i * 4 + c]);
       }
       mad /= (double)W * H * 3;
+      if (post) {
+        postFx.apply(rgba.data(), o8.data(), W, H, a.grade, a.detail, true);
+        double pm = 0;
+        for (size_t i = 0; i < (size_t)W * H; ++i) for (int c = 0; c < 3; ++c) pm += fabsf((float)o8[i * 4 + c] - (float)rgba[i * 4 + c]);
+        printf("  model mean|out-in| = %.3f; after grade %g / detail %g:\n", mad, a.grade, a.detail);
+        mad = pm / ((double)W * H * 3);
+      }
       char fn[512]; snprintf(fn, sizeof fn, "%s\\frame_%03u.rgba", a.outDir.c_str(), fi);
       FILE* f = fopen(fn, "wb"); if (f) { fwrite(o8.data(), 1, o8.size(), f); fclose(f); }
       printf("  dumped %s  mean|out-in| (0..255) = %.3f  untouched(sentinel) px = %zu\n", fn, mad, sentinelPx);
     }
+  }
+  if (a.stream) {
+    if (writer.busy) WaitForSingleObject(writer.idle, INFINITE);  // the last frame is out
+    if (writer.closed) printf("stream: output closed at the last frame\n");
+    postMs = writer.ms;
+    if (fi > 1) printf("cpu per frame: motion %.1f ms, grade/detail %.1f ms (on the writer thread)\n", flowMs / (fi - 1), postMs / (fi - 1));
   }
   if (!a.stream && a.frames > 1) printf("mean per-evaluate submit+fence time (frames 2..%u): %.2f ms\n", a.frames, sumMs / (a.frames - 1));
 

@@ -129,7 +129,7 @@ window, optionally, PyGObject with GTK 4, libadwaita and WebKitGTK 6.0
 opens in your browser.
 
 On a host without FUSE (libfuse2) run it with `--appimage-extract-and-run`
-first, e.g. `DLSS5_for_Linux-0.0.4-x86_64.AppImage --appimage-extract-and-run cli --help`.
+first, e.g. `DLSS5_for_Linux-0.0.5-x86_64.AppImage --appimage-extract-and-run cli --help`.
 The AppImage runtime leaves its extract (`appimage_extracted_<hash>`, about
 250 KB, one per AppImage build) in `$TMPDIR` or `/tmp` after it exits; delete those by hand.
 
@@ -355,35 +355,54 @@ Cancel deletes the partial file.
   own size, up to 4K.
 - **Length** processes only the first N seconds, which is useful for trying out
   settings.
-- **History between frames** is on by default. The model then uses earlier
-  frames, which in testing gave less flicker. There are no motion vectors, so
-  fast motion can smear. The history resets at scene cuts, which are detected
-  from frame differences. Turn it off to process every frame on its own.
+- **History between frames** is on by default. The model then reuses its
+  previous output, moved along motion vectors that `nrstill.exe` estimates from
+  the frames themselves (block matching on a half-size copy, in the DLSS
+  convention: previous minus current position, in pixels). The history resets
+  at scene cuts, which are detected from frame differences. Turn it off to
+  process every frame on its own, without motion vectors.
 
 The AppImage bundles a static `ffmpeg` and `ffprobe`: BtbN's GPL build of
 FFmpeg 8.1, with its licence and source pointers in
 `usr/share/licenses/dlss5-linux/ffmpeg/`. That adds about 120 MB to the file.
 The RPM uses the system's ffmpeg and recommends it (Fedora: `ffmpeg-free`).
-Encoding uses
-libx264, then h264_nvenc, libopenh264 or libvpx-vp9, whichever is available
-first, and writes BT.709-tagged video. On an RTX 4090 a 1080p video runs at
-about 15–20 frames per second, plus a few seconds to start the model. One
-helper process handles the whole video: frames go to `nrstill.exe --stream`
-over a pipe.
+Decoding converts to BT.709: HDR (PQ or HLG) is tone-mapped to SDR and
+BT.2020 colour converted with zscale, which needs an ffmpeg built with libzimg
+(the bundled one is). Encoding uses
+libx264 (CRF 14), then h264_nvenc, libopenh264 or libvpx-vp9, whichever is
+available first, and writes BT.709-tagged video. The quality is set high on
+purpose: at CRF 17 the codec's own noise was as large as the fine detail the
+model adds. On an RTX 4090 a 1080p video runs at about 12–19 frames per second,
+plus a few seconds to start the model. One helper process handles the whole
+video: frames go to `nrstill.exe --stream` over a pipe.
 
-- **Intensity** sets the strength of the whole effect. At 0 the image is
-  unchanged, and values above 1 add nothing.
-- **Structure** sets how much fine detail the model redraws. Lower values keep
-  more of the original detail.
-- **Tone** sets how much the lighting and colour change.
-- **Style 1** gives a darker, matte look.
+- **Structure** (0–4, default 2) sets how much the model redraws faces,
+  skin and materials. **Tone** (0–3, default 2) sets how much it relights.
+  These two are the model's real strength controls: at 0 and 0 it changes
+  almost nothing. Above about 4 and 3 it breaks down (grey-green skin, noise).
+- **Colour grade** (default 0) is how much of the model's overall colour shift
+  is kept. Most of what the model changes on ordinary footage is one colour
+  map for the whole frame (darker midtones, less saturation, a hue shift),
+  which looks like a colour grade rather than rendering. The app fits that map
+  to each frame (a cubic polynomial in R, G and B, averaged over recent frames
+  in a video) and by default removes it. What is left is the part that varies
+  across the picture: relit faces and materials, local contrast and detail.
+  At 1 you get the model's output as it is.
+- **Detail** (0–2, default 1) scales that remaining part. Above about 1.5,
+  flat cartoon colours start to show blotches.
+- **Intensity** blends the model's output back toward the original: 0 is
+  the original, and values above 1 would add nothing.
+- **Style**: Default, Cinematic, or Natural. Natural is mostly a darker
+  grade.
 - **Passes** sets how many times the same image is fed in. The model keeps a
-  history between frames; the last pass is shown.
+  history between frames; the last pass is shown. It barely changes a still.
 
-The model relights the scene: it lifts shadowed sides, softens hard shadows and
-shrinks highlights. It does not sharpen or upscale. The picture is fed in as
-an sRGB game frame with flat depth and no motion, scaled down to 3840 px on the
-long side if it is larger.
+The model relights people and materials: skin shading, lips, eyes, fabric
+texture. It does not sharpen or upscale. It was made for photoreal game
+frames, so photos, live action and game captures change most. Flat 2D cartoons
+and anime only get a subtle change to tone and edges. The picture is fed in as
+an sRGB game frame with a flat depth, scaled down to 3840 px on the long side
+if it is larger.
 
 It needs an NVIDIA GPU (the cached `nvngx_dlssnr.dll` is the RTX 40 / sm_89
 build), GE-Proton, and the driver's NGX Wine files. On first use the tab offers
@@ -406,8 +425,14 @@ module whose path contains `nvngx.dll`, so every call goes through
 `build.sh` rebuilds both binaries with zig. `still/nr-runtime.sh` is the whole
 runtime (`status`, `setup`, `run`) and works without the GUI.
 
-Depth has no measurable effect on the output, and the model's preset setting
-did nothing in testing. Images with faces, and HDR input, are untested.
+What the DLL (v310.8.0) does with its inputs was measured, not assumed. It
+holds one network (`CC_Control_History_Blend_..._honest_tench`), so every
+preset falls back to it. It runs at the output resolution (about 4 ms per 1080p
+frame on an RTX 4090). Feature flags, SDR/HDR hints, pre-exposure, sharpness,
+the application ID and a flat depth's value leave the output byte-identical.
+`nr-runtime.sh` turns on the DLL's own log (`DLSS5_NGX_LOG_LEVEL`, default 1)
+and appends it to `last-run.log` / `last-video.log`, so the network it built
+and its resolution are on record.
 
 ## Configuring OptiScaler.ini
 
