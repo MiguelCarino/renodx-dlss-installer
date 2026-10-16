@@ -1,0 +1,102 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DLSS 5 for Linux</title>
+  <meta name="description" content="DLSS 5 for Linux puts NVIDIA's DLSS 5 neural rendering into Steam games running under Proton, and runs the same model over your pictures and videos. Free software for Fedora and any recent Linux.">
+  <meta name="theme-color" content="#050505">
+  <link rel="icon" type="image/svg+xml" href="web/dlss5.svg">
+  <link rel="stylesheet" href="web/fonts/carino-fonts.css">
+  <link rel="stylesheet" href="web/style.css">
+</head>
+<body>
+  <!-- One screen, laid out like butter.carino.systems and dicom.carino.systems:
+       mark, headline, what it does, the version, the download buttons. -->
+  <header class="hero">
+    <div class="wrap">
+      <!-- The app icon over a strip of pixels: blocky on the left, refined toward
+           the right, a wave of detail passing along it. Decorative (aria-hidden). -->
+      <div class="hero-mark" aria-hidden="true">
+        <img class="mark" src="web/dlss5.svg" alt="" width="96" height="96" decoding="async">
+        <svg class="pixels" viewBox="0 0 200 24">
+          <rect x="0"   y="2" width="20" height="20" rx="0"  style="--d: 0"/>
+          <rect x="30"  y="2" width="20" height="20" rx="2"  style="--d: 1"/>
+          <rect x="60"  y="2" width="20" height="20" rx="4"  style="--d: 2"/>
+          <rect x="90"  y="2" width="20" height="20" rx="6"  style="--d: 3"/>
+          <rect x="120" y="2" width="20" height="20" rx="8"  style="--d: 4"/>
+          <rect x="150" y="2" width="20" height="20" rx="9"  style="--d: 5"/>
+          <rect x="180" y="2" width="20" height="20" rx="10" style="--d: 6"/>
+        </svg>
+      </div>
+      <p class="kicker">DLSS 5 for Linux</p>
+      <h1><span>Neural rendering in your Proton games.</span><br><span class="gold">Checked first, then installed.</span></h1>
+      <p class="lede"><strong>DLSS 5 for Linux</strong> finds your Steam games, says which ones the DLSS 5 neural pass can work in, and installs it with the Proton settings it needs.</p>
+      <ul class="situations">
+        <li>Will this game work? A probe reads its folder and rates it supported, partial, unsupported or blocked before anything is copied.</li>
+        <li>Online game with anti-cheat? It refuses to install there. This is for single-player games.</li>
+        <li>No game handy? Run the same model over a picture or a video, sound kept. It also tells you when footage is 2D animation, where the model changes little.</li>
+        <li>Made for NVIDIA RTX 40 cards. AMD RX 6000/7000/9000 is experimental; RTX 20, 30 and 50 are not supported yet.</li>
+      </ul>
+
+      <!-- app.js rewrites the version and the links from the latest release. -->
+      <p class="version" id="version">Version <strong>0.0.6</strong> · Linux · x86-64 · GPL-3.0</p>
+
+      <!-- The hrefs are the no-JS path: each downloads its file. With JS, a click
+           also opens the sheet that says what to do with it. -->
+      <div class="downloads" id="downloads">
+        <a class="dl-btn" data-kind="appimage" href="https://github.com/MiguelCarino/renodx-dlss-installer/releases/download/v0.0.6/DLSS5_for_Linux-0.0.6-x86_64.AppImage">
+          <span class="rec">for your system</span><b>🐧 AppImage</b><span class="fmt">any Linux · x86-64</span></a>
+        <a class="dl-btn" data-kind="fedora" href="https://github.com/MiguelCarino/renodx-dlss-installer/releases/download/v0.0.6/dlss5-linux-0.0.6-1.fc44.noarch.rpm">
+          <span class="rec">for your system</span><b>Fedora</b><span class="fmt">.rpm · noarch</span></a>
+      </div>
+
+      <p class="dl-manual"><button class="btn ghost" type="button" id="installBtn"
+         aria-haspopup="dialog" aria-controls="fedoraDialog">⌨ Install in one command</button></p>
+      <p class="dl-all"><a id="allLink" href="https://github.com/MiguelCarino/renodx-dlss-installer/releases">All versions and release notes →</a></p>
+      <p class="dl-note" id="osNote">Linux only. On Windows, use the original <a href="https://github.com/yumlevi/renodx-dlss-installer/releases/tag/latest">RenoDX DLSS installer</a> this project is a port of.</p>
+    </div>
+  </header>
+
+  <footer class="foot">
+    <span id="foot-version">DLSS 5 for Linux 0.0.6</span> · GPL-3.0 ·
+    <a href="https://github.com/MiguelCarino/renodx-dlss-installer/tree/linux-port/linux">Source</a> ·
+    <a href="https://github.com/MiguelCarino/renodx-dlss-installer/blob/linux-port/linux/README.md">Documentation</a>
+    <br><span class="legal">Not affiliated with or endorsed by NVIDIA. DLSS is a trademark of NVIDIA Corporation.</span>
+  </footer>
+
+  <!-- Fedora: one dnf command fetches the RPM from the release and its dependencies from Fedora. -->
+  <dialog class="modal" id="fedoraDialog" aria-labelledby="fedoraTitle">
+    <div class="modal-head">
+      <h2 class="modal-title" id="fedoraTitle">DLSS 5 for Linux on Fedora</h2>
+      <form method="dialog"><button class="modal-x" aria-label="Close">✕</button></form>
+    </div>
+    <div class="modal-body">
+      <p>One command; dnf downloads the package from the release and what it needs from Fedora:</p>
+      <div class="code"><pre><code id="cmd">sudo dnf install https://github.com/MiguelCarino/renodx-dlss-installer/releases/download/v0.0.6/dlss5-linux-0.0.6-1.fc44.noarch.rpm</code></pre><button type="button" class="copy" data-src="cmd">Copy</button></div>
+      <p>Then open <strong>DLSS 5 for Linux</strong> from your application menu, or run <code>dlss5-linux-gui</code>. The command line is <code>dlss5-linux --help</code>.</p>
+      <p class="small">The package has no architecture of its own and installs on current Fedora releases. It also recommends GTK 4, libadwaita and WebKitGTK for the app's own window; without them it opens in your browser. Check the download against <a class="sums" href="https://github.com/MiguelCarino/renodx-dlss-installer/releases/download/v0.0.6/SHA256SUMS">SHA256SUMS</a>.</p>
+    </div>
+  </dialog>
+
+  <!-- AppImage: the link downloads it; this sheet says how to start it and what the host provides. -->
+  <dialog class="modal" id="appimageDialog" aria-labelledby="appimageTitle">
+    <div class="modal-head">
+      <h2 class="modal-title" id="appimageTitle">DLSS 5 for Linux AppImage</h2>
+      <form method="dialog"><button class="modal-x" aria-label="Close">✕</button></form>
+    </div>
+    <div class="modal-body">
+      <p><strong>1. Make it runnable and start it</strong>, from the folder you downloaded it to:</p>
+      <div class="code"><pre><code id="appcmd">chmod +x DLSS5_for_Linux-0.0.6-x86_64.AppImage
+./DLSS5_for_Linux-0.0.6-x86_64.AppImage</code></pre><button type="button" class="copy" data-src="appcmd">Copy</button></div>
+      <p><strong>2. Have the usual tools installed.</strong> FFmpeg is inside; the rest comes from your system: <code>python3</code>, <code>curl</code>, <code>unzip</code>, <code>binutils</code>, 7-Zip and <code>xdg-utils</code>. On Debian or Ubuntu:</p>
+      <div class="code"><pre><code id="debcmd">sudo apt install python3 curl unzip binutils p7zip-full xdg-utils</code></pre><button type="button" class="copy" data-src="debcmd">Copy</button></div>
+      <p><strong>3. Pick a game</strong> in the app, press Install, and set the launch options it shows in Steam. It opens in its own window when PyGObject with GTK 4, libadwaita and WebKitGTK 6 is installed, and in your browser otherwise.</p>
+      <p class="small">No FUSE on your system? Add <code>--appimage-extract-and-run</code> after the file name. The command line is the same file followed by <code>cli --help</code>. <a class="sums" href="https://github.com/MiguelCarino/renodx-dlss-installer/releases/download/v0.0.6/SHA256SUMS">SHA256SUMS</a></p>
+    </div>
+  </dialog>
+
+  <script src="web/app.js"></script>
+</body>
+</html>

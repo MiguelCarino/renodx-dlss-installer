@@ -1,0 +1,165 @@
+/* SPDX-License-Identifier: GPL-3.0-only
+   dlss.carino.systems, laid out like butter.carino.systems and dicom.carino.systems
+   (Carino-PACS docs/styles.css): one top-anchored hero holding the downloads, every
+   size written as `base + --tall x rate` so short screens stay as they are and tall
+   ones grow without a breakpoint. Carino tokens (branding.carino.systems). */
+
+:root {
+  --accent: #eab308;
+  --accent-hover: #fbbf24;
+  --bg: #050505;
+  --bg-2: #0d0d0d;
+  --panel: #111;
+  --border: #262626;
+  --text: #f5f5f5;
+  --muted: #8a8a8a;
+  --gold-text: linear-gradient(130deg, #fef08a 0%, #eab308 50%, #b45309 100%);
+  --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  --display: 'Red Hat Display', var(--sans);
+  /* surplus height over 900px: zero on short screens, so they keep this layout */
+  --tall: max(0px, 100vh - 900px);
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); line-height: 1.55;
+  min-height: 100dvh; display: flex; flex-direction: column; -webkit-font-smoothing: antialiased; }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.gold { color: var(--accent); }
+
+/* ---- hero: the whole page, top-anchored ---- */
+.hero { flex: 1 0 auto; display: flex; text-align: center;
+  padding: min(72px, calc(clamp(18px, 3.4vh, 46px) + var(--tall) * .07)) 0 clamp(10px, 2vh, 34px);
+  background: radial-gradient(1100px 360px at 50% -12%, rgba(234,179,8,.10), transparent 70%); }
+.hero > .wrap { margin: 0 auto auto; width: min(1040px, 90%); }
+
+.hero-mark { display: flex; flex-direction: column; align-items: center;
+  gap: min(28px, calc(8px + var(--tall) * .045));
+  margin: 0 auto min(40px, calc(clamp(6px, 1vh, 14px) + var(--tall) * .08)); }
+.hero-mark .mark { display: block; width: auto; filter: drop-shadow(0 0 22px rgba(234,179,8,.18));
+  height: min(132px, calc(clamp(44px, 7vh, 72px) + var(--tall) * .16)); }
+/* the pixel strip: square on the left, rounder to the right, a wave of light along it */
+.pixels { display: block; width: auto; aspect-ratio: 200 / 24; overflow: visible;
+  height: min(40px, calc(clamp(14px, 2.2vh, 22px) + var(--tall) * .045)); }
+.pixels rect { fill: var(--accent); opacity: .22; animation: lit 2.8s ease-in-out infinite;
+  animation-delay: calc(var(--d) * .18s); }
+@keyframes lit { 0%, 100% { opacity: .22; } 20%, 45% { opacity: 1; filter: drop-shadow(0 0 4px rgba(234,179,8,.9)); } }
+@media (prefers-reduced-motion: reduce) { .pixels rect { animation: none; opacity: .6; } }
+
+.kicker { font-family: var(--display); font-weight: 900; text-transform: uppercase; letter-spacing: 1px;
+  margin: 0 0 min(14px, calc(4px + var(--tall) * .02));
+  font-size: min(2.6rem, calc(clamp(1.5rem, 2.6vw + .3vh, 2rem) + var(--tall) * .02));
+  background: var(--gold-text); -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent; }
+.hero h1 { font-family: var(--display); font-weight: 900; line-height: 1.1; letter-spacing: -.005em;
+  font-size: min(3.4rem, calc(clamp(1.5rem, 3.4vw + .4vh, 2.6rem) + var(--tall) * .035));
+  margin: 0 0 min(56px, calc(clamp(8px, 1.5vh, 16px) + var(--tall) * .1)); }
+.lede { color: #d4d4d4; max-width: min(820px, calc(660px + var(--tall) * .35));
+  font-size: min(1.3rem, calc(clamp(.92rem, .55rem + .5vh, 1.05rem) + var(--tall) * .012));
+  margin: 0 auto 10px; }
+.situations { list-style: none; padding: 0; text-align: left; color: #cfcfcf;
+  max-width: min(720px, calc(600px + var(--tall) * .3));
+  font-size: min(1.08rem, calc(clamp(.86rem, .5rem + .45vh, .98rem) + var(--tall) * .008));
+  margin: 0 auto min(48px, calc(clamp(12px, 2.4vh, 26px) + var(--tall) * .07)); }
+.situations li { padding-left: 1.1em; position: relative; margin: .25em 0; }
+.situations li::before { content: "›"; color: var(--accent); position: absolute; left: 0; }
+
+.version { margin: 0 0 min(28px, calc(clamp(10px, 1.6vh, 16px) + var(--tall) * .035));
+  font-family: var(--mono); font-size: min(1rem, calc(.78rem + var(--tall) * .008)); color: var(--muted); }
+.version strong { color: var(--accent); }
+
+/* ---- download chips (dicom's .dl-btn) ---- */
+.downloads { display: flex; justify-content: center; flex-wrap: wrap;
+  gap: min(30px, calc(14px + var(--tall) * .04)); }
+.dl-btn {
+  position: relative; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  min-width: min(226px, calc(150px + var(--tall) * .09));
+  padding: min(30px, calc(14px + var(--tall) * .028)) min(46px, calc(22px + var(--tall) * .04));
+  border-radius: 11px; text-decoration: none; font: inherit; cursor: pointer;
+  border: 1px solid var(--border); background: linear-gradient(180deg, var(--panel), #0a0a0a);
+  color: var(--text); transition: .16s;
+}
+.dl-btn:hover { border-color: var(--accent); transform: translateY(-2px); }
+.dl-btn b { font-size: min(1.42rem, calc(1.02rem + var(--tall) * .013)); font-weight: 600; }
+.dl-btn .fmt { font-family: var(--mono); font-size: .68rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.dl-btn .rec { display: none; }
+.dl-btn.recommended {
+  border-color: var(--accent); background: var(--accent); color: #050505;
+  box-shadow: 0 10px 30px rgba(234,179,8,.22);
+}
+.dl-btn.recommended .fmt { color: #3a2c00; }
+.dl-btn.recommended .rec {
+  display: block; position: absolute; top: -10px; left: 50%; transform: translateX(-50%);
+  background: #050505; color: var(--accent); border: 1px solid var(--accent); border-radius: 999px;
+  font-family: var(--mono); font-size: .56rem; letter-spacing: .1em; text-transform: uppercase; padding: 2px 8px; white-space: nowrap;
+}
+
+.btn {
+  display: inline-block; font-family: var(--mono); letter-spacing: .04em; text-transform: uppercase;
+  font-weight: 600; text-decoration: none; cursor: pointer; border-radius: 7px; transition: .15s;
+  font-size: min(1.05rem, calc(.8rem + var(--tall) * .009));
+  padding: min(19px, calc(9px + var(--tall) * .026)) min(32px, calc(16px + var(--tall) * .04));
+  border: 1px solid var(--border); color: var(--muted); background: transparent;
+}
+.btn.ghost:hover { color: var(--accent); border-color: var(--accent); }
+.dl-manual { margin: min(38px, calc(clamp(12px, 2vh, 20px) + var(--tall) * .05)) 0 0; }
+.dl-all { margin: min(24px, calc(clamp(8px, 1.2vh, 12px) + var(--tall) * .035)) 0 0;
+  font-size: min(1.02rem, calc(.82rem + var(--tall) * .008)); }
+.dl-all a { text-decoration: none; }
+.dl-all a:hover { text-decoration: underline; }
+.dl-note[hidden] { display: none; }
+.dl-note { margin: 8px auto 0; max-width: min(720px, calc(560px + var(--tall) * .35));
+  color: var(--muted); font-size: min(.9rem, calc(.78rem + var(--tall) * .006)); }
+
+.foot { padding: 12px 5% 18px; border-top: 1px solid var(--border); text-align: center;
+  color: #666; font-family: var(--mono); font-size: .72rem; }
+.foot a { color: var(--muted); text-decoration: none; }
+.foot a:hover { color: var(--accent); }
+.foot .legal { display: inline-block; margin-top: 4px; color: #555; }
+
+/* ---- modal (branding.carino.systems §17 on a native <dialog>) ---- */
+.modal[open] { display: flex; }
+.modal {
+  flex-direction: column; padding: 0; overflow: hidden;
+  width: min(92vw, 820px); max-height: min(88vh, 900px);
+  background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+  box-shadow: 0 30px 80px rgba(0,0,0,.75); color: var(--text);
+}
+.modal::backdrop { background: rgba(0,0,0,.65); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+.modal-head { display: flex; align-items: center; gap: 12px; padding: 16px 18px; border-bottom: 1px solid var(--border); }
+.modal-title { margin: 0; flex: 1; font-family: var(--display); font-weight: 900; font-size: 1.05rem;
+  text-transform: uppercase; letter-spacing: .5px; }
+.modal-head form { margin: 0; }
+.modal-x { border: none; background: transparent; color: var(--muted); font-size: 1.05rem; line-height: 1;
+  cursor: pointer; padding: 4px 8px; border-radius: 6px; transition: .15s; }
+.modal-x:hover { color: var(--accent); background: rgba(234,179,8,.1); }
+.modal-body { padding: 18px; overflow-y: auto; }
+.modal-body p { color: #cfcfcf; margin: 10px 0; }
+
+/* shell commands scroll inside their own box rather than wrap (dicom's rule) */
+.code { position: relative; margin: 10px 0; }
+.code pre { margin: 0; padding: 14px 92px 14px 14px; overflow-x: auto; white-space: pre;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px;
+  font-size: .78rem; line-height: 1.6; color: #fde68a; }
+.copy { position: absolute; top: 8px; right: 8px; font-family: var(--mono); font-size: .7rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .06em; border-radius: 6px; cursor: pointer; padding: 0 12px; height: 32px;
+  border: 1px solid var(--accent); background: var(--accent); color: #050505; }
+.copy:hover { background: var(--accent-hover); }
+.copy.done { background: transparent; color: var(--accent); }
+.modal code:not(pre code) { font-family: var(--mono); background: #1a1a1a; padding: 1px 5px; border-radius: 3px; color: #fde68a; }
+details { margin-top: 10px; }
+summary { cursor: pointer; font-weight: 600; }
+.files { margin: 8px 0; padding-left: 18px; font-family: var(--mono); font-size: .78rem; }
+.files li { margin: 3px 0; overflow-wrap: anywhere; }
+.small { font-size: .82rem; }
+
+/* ---- phone ---- */
+@media (max-width: 640px) {
+  .pixels { display: none; }
+  .dl-btn { min-width: 140px; padding: 10px 14px; gap: 0; }
+  .dl-btn b { font-size: .98rem; }
+  .downloads { gap: 10px; }
+  .dl-note[hidden] { display: none; }
+.dl-note { font-size: .78rem; }
+}
+@media (prefers-reduced-motion: reduce) { .dl-btn, .btn { transition: none; } }
