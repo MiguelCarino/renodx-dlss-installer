@@ -129,7 +129,7 @@ window, optionally, PyGObject with GTK 4, libadwaita and WebKitGTK 6.0
 opens in your browser.
 
 On a host without FUSE (libfuse2) run it with `--appimage-extract-and-run`
-first, e.g. `DLSS5_for_Linux-0.0.5-x86_64.AppImage --appimage-extract-and-run cli --help`.
+first, e.g. `DLSS5_for_Linux-0.0.6-x86_64.AppImage --appimage-extract-and-run cli --help`.
 The AppImage runtime leaves its extract (`appimage_extracted_<hash>`, about
 250 KB, one per AppImage build) in `$TMPDIR` or `/tmp` after it exits; delete those by hand.
 
@@ -372,9 +372,15 @@ BT.2020 colour converted with zscale, which needs an ffmpeg built with libzimg
 libx264 (CRF 14), then h264_nvenc, libopenh264 or libvpx-vp9, whichever is
 available first, and writes BT.709-tagged video. The quality is set high on
 purpose: at CRF 17 the codec's own noise was as large as the fine detail the
-model adds. On an RTX 4090 a 1080p video runs at about 12–19 frames per second,
-plus a few seconds to start the model. One helper process handles the whole
-video: frames go to `nrstill.exe --stream` over a pipe.
+model adds. On an RTX 4090 a 1080p video runs at about 20–36 frames per second
+(about 36 once the model is up, on a 10-second clip), plus a few seconds to start
+the model. One helper process handles the whole video: frames go to
+`nrstill.exe --stream` over a pipe. Inside it the work is pipelined: a reader
+thread pulls frames off the pipe up to two ahead; while the GPU runs the model
+on one frame, the next one's motion is estimated and its upload staged; and a
+writer thread applies the colour-grade/detail pass and sends the previous frame
+back. Motion estimation is now the slowest step. The output is identical to
+running the steps one after another.
 
 - **Structure** (0–4, default 2) sets how much the model redraws faces,
   skin and materials. **Tone** (0–3, default 2) sets how much it relights.
@@ -400,7 +406,25 @@ video: frames go to `nrstill.exe --stream` over a pipe.
 The model relights people and materials: skin shading, lips, eyes, fabric
 texture. It does not sharpen or upscale. It was made for photoreal game
 frames, so photos, live action and game captures change most. Flat 2D cartoons
-and anime only get a subtle change to tone and edges. The picture is fed in as
+and anime only get a subtle change to tone and edges.
+
+So the tab says which kind it got. When a picture or video is opened, a few
+frames go through `nrstill.exe --classify` (CPU only, about a second) and the
+panel shows "2D animation", "3D or camera footage", or "could not tell". The
+classifier is MobileNetV3-Large (torchvision's ImageNet weights, BSD-3-Clause)
+with a logistic head trained on up to 10 frames from each of 123 labelled clips:
+cel and hand-drawn animation, anime and 2D or painted games against 3D animation,
+Blender films, 3D games, film, TV and camera footage (`still/native/kind-clips.txt`).
+In clip-grouped cross-validation it called about 82% of clips right and 7.5%
+wrong, and was unsure on the rest. Its misses are the borderline cases:
+cel-shaded 3D games (Zelda, Sonic), smooth stylised 3D, painted anime scenery
+and pixel art. Smooth abstract CG with no texture reads as 2D. A
+video's guess uses up to eight frames spread over its length, skipping black
+and blank ones. The weights are `still/bin/kind.bin` (6 MB, fp16, batch norm
+folded); `still/native/kind-train.py` rebuilds them, and `kind.h` is the
+inference. The guess is only a label: it does not change any setting.
+
+The picture is fed in as
 an sRGB game frame with a flat depth, scaled down to 3840 px on the long side
 if it is larger.
 
@@ -423,7 +447,7 @@ the driver's own loader cannot be used. The DLL also only accepts calls from a
 module whose path contains `nvngx.dll`, so every call goes through
 `still/bin/nvngx.dll_nrshim.dll`. The sources are in `still/native/`, and
 `build.sh` rebuilds both binaries with zig. `still/nr-runtime.sh` is the whole
-runtime (`status`, `setup`, `run`) and works without the GUI.
+runtime (`status`, `setup`, `run`, `stream`, `classify`) and works without the GUI.
 
 What the DLL (v310.8.0) does with its inputs was measured, not assumed. It
 holds one network (`CC_Control_History_Blend_..._honest_tench`), so every

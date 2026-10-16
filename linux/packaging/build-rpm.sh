@@ -52,8 +52,12 @@ readonly FILES=(
     linux/still/nr-runtime.sh
     linux/still/bin/nrstill.exe
     linux/still/bin/nvngx.dll_nrshim.dll
+    linux/still/bin/kind.bin
     linux/still/native/nrstill.cpp
     linux/still/native/nrshim.cpp
+    linux/still/native/kind.h
+    linux/still/native/kind-train.py
+    linux/still/native/kind-clips.txt
     linux/still/native/build.sh
     linux/README.md
     linux/LICENSE

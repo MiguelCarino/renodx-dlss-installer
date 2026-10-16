@@ -6,6 +6,8 @@
 #   nr-runtime.sh setup [DLL]       builds the Wine prefix (one time) and installs the NR DLL
 #   nr-runtime.sh run LOG ARGS...   runs nrstill.exe; ARGS use Windows paths under C:\nr
 #   nr-runtime.sh stream LOG ARGS... nrstill.exe --stream: RGBA8 frames on stdin -> stdout
+#   nr-runtime.sh classify FILE W H N  2D animation or 3D/camera footage? FILE (a Windows path
+#                                   under C:\nr) holds N RGBA8 frames of WxH; prints "content: ..."
 #   nr-runtime.sh stop              ends every Wine process in the prefix
 #
 # run/stream append the NR DLL's own log (C:\nr\logs\nvngx_dlssnr_*.log: network config, the
@@ -95,6 +97,7 @@ REG
 
     mkdir -p "$RUN/in" "$RUN/out"
     install -m755 "$HERE/bin/nrstill.exe" "$HERE/bin/nvngx.dll_nrshim.dll" "$RUN/"
+    install -m644 "$HERE/bin/kind.bin" "$RUN/"
     if [[ -n "$src" ]]; then
         case "$src" in
             *.zip) unzip -o -j -q "$src" 'streamline/nvngx_dlssnr.dll' -d "$RUN" || { echo "no streamline/nvngx_dlssnr.dll in $src"; return 1; } ;;
@@ -108,6 +111,27 @@ REG
     echo "Runtime ready in $DATA"
 }
 
+# Keep the exe, shim and classifier weights in step with the app's bin/ (an updated app ships new ones).
+sync_bin() {
+    cmp -s "$HERE/bin/nrstill.exe" "$RUN/nrstill.exe" || install -m755 "$HERE/bin/nrstill.exe" "$RUN/"
+    cmp -s "$HERE/bin/nvngx.dll_nrshim.dll" "$RUN/nvngx.dll_nrshim.dll" || install -m755 "$HERE/bin/nvngx.dll_nrshim.dll" "$RUN/"
+    cmp -s "$HERE/bin/kind.bin" "$RUN/kind.bin" || install -m644 "$HERE/bin/kind.bin" "$RUN/"
+}
+
+# classify FILE W H N: CPU only, no GPU or NGX. It may run next to a picture or video job in the
+# same prefix, so unlike run() it leaves the wineserver alone.
+classify() {
+    local ge
+    ge=$(find_proton)
+    [[ -n "$ge" && -f "$PFX/system.reg" ]] || { echo "content: none (no runtime)"; return 1; }
+    sync_bin
+    cd "$RUN" || return 1
+    env -u DISPLAY -u WAYLAND_DISPLAY WINEPREFIX="$PFX" WINEDEBUG=-all \
+        WINEDLLOVERRIDES='mscoree,mshtml,winemenubuilder.exe=' \
+        timeout 120 "$ge/files/bin/wine" 'C:\nr\nrstill.exe' --classify "$1" --size "$2" "$3" --count "$4" 2>&1 \
+        | tr -d '\r' | grep -a '^content:\|^classify:'
+}
+
 # run LOG ARGS...     all output to LOG
 # stream LOG ARGS...  frames through stdin/stdout, everything else to LOG, no time limit
 run() {
@@ -115,9 +139,7 @@ run() {
     local ge nv rc limit=${NRTIMEOUT:-240}
     [[ $mode == stream ]] && limit=${NRTIMEOUT:-0}
     ge=$(find_proton); nv=$(nv_wine_dir)
-    # Keep the exe/shim in step with the app's bin/ (an updated app ships new ones).
-    cmp -s "$HERE/bin/nrstill.exe" "$RUN/nrstill.exe" || install -m755 "$HERE/bin/nrstill.exe" "$RUN/"
-    cmp -s "$HERE/bin/nvngx.dll_nrshim.dll" "$RUN/nvngx.dll_nrshim.dll" || install -m755 "$HERE/bin/nvngx.dll_nrshim.dll" "$RUN/"
+    sync_bin
     cd "$RUN" || return 1
     mkdir -p "$RUN/logs" && rm -f "$RUN"/logs/nvngx_dlssnr_*.log
     env -u DISPLAY -u WAYLAND_DISPLAY -u VK_INSTANCE_LAYERS -u DLSSNR_LAYER_OBJECT \
@@ -148,6 +170,7 @@ case "${1:-}" in
     setup) shift; setup "${1:-}" ;;
     run) shift; run run "$@" ;;
     stream) shift; run stream "$@" ;;
+    classify) shift; classify "$@" ;;
     stop) ge=$(find_proton); [[ -n "$ge" && -d "$PFX" ]] && WINEPREFIX="$PFX" "$ge/files/bin/wineserver" -k 2>/dev/null; exit 0 ;;
-    *) sed -n '2,9p' "$0"; exit 64 ;;
+    *) sed -n '2,11p' "$0"; exit 64 ;;
 esac

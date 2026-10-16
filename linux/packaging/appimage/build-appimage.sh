@@ -128,8 +128,12 @@ put "$LINUX_DIR/dlss5-app.py"    usr/share/dlss5-linux/dlss5-app.py   0755
 put "$LINUX_DIR/still/nr-runtime.sh"            usr/share/dlss5-linux/still/nr-runtime.sh            0755
 put "$LINUX_DIR/still/bin/nrstill.exe"          usr/share/dlss5-linux/still/bin/nrstill.exe          0644
 put "$LINUX_DIR/still/bin/nvngx.dll_nrshim.dll" usr/share/dlss5-linux/still/bin/nvngx.dll_nrshim.dll 0644
+put "$LINUX_DIR/still/bin/kind.bin"             usr/share/dlss5-linux/still/bin/kind.bin             0644
 put "$LINUX_DIR/still/native/nrstill.cpp"       usr/share/dlss5-linux/still/native/nrstill.cpp       0644
 put "$LINUX_DIR/still/native/nrshim.cpp"        usr/share/dlss5-linux/still/native/nrshim.cpp        0644
+put "$LINUX_DIR/still/native/kind.h"            usr/share/dlss5-linux/still/native/kind.h            0644
+put "$LINUX_DIR/still/native/kind-train.py"     usr/share/dlss5-linux/still/native/kind-train.py     0644
+put "$LINUX_DIR/still/native/kind-clips.txt"    usr/share/dlss5-linux/still/native/kind-clips.txt    0644
 put "$LINUX_DIR/still/native/build.sh"          usr/share/dlss5-linux/still/native/build.sh          0755
 put "$PACKAGING_DIR/bin/dlss5-linux"     usr/bin/dlss5-linux     0755
 put "$PACKAGING_DIR/bin/dlss5-linux-gui" usr/bin/dlss5-linux-gui 0755

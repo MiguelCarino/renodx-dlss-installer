@@ -35,6 +35,8 @@
 #include <string>
 #include <initializer_list>
 #include <algorithm>
+#include <deque>
+#include "kind.h"
 
 typedef int NGXResult;
 static const NGXResult NGX_OK = 1;
@@ -122,6 +124,8 @@ struct Args {
   float intensity = 1.0f, lstruct = 1.0f, ltone = 1.0f, skin = -1.0f, flatDepth = 0.01f;
   float grade = 1.0f, detail = 1.0f;  // post split of the model's change, see Post; 1,1 = model output as is
   bool resetEvery = false, verbose = false, noTunables = false, queryRatio = true, stream = false;
+  std::string classify;  // --classify f.rgba: N frames of --size W H, 2D-vs-3D only (no GPU)
+  unsigned count = 1;
   std::string fmt = "rgba8";  // rgba8 | rgba16f (colour + output format)
 };
 
@@ -166,13 +170,21 @@ struct Gpu {
   HANDLE ev = nullptr;
   UINT64 fv = 0;
   void begin() { alloc->Reset(); cl->Reset(alloc, nullptr); }
-  double submitWait() {
+  void submit() {
     cl->Close();
     ID3D12CommandList* l[] = {cl};
-    LARGE_INTEGER t0, t1, fq; QueryPerformanceCounter(&t0); QueryPerformanceFrequency(&fq);
     q->ExecuteCommandLists(1, l);
     q->Signal(fence, ++fv);
+  }
+  double wait() {  // ms spent waiting for the last submit
+    LARGE_INTEGER t0, t1, fq; QueryPerformanceCounter(&t0); QueryPerformanceFrequency(&fq);
     if (fence->GetCompletedValue() < fv) { fence->SetEventOnCompletion(fv, ev); WaitForSingleObject(ev, 20000); }
+    QueryPerformanceCounter(&t1);
+    return (t1.QuadPart - t0.QuadPart) * 1000.0 / fq.QuadPart;
+  }
+  double submitWait() {
+    LARGE_INTEGER t0, t1, fq; QueryPerformanceCounter(&t0); QueryPerformanceFrequency(&fq);
+    submit(); wait();
     QueryPerformanceCounter(&t1);
     return (t1.QuadPart - t0.QuadPart) * 1000.0 / fq.QuadPart;
   }
@@ -581,6 +593,55 @@ struct Flow {
 
 // --stream output on its own thread: the grade/detail pass and the pipe write of one frame overlap
 // the motion estimate and evaluate of the next.
+// --stream input on its own thread, up to two frames ahead: moving a frame through the Wine pipe
+// costs as much CPU time as the motion estimate, so the two run side by side.
+struct Reader {
+  CRITICAL_SECTION cs; CONDITION_VARIABLE cv;
+  std::deque<std::pair<std::vector<uint8_t>, uint32_t>> ready;
+  std::vector<std::vector<uint8_t>> spare;
+  size_t size = 0;
+  int end = 1;  // readFrame's result once the input is over: 0 clean end, -1 error
+  bool start(size_t frameBytes) {
+    size = frameBytes; InitializeCriticalSection(&cs); InitializeConditionVariable(&cv);
+    HANDLE t = CreateThread(nullptr, 0, run, this, 0, nullptr);
+    if (t) CloseHandle(t);
+    return t != nullptr;
+  }
+  static DWORD WINAPI run(void* p) {
+    Reader* rd = (Reader*)p;
+    for (;;) {
+      std::vector<uint8_t> buf;
+      EnterCriticalSection(&rd->cs);
+      while (rd->ready.size() >= 2) SleepConditionVariableCS(&rd->cv, &rd->cs, INFINITE);
+      if (!rd->spare.empty()) { buf.swap(rd->spare.back()); rd->spare.pop_back(); }
+      LeaveCriticalSection(&rd->cs);
+      buf.resize(rd->size);
+      uint32_t flags = 0;
+      int got = readFrame(buf, &flags);
+      EnterCriticalSection(&rd->cs);
+      if (got == 1) rd->ready.emplace_back(std::move(buf), flags);
+      else rd->end = got;
+      WakeAllConditionVariable(&rd->cv);
+      LeaveCriticalSection(&rd->cs);
+      if (got != 1) return 0;
+    }
+  }
+  // Swaps the next frame into px (px's old buffer is reused); returns 1, or 0/-1 at the end.
+  int take(std::vector<uint8_t>& px, uint32_t* flags) {
+    EnterCriticalSection(&cs);
+    while (ready.empty() && end == 1) SleepConditionVariableCS(&cv, &cs, INFINITE);
+    int got = 1;
+    if (ready.empty()) got = end;
+    else {
+      px.swap(ready.front().first); *flags = ready.front().second;
+      spare.push_back(std::move(ready.front().first)); ready.pop_front();
+      WakeAllConditionVariable(&cv);
+    }
+    LeaveCriticalSection(&cs);
+    return got;
+  }
+};
+
 struct Writer {
   std::vector<uint8_t> in, out;
   uint32_t idx = 0, res = 0;
@@ -657,6 +718,8 @@ int main(int argc, char** argv) {
     else if (k == "--detail") a.detail = (float)atof(nx());
     else if (k == "--reset-every") a.resetEvery = true;
     else if (k == "--stream") a.stream = true;
+    else if (k == "--classify") a.classify = nx();
+    else if (k == "--count") a.count = atoi(nx());
     else if (k == "--no-tunables") a.noTunables = true;
     else if (k == "--no-ratio") a.queryRatio = false;
     else if (k == "--fmt") a.fmt = nx();
@@ -664,6 +727,32 @@ int main(int argc, char** argv) {
     else if (k == "--res-slot") g_resSlot = atoi(nx());
     else if (k == "--verbose") { a.verbose = true; g_ngxLogLevel = 2; }
     else { printf("unknown arg %s\n", k.c_str()); return 64; }
+  }
+  if (!a.classify.empty()) {  // 2D-vs-3D guess only: CPU, no D3D12 or NGX (see kind.h)
+    if (!a.w || !a.h || !a.count || a.count > 64) { printf("usage: nrstill --classify f.rgba --size W H --count N\n"); return 64; }
+    std::vector<uint8_t> px;
+    if (!readFile(a.classify, px, (size_t)a.w * a.h * 4 * a.count)) return 2;
+    char exe[MAX_PATH]; GetModuleFileNameA(nullptr, exe, MAX_PATH); *strrchr(exe, '\\') = 0;
+    static kind::Net net;
+    if (!kind::load(std::string(exe) + "\\kind.bin", net)) return 3;
+    struct Job { const uint8_t* px; int w, h; float z; };
+    std::vector<Job> jobs(a.count);
+    for (unsigned i = 0; i < a.count; ++i) jobs[i] = {px.data() + (size_t)a.w * a.h * 4 * i, (int)a.w, (int)a.h, 0};
+    auto work = [](void* p) -> DWORD { Job* j = (Job*)p; j->z = kind::logit(net, j->px, j->w, j->h); return 0; };
+    double t0 = nowMs();
+    for (unsigned i = 0; i < a.count; i += 8) {  // a frame per thread, eight at a time
+      std::vector<HANDLE> th;
+      for (unsigned j = i; j < a.count && j < i + 8; ++j) th.push_back(CreateThread(nullptr, 0, work, &jobs[j], 0, nullptr));
+      WaitForMultipleObjects((DWORD)th.size(), th.data(), TRUE, INFINITE);
+      for (HANDLE t : th) CloseHandle(t);
+    }
+    double z = 0;
+    for (unsigned i = 0; i < a.count; ++i) { printf("classify: frame %u logit %.3f\n", i + 1, jobs[i].z); z += jobs[i].z; }
+    z /= a.count;
+    // |logit| < 0.5 is where most cross-validated misses sat: say so rather than guess.
+    printf("content: %s logit %.3f (%u frames, %.0f ms)\n", z > 0.5 ? "2d" : z < -0.5 ? "3d" : "unsure", z, a.count, nowMs() - t0);
+    fflush(stdout);
+    ExitProcess(0);
   }
   if ((a.color.empty() && !a.stream) || !a.w || !a.h) {
     printf("usage: nrstill --color f.rgba --size W H [--depth flat|none|f.f32] ...\n"
@@ -819,19 +908,24 @@ int main(int argc, char** argv) {
   D3D12_RESOURCE_DESC cd = tColor->GetDesc();
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT cfp; UINT64 ctotal = 0;
   g.dev->GetCopyableFootprints(&cd, 0, 1, 0, &cfp, nullptr, nullptr, &ctotal);
-  ID3D12Resource* upColor = a.stream ? makeBuf(g.dev, ctotal, D3D12_HEAP_TYPE_UPLOAD) : nullptr;
-  // ... and, with --mv flow, the motion vectors from a second one.
+  // Two of each: the next frame is written into one while the GPU still copies from the other.
+  ID3D12Resource* upColor[2] = {};
+  if (a.stream) for (auto*& u : upColor) u = makeBuf(g.dev, ctotal, D3D12_HEAP_TYPE_UPLOAD);
+  // ... and, with --mv flow, the motion vectors.
   const bool flow = a.mv == "flow";
   D3D12_RESOURCE_DESC md = tMv->GetDesc();
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT mfp; UINT64 mtotal = 0;
   g.dev->GetCopyableFootprints(&md, 0, 1, 0, &mfp, nullptr, nullptr, &mtotal);
-  ID3D12Resource* upMv = flow ? makeBuf(g.dev, mtotal, D3D12_HEAP_TYPE_UPLOAD) : nullptr;
+  ID3D12Resource* upMv[2] = {};
+  if (flow) for (auto*& u : upMv) u = makeBuf(g.dev, mtotal, D3D12_HEAP_TYPE_UPLOAD);
   Flow fl; if (flow) fl.init(W, H);
   Post postFx;
   Writer writer;
+  Reader reader;
   if (a.stream) {
     writer.post = post; writer.grade = a.grade; writer.detail = a.detail;
     if (!writer.start(W, H)) { printf("stream: cannot start the writer thread\n"); return 6; }
+    if (!reader.start(rgba.size())) { printf("stream: cannot start the reader thread\n"); return 6; }
   }
   // Output pre-filled with a sentinel (pure magenta, alpha 0) so "model wrote nothing" is detectable.
   std::vector<uint8_t> sentinel((size_t)W * H * cbpp);
@@ -884,22 +978,11 @@ int main(int argc, char** argv) {
   if (r != NGX_OK || !feature) { if (coreShutdown) coreShutdown(); return 7; }
   if (FAILED(g.dev->GetDeviceRemovedReason())) { printf("device removed after create: 0x%08lx\n", (unsigned long)g.dev->GetDeviceRemovedReason()); return 7; }
 
-  // ---- evaluate N times on the same still ----
+  // ---- evaluate: N times on the same still, or once per --stream frame ----
   std::vector<uint8_t> frame((size_t)W * H * cbpp);
-  double sumMs = 0, flowMs = 0, postMs = 0;
+  double sumMs = 0, flowMs = 0, postMs = 0, waitMs = 0, readMs = 0;
   unsigned fi = 1;
-  for (; a.stream || fi <= a.frames; ++fi) {
-    bool dumpIt = a.stream;
-    for (unsigned d : a.dump) if (d == fi) dumpIt = true;
-    if (fi == a.frames) dumpIt = true;
-    if (a.stream && fi > 1) {
-      int got = readFrame(rgba, &inFlags);
-      if (got != 1) {
-        if (got < 0) printf("stream: bad frame %u\n", fi);
-        printf("stream: %u frames\n", fi - 1);
-        break;
-      }
-    }
+  auto setEval = [&](bool reset) {
     setR(caps, "DLSSNR.Color", tColor);
     setR(caps, "DLSSNR.Output", tOut);
     setR(caps, "DLSSNR.Depth", a.mode == "none" ? nullptr : tDepth);
@@ -911,7 +994,6 @@ int main(int argc, char** argv) {
     setU(caps, "DLSSNR.Width", W);
     setU(caps, "DLSSNR.Height", H);
     setU(caps, "DLSSNR.DepthInverted", (unsigned)a.depthInverted);
-    const bool reset = fi == 1 || a.resetEvery || (inFlags & 1);
     setU(caps, "DLSSNR.Reset", reset ? 1u : 0u);
     for (const char* base : {"Color", "Output", "Depth", "MVec"}) {
       char k[96];
@@ -923,51 +1005,66 @@ int main(int argc, char** argv) {
     setF(caps, "DLSSNR.MVecScaleX", 1.0f);
     setF(caps, "DLSSNR.MVecScaleY", 1.0f);
     setTunables();
-    g.begin();
-    if (a.stream && fi > 1) {
-      uint8_t* m = nullptr;
-      upColor->Map(0, nullptr, (void**)&m);
-      for (unsigned y = 0; y < H; ++y) memcpy(m + cfp.Offset + (size_t)y * cfp.Footprint.RowPitch, rgba.data() + (size_t)y * W * 4, (size_t)W * 4);
-      upColor->Unmap(0, nullptr);
-      barrier(g.cl, tColor, SRV, D3D12_RESOURCE_STATE_COPY_DEST);
-      D3D12_TEXTURE_COPY_LOCATION dst = {}; dst.pResource = tColor; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-      D3D12_TEXTURE_COPY_LOCATION src = {}; src.pResource = upColor; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = cfp;
-      g.cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-      barrier(g.cl, tColor, D3D12_RESOURCE_STATE_COPY_DEST, SRV);
-    }
-    if (flow) {  // zero vectors on the first frame and at every reset
+  };
+  auto copyIn = [&](ID3D12Resource* up, ID3D12Resource* tex, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp) {
+    barrier(g.cl, tex, SRV, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}; dst.pResource = tex; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION src = {}; src.pResource = up; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = fp;
+    g.cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    barrier(g.cl, tex, D3D12_RESOURCE_STATE_COPY_DEST, SRV);
+  };
+  auto fill = [&](ID3D12Resource* up, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp, const uint8_t* src) {
+    uint8_t* m = nullptr;
+    up->Map(0, nullptr, (void**)&m);
+    for (unsigned y = 0; y < H; ++y) memcpy(m + fp.Offset + (size_t)y * fp.Footprint.RowPitch, src + (size_t)y * W * 4, (size_t)W * 4);
+    up->Unmap(0, nullptr);
+  };
+  auto readOut = [&]() {
+    barrier(g.cl, tOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}; dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = ofp;
+    D3D12_TEXTURE_COPY_LOCATION src = {}; src.pResource = tOut; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    barrier(g.cl, tOut, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  };
+
+  if (a.stream) {
+    // Pipelined: while the GPU evaluates frame fi, frame fi+1 is taken from the reader thread, its motion
+    // estimated and both written into the other upload slot; only then is fi's fence waited on.
+    std::vector<uint8_t> next(rgba.size());
+    std::vector<uint16_t> nextMv(flow ? mv.size() : 0);
+    bool curReset = true;
+    if (flow) { double t0 = nowMs(); fl.estimate(rgba.data(), true, mv); flowMs += nowMs() - t0; }  // seeds the pyramid; vectors zero
+    unsigned slot = 0;
+    for (;; ++fi) {
+      setEval(curReset);
+      g.begin();
+      if (fi > 1) {
+        copyIn(upColor[slot], tColor, cfp);
+        if (flow) copyIn(upMv[slot], tMv, mfp);
+      }
+      r = (NGXResult)call(sEval, (uintptr_t)g.cl, (uintptr_t)feature, (uintptr_t)caps, 0, 0);
+      uavBarrier(g.cl, tOut);
+      readOut();
+      g.submit();
       double t0 = nowMs();
-      fl.estimate(rgba.data(), reset, mv);
+      uint32_t nextFlags = 0;
+      int got = r == NGX_OK ? reader.take(next, &nextFlags) : 0;
+      const bool nextReset = a.resetEvery || (nextFlags & 1);
+      double t1 = nowMs(); readMs += t1 - t0; t0 = t1;
+      if (got == 1) {
+        if (flow) { fl.estimate(next.data(), nextReset, nextMv); fill(upMv[slot ^ 1], mfp, (uint8_t*)nextMv.data()); }
+        fill(upColor[slot ^ 1], cfp, next.data());
+      }
       flowMs += nowMs() - t0;
-      uint8_t* m = nullptr;
-      upMv->Map(0, nullptr, (void**)&m);
-      for (unsigned y = 0; y < H; ++y) memcpy(m + mfp.Offset + (size_t)y * mfp.Footprint.RowPitch, (uint8_t*)mv.data() + (size_t)y * W * 4, (size_t)W * 4);
-      upMv->Unmap(0, nullptr);
-      barrier(g.cl, tMv, SRV, D3D12_RESOURCE_STATE_COPY_DEST);
-      D3D12_TEXTURE_COPY_LOCATION dst = {}; dst.pResource = tMv; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-      D3D12_TEXTURE_COPY_LOCATION src = {}; src.pResource = upMv; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = mfp;
-      g.cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-      barrier(g.cl, tMv, D3D12_RESOURCE_STATE_COPY_DEST, SRV);
-    }
-    r = (NGXResult)call(sEval, (uintptr_t)g.cl, (uintptr_t)feature, (uintptr_t)caps, 0, 0);
-    uavBarrier(g.cl, tOut);
-    if (dumpIt) {
-      barrier(g.cl, tOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-      D3D12_TEXTURE_COPY_LOCATION dst = {}; dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = ofp;
-      D3D12_TEXTURE_COPY_LOCATION src = {}; src.pResource = tOut; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-      g.cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-      barrier(g.cl, tOut, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    }
-    double ms = g.submitWait();
-    HRESULT dr = g.dev->GetDeviceRemovedReason();
-    if (fi > 1) sumMs += ms;
-    if (r != NGX_OK || FAILED(dr) || (dumpIt && !a.stream) || fi <= 2 || (a.stream && fi % 300 == 0))
-      printf("frame %3u: evaluate -> 0x%08x %s, gpu+wait %.2f ms%s%s\n", fi, (unsigned)r, ngxName(r), ms,
-             FAILED(dr) ? " DEVICE REMOVED" : "", reset ? " (reset)" : "");
-    if (flow && (fi <= 3 || fi % 300 == 0)) printf("frame %3u: mean motion vector %.2f, %.2f px, %.0f%% of blocks still\n", fi, fl.meanX, fl.meanY, fl.still * 100);
-    if (FAILED(dr)) { printf("device removed reason 0x%08lx\n", (unsigned long)dr); return 8; }
-    if (r != NGX_OK) break;
-    if (a.stream) {
+      double ms = g.wait();
+      HRESULT dr = g.dev->GetDeviceRemovedReason();
+      if (fi > 1) waitMs += ms;
+      if (r != NGX_OK || FAILED(dr) || fi <= 2 || fi % 300 == 0)
+        printf("frame %3u: evaluate -> 0x%08x %s, gpu wait %.2f ms%s%s\n", fi, (unsigned)r, ngxName(r), ms,
+               FAILED(dr) ? " DEVICE REMOVED" : "", curReset ? " (reset)" : "");
+      if (flow && (fi <= 3 || fi % 300 == 0)) printf("frame %3u: mean motion vector %.2f, %.2f px, %.0f%% of blocks still\n", fi, fl.meanX, fl.meanY, fl.still * 100);
+      if (FAILED(dr)) { printf("device removed reason 0x%08lx\n", (unsigned long)dr); return 8; }
+      if (r != NGX_OK) break;
       if (writer.busy) WaitForSingleObject(writer.idle, INFINITE);  // the previous frame is out
       writer.busy = false;
       if (writer.closed) { printf("stream: output closed at frame %u\n", fi - 1); break; }
@@ -981,8 +1078,38 @@ int main(int argc, char** argv) {
       writer.idx = fi; writer.res = (uint32_t)r; writer.reset = fi == 1 || (inFlags & 1);
       writer.busy = true;
       SetEvent(writer.full);
-      continue;
+      if (got != 1) {
+        if (got < 0) printf("stream: bad frame %u\n", fi + 1);
+        printf("stream: %u frames\n", fi);
+        ++fi;
+        break;
+      }
+      rgba.swap(next); inFlags = nextFlags; curReset = nextReset; slot ^= 1;
     }
+    if (writer.busy) WaitForSingleObject(writer.idle, INFINITE);  // the last frame is out
+    if (writer.closed) printf("stream: output closed at the last frame\n");
+    postMs = writer.ms;
+    if (fi > 1) printf("per frame, overlapping the GPU: input wait %.1f ms, motion %.1f ms; then gpu wait %.1f ms; grade/detail %.1f ms (writer thread)\n",
+                       readMs / (fi - 1), flowMs / (fi - 1), waitMs / (fi > 2 ? fi - 2 : 1), postMs / (fi - 1));
+  }
+
+  for (; !a.stream && fi <= a.frames; ++fi) {
+    bool dumpIt = fi == a.frames;
+    for (unsigned d : a.dump) if (d == fi) dumpIt = true;
+    const bool reset = fi == 1 || a.resetEvery;
+    setEval(reset);
+    g.begin();
+    r = (NGXResult)call(sEval, (uintptr_t)g.cl, (uintptr_t)feature, (uintptr_t)caps, 0, 0);
+    uavBarrier(g.cl, tOut);
+    if (dumpIt) readOut();
+    double ms = g.submitWait();
+    HRESULT dr = g.dev->GetDeviceRemovedReason();
+    if (fi > 1) sumMs += ms;
+    if (r != NGX_OK || FAILED(dr) || dumpIt || fi <= 2)
+      printf("frame %3u: evaluate -> 0x%08x %s, gpu+wait %.2f ms%s%s\n", fi, (unsigned)r, ngxName(r), ms,
+             FAILED(dr) ? " DEVICE REMOVED" : "", reset ? " (reset)" : "");
+    if (FAILED(dr)) { printf("device removed reason 0x%08lx\n", (unsigned long)dr); return 8; }
+    if (r != NGX_OK) break;
     if (dumpIt) {
       uint8_t* m = nullptr; D3D12_RANGE rr = {0, (SIZE_T)ototal};
       rb->Map(0, &rr, (void**)&m);
@@ -1012,12 +1139,6 @@ int main(int argc, char** argv) {
       FILE* f = fopen(fn, "wb"); if (f) { fwrite(o8.data(), 1, o8.size(), f); fclose(f); }
       printf("  dumped %s  mean|out-in| (0..255) = %.3f  untouched(sentinel) px = %zu\n", fn, mad, sentinelPx);
     }
-  }
-  if (a.stream) {
-    if (writer.busy) WaitForSingleObject(writer.idle, INFINITE);  // the last frame is out
-    if (writer.closed) printf("stream: output closed at the last frame\n");
-    postMs = writer.ms;
-    if (fi > 1) printf("cpu per frame: motion %.1f ms, grade/detail %.1f ms (on the writer thread)\n", flowMs / (fi - 1), postMs / (fi - 1));
   }
   if (!a.stream && a.frames > 1) printf("mean per-evaluate submit+fence time (frames 2..%u): %.2f ms\n", a.frames, sumMs / (a.frames - 1));
 

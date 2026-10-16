@@ -69,6 +69,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.0.6" date="2026-10-16">
+      <description>
+        <p>Video converts about a quarter faster: motion for the next frame is estimated while the GPU works on the current one. Pictures and videos are checked for 2D animation versus 3D or camera footage, and the result is shown with what to expect. The live before/after preview during a conversion can be turned off.</p>
+      </description>
+    </release>
     <release version="0.0.5" date="2026-10-15">
       <description>
         <p>Pictures and video now show the model's real neural rendering instead of what looked like a colour grade: its whole-frame colour shift is removed by default, structure and tone default to 2, video gets estimated motion vectors, and HDR sources are tone-mapped to BT.709 before processing.</p>

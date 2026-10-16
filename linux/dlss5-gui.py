@@ -727,6 +727,59 @@ def still_status():
             "data": str(STILL_DATA)}
 
 
+def content_kind(frames, width, height):
+    """Is this 2D animation or 3D/camera footage? nrstill --classify on N RGBA8 frames of
+    width x height (CPU only, a second or two; see still/native/kind.h). Returns
+    {"kind": "2d"|"3d"|"unsure", "logit": float}, or None when the runtime is not set up."""
+    count = len(frames) // (width * height * 4)
+    if not count or not still_status()["ready"]:
+        return None
+    name = "kind-%s.rgba" % uuid.uuid4().hex[:12]      # its own file: a video job may be classifying too
+    path = STILL_RUN / "in" / name
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(frames[:count * width * height * 4])
+        out = subprocess.run([str(STILL_RUNTIME), "classify", "C:\\nr\\in\\" + name, str(width), str(height),
+                              str(count)], capture_output=True, text=True, timeout=180).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        path.unlink(missing_ok=True)
+    match = re.search(r"^content: (2d|3d|unsure) logit (-?[0-9.]+)", out, re.M)
+    return {"kind": match[1], "logit": float(match[2])} if match else None
+
+
+def video_kind(path, info):
+    """content_kind() on up to eight frames spread over the video, skipping black and blank ones
+    (fades and title cards say nothing; the classifier was trained without them)."""
+    w, h = 480, 270
+    try:
+        vf = video_decode_filter(info, w, h)
+    except BadRequest:
+        return None
+    frames = []
+    duration = info.get("duration") or 0
+    for k in range(12):
+        if len(frames) == 8:
+            break
+        cmd = ["ffmpeg", "-v", "error", "-nostdin"] + (["-ss", "%.2f" % (duration * (k + 0.5) / 12)] if duration else []) + [
+               "-i", str(path), "-map", "0:v:0", "-frames:v", "1", "-vf", vf, "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
+        try:
+            frame = subprocess.run(cmd, capture_output=True, timeout=60).stdout
+        except subprocess.TimeoutExpired:
+            continue
+        if len(frame) != w * h * 4:
+            continue
+        g = frame[1::4]
+        mean = sum(g) / len(g)
+        if mean < 20 or sum(v * v for v in g[::7]) / len(g[::7]) - mean * mean < 64:
+            continue
+        frames.append(frame)
+        if not duration:
+            break
+    return content_kind(b"".join(frames), w, h) if frames else None
+
+
 def still_pictures_dir():
     try:
         out = subprocess.run(["xdg-user-dir", "PICTURES"], capture_output=True,
@@ -974,6 +1027,7 @@ def video_upload(handler, query):
     except Exception:
         shutil.rmtree(folder, ignore_errors=True)
         raise
+    info["content"] = video_kind(target, info)
     with VIDEOS_LOCK:
         VIDEOS[vid] = {"status": "ready", "name": stem, "input": str(target), "info": info,
                        "done": 0, "total": 0, "error": "", "output": "", "cuts": 0,
@@ -2035,6 +2089,18 @@ class Handler(BaseHTTPRequestHandler):
             except BadRequest as exc:
                 self._json({"error": str(exc)}, 400)
             return
+        if url.path == "/api/still/kind":
+            query = parse_qs(url.query)
+            try:
+                width = int(still_number(query, "w", 0, 2, STILL_MAX_SIDE))
+                height = int(still_number(query, "h", 0, 2, STILL_MAX_SIDE))
+                data = self._raw_body(STILL_MAX_BODY)
+                if len(data) != width * height * 4:
+                    raise BadRequest("expected %d bytes for %dx%d" % (width * height * 4, width, height))
+                self._json({"content": content_kind(data, width, height)})
+            except BadRequest as exc:
+                self._json({"error": str(exc)}, 400)
+            return
         if url.path in ("/api/still/run", "/api/still/save"):
             query = parse_qs(url.query)
             try:
@@ -2617,6 +2683,9 @@ PAGE = r"""<!doctype html>
         <input id="stSeconds" type="number" min="0" step="1" value="0"></label>
       <label class="vid chk" hidden><input id="stHistory" type="checkbox" checked>
         History between frames, steered by motion estimated from the picture. Resets at scene cuts.</label>
+      <label class="vid chk" hidden><input id="stLive" type="checkbox" checked>
+        Show frames while converting. Each refresh copies a before/after pair into the page (16 MB at
+        1080p); turn it off to save memory and CPU. The conversion itself does not change.</label>
     </div>
 
     <div class="grp">
@@ -2629,6 +2698,7 @@ PAGE = r"""<!doctype html>
         <button id="stPlay" disabled>Open video</button>
         <button id="stRevealVid">Show folder</button>
       </div>
+      <div class="note" id="stKind" hidden></div>
       <div class="note" id="stStatus"></div>
     </div>
   </aside>
@@ -3647,7 +3717,9 @@ const ST = { mode: "pic", status: null, setupPoll: null, split: 0.5,
              // picture
              w: 0, h: 0, name: "", px: null, inData: null, outData: null, params: "", busy: false,
              // video
-             vid: null, vinfo: null, vrun: null, vIn: null, vOut: null, vFrame: 0, uploading: false };
+             vid: null, vinfo: null, vrun: null, vIn: null, vOut: null, vFrame: 0, uploading: false,
+             // 2D-vs-3D guess per mode: undefined = none yet, null = could not tell (no runtime)
+             picContent: undefined, vidContent: undefined };
 const STILL_MAX_SIDE = 3840;
 const $ = id => document.getElementById(id);
 
@@ -3696,6 +3768,7 @@ function stillPaint() {
   $("stPlay").disabled = ST.vrun?.status !== "done";
   $("stProgress").hidden = ST.mode !== "vid" || !(vrunning || ST.uploading);
   $("stSetupBtn").disabled = gpuBusy || !!ST.setupPoll;
+  stillKindShow();
 
   // The stage shows whichever mode is active.
   const [inData, outData] = ST.mode === "pic" ? [ST.inData, ST.outData] : [ST.vIn, ST.vOut];
@@ -3776,6 +3849,22 @@ async function stillSetup() {
   stillPaint();
 }
 
+// What nrstill --classify made of the picture or video (still/native/kind.h).
+function stillKindShow() {
+  const c = ST.mode === "pic" ? ST.picContent : ST.vidContent, el = $("stKind");
+  const loaded = ST.mode === "pic" ? !!ST.px : !!ST.vid;
+  el.hidden = !loaded || c === null;
+  if (el.hidden) return;
+  el.className = "note";
+  if (c === undefined) { el.textContent = "Content: checking whether this is 2D or 3D…"; return; }
+  el.textContent = {
+    "2d": "Content: 2D animation detected. The model was made for 3D game characters; on flat 2D art " +
+          "it changes little beyond edges and tone.",
+    "3d": "Content: 3D or camera footage detected. This is what the model was made for.",
+    unsure: "Content: could not tell whether this is 2D animation or 3D.",
+  }[c.kind] + " (score " + c.logit.toFixed(2) + ")";
+}
+
 // ---- picture ----
 
 async function stillLoad(file) {
@@ -3795,7 +3884,15 @@ async function stillLoad(file) {
   ctx.drawImage(bmp, 0, 0, w, h);
   const data = ctx.getImageData(0, 0, w, h);
   Object.assign(ST, { w, h, name: file.name.replace(/\.[^.]+$/, ""), inData: data, px: data.data,
-                      outData: null, params: "" });
+                      outData: null, params: "", picContent: undefined });
+  const px = data.data;
+  fetch("/api/still/kind?w=" + w + "&h=" + h, {
+    method: "POST", headers: { "X-Token": TOKEN, "Content-Type": "application/octet-stream" }, body: px,
+  }).then(r => r.json()).catch(() => ({})).then(j => {
+    if (ST.px !== px) return;                    // another picture was opened meanwhile
+    ST.picContent = j.content || null;
+    stillKindShow();
+  });
   const note = scale < 1 || w !== bmp.width || h !== bmp.height
     ? " (from " + bmp.width + "×" + bmp.height + ")" : "";
   sayFor("pic", file.name + ": " + w + "×" + h + note + ". Press Run.");
@@ -3859,7 +3956,7 @@ function fmtTime(secs) {
 function videoOpen(file) {
   if (!file || ST.uploading || ST.vrun?.status === "running") return;
   ST.uploading = true;
-  Object.assign(ST, { vid: null, vinfo: null, vrun: null, vIn: null, vOut: null, vFrame: 0 });
+  Object.assign(ST, { vid: null, vinfo: null, vrun: null, vIn: null, vOut: null, vFrame: 0, vidContent: undefined });
   $("stProgress").value = 0;
   sayFor("vid", "Loading " + file.name + "…");
   stillDraw();
@@ -3876,6 +3973,7 @@ function videoOpen(file) {
     if (j.error || !j.id) { sayFor("vid", j.error || "Upload failed.", "warn"); stillPaint(); return; }
     ST.vid = j.id;
     ST.vinfo = j;
+    ST.vidContent = j.content || null;
     sayFor("vid", file.name + ": " + j.width + "×" + j.height + ", " + j.fps + " fps, " + fmtTime(j.duration) +
            (j.audio ? ", with sound" : ", no sound") + ". Press Start.");
     stillPaint();
@@ -3919,7 +4017,7 @@ async function videoPoll() {
     ST.vrun = p;
     if (p.total) $("stProgress").value = p.done / p.total;
     // A fresh frame pair at most every two seconds: each is 8 MB at 1080p.
-    if (p.preview && p.preview !== ST.vFrame && Date.now() - lastPreview > 2000) {
+    if ($("stLive").checked && p.preview && p.preview !== ST.vFrame && Date.now() - lastPreview > 2000) {
       lastPreview = Date.now();
       const [o, i] = [await videoPreview("out"), await videoPreview("in")];
       if (o && i && o.frame === i.frame) { ST.vOut = o.data; ST.vIn = i.data; ST.vFrame = o.frame; }
@@ -3961,6 +4059,11 @@ function stillInit() {
   $("stReveal").onclick = () => api("/api/still/reveal", {});
   $("stRevealVid").onclick = () => api("/api/still/reveal", { kind: "video" });
   $("stSetupBtn").onclick = stillSetup;
+  // Remembered per browser; storage can be missing or throw, and then it is simply on.
+  try { $("stLive").checked = localStorage.getItem("dlss5.livePreview") !== "0"; } catch (e) {}
+  $("stLive").onchange = () => {
+    try { localStorage.setItem("dlss5.livePreview", $("stLive").checked ? "1" : "0"); } catch (e) {}
+  };
   for (const id of ["stIntensity", "stStructure", "stTone", "stDetail", "stGrade", "stStyle", "stPasses"])
     $(id).oninput = () => {
       stillPaint();

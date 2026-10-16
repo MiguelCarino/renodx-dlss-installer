@@ -81,8 +81,12 @@ install -Dpm 0755 linux/dlss5-app.py   %{buildroot}%{_datadir}/%{name}/dlss5-app
 install -Dpm 0755 linux/still/nr-runtime.sh            %{buildroot}%{_datadir}/%{name}/still/nr-runtime.sh
 install -Dpm 0644 linux/still/bin/nrstill.exe          %{buildroot}%{_datadir}/%{name}/still/bin/nrstill.exe
 install -Dpm 0644 linux/still/bin/nvngx.dll_nrshim.dll %{buildroot}%{_datadir}/%{name}/still/bin/nvngx.dll_nrshim.dll
+install -Dpm 0644 linux/still/bin/kind.bin              %{buildroot}%{_datadir}/%{name}/still/bin/kind.bin
 install -Dpm 0644 linux/still/native/nrstill.cpp       %{buildroot}%{_datadir}/%{name}/still/native/nrstill.cpp
 install -Dpm 0644 linux/still/native/nrshim.cpp        %{buildroot}%{_datadir}/%{name}/still/native/nrshim.cpp
+install -Dpm 0644 linux/still/native/kind.h            %{buildroot}%{_datadir}/%{name}/still/native/kind.h
+install -Dpm 0644 linux/still/native/kind-train.py     %{buildroot}%{_datadir}/%{name}/still/native/kind-train.py
+install -Dpm 0644 linux/still/native/kind-clips.txt    %{buildroot}%{_datadir}/%{name}/still/native/kind-clips.txt
 install -Dpm 0755 linux/still/native/build.sh          %{buildroot}%{_datadir}/%{name}/still/native/build.sh
 
 install -Dpm 0755 linux/packaging/bin/dlss5-linux     %{buildroot}%{_bindir}/dlss5-linux
@@ -122,6 +126,13 @@ python3 -c 'import sys; [compile(open(f).read(), f, "exec") for f in sys.argv[1:
 %{_metainfodir}/%{app_id}.metainfo.xml
 
 %changelog
+* Fri Oct 16 2026 MiguelCarino <miguel.carino1994@outlook.com> - 0.0.6-1
+- Video: motion estimation and frame reading overlap the GPU pass
+  (about 29 -> 36 fps at 1080p, bit-identical output).
+- 2D vs 3D content detection (nrstill --classify, MobileNetV3 probe in
+  still/bin/kind.bin, retrainable with still/native/kind-train.py).
+- Toggle for the live before/after preview while converting.
+
 * Thu Oct 15 2026 MiguelCarino <miguel.carino1994@outlook.com> - 0.0.5-1
 - Images & video: remove the model's whole-frame colour grade by default
   (nrstill --grade/--detail), structure/tone default 2, estimated motion
