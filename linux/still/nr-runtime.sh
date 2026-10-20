@@ -23,7 +23,8 @@ DATA=${DLSS5_STILL_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/dlss5-linux/still}
 PFX=$DATA/prefix
 RUN=$PFX/drive_c/nr
 PROTON=${DLSS5_STILL_PROTON:-}
-INSTALLER_CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/dlss5-linux/streamline.zip
+# The nvngx_dlssnr.dll you gave the installer (dlss5-linux.sh --dlssnr-dll); nothing downloads it.
+OWN_DLL=${XDG_DATA_HOME:-$HOME/.local/share}/dlss5-linux/own/nvngx_dlssnr.dll
 
 find_proton() {
     [[ -n "$PROTON" ]] && { echo "$PROTON"; return; }
@@ -104,9 +105,9 @@ REG
             *) install -m644 "$src" "$RUN/nvngx_dlssnr.dll" ;;
         esac
     elif [[ ! -f "$RUN/nvngx_dlssnr.dll" ]]; then
-        [[ -f "$INSTALLER_CACHE" ]] || { echo "No nvngx_dlssnr.dll: choose the file, or run the DLSS 5 installer once so its cache has it."; return 1; }
-        echo "Copying nvngx_dlssnr.dll from the installer cache ..."
-        unzip -o -j -q "$INSTALLER_CACHE" 'streamline/nvngx_dlssnr.dll' -d "$RUN" || return 1
+        [[ -f "$OWN_DLL" ]] || { echo "No nvngx_dlssnr.dll: choose your copy, or give it to the installer once (--dlssnr-dll)."; return 1; }
+        echo "Copying your nvngx_dlssnr.dll ..."
+        install -m644 "$OWN_DLL" "$RUN/nvngx_dlssnr.dll" || return 1
     fi
     echo "Runtime ready in $DATA"
 }

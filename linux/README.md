@@ -27,10 +27,16 @@ cd linux
 
 Or from the shell:
 
+`nvngx_dlssnr.dll` is never downloaded (see [Caveats](#caveats)): hand the
+installer your own copy once — the GUI asks for it on the first install — and it
+is kept in `~/.local/share/dlss5-linux/own/` for every later one.
+
 ```bash
+./dlss5-linux.sh --dlssnr-dll=/path/to/nvngx_dlssnr.dll   # once: keep your DLL
 ./dlss5-linux.sh --check                          # preflight only
 ./dlss5-linux.sh --game-dir=/path/to/game --probe # will this game work?
 ./dlss5-linux.sh --game-dir=/path/to/game         # install (optiscaler engine)
+./dlss5-linux.sh --amd-package=/path/to/dlss5-nr-amd-custom.zip   # AMD, once
 ./dlss5-linux.sh --game-dir=/path/to/game --engine=amd   # AMD GPU, experimental
 ./dlss5-linux.sh --game-dir=/path/to/game --uninstall
 ```
@@ -434,9 +440,8 @@ a one-time setup, which:
 
 - creates a private, headless Wine prefix of about 1 GB in
   `~/.local/share/dlss5-linux/still`; set `DLSS5_STILL_DATA` to put it elsewhere;
-- copies `nvngx_dlssnr.dll` from the installer's cache. Install the
-  optiscaler engine once to fill the cache, or choose the DLL or
-  `streamline.zip` yourself.
+- copies the `nvngx_dlssnr.dll` you gave the installer (`--dlssnr-dll`), or
+  one you choose here.
 
 Nothing runs in a window, and nothing touches games or their prefixes.
 
@@ -611,8 +616,8 @@ read `supported` the moment it has been installed into once.
 Two things decide it. Anything inside a directory the package creates —
 `OptiScaler/`, `DlssOverrides/`, `Licenses/` — is ours by construction. At the
 top level it depends on the engine named in the state file: `install_optiscaler`
-takes `nvngx_dlssnr.dll` out of `streamline.zip` and leaves the rest, while
-`install_reshade` unpacks all of it. Treating `nvngx_dlss.dll` as ours either
+adds only your `nvngx_dlssnr.dll`, while `install_reshade` unpacks the rest of
+`streamline.zip` beside it. Treating `nvngx_dlss.dll` as ours either
 way is what made Control — which ships its own, and was installed with the
 optiscaler engine — report "no upscaler runtime found".
 
@@ -752,9 +757,14 @@ What it needs:
   OptiScaler hands the network depth and motion vectors; with none, the network
   runs on the finished image — it then trails behind motion and processes the
   HUD too.
-- **About 1.2 GB of disk**: a 365 MB download cached in
-  `~/.cache/dlss5-linux/`, and ~820 MB unpacked into the game folder, 347 MB of
-  it the translation cache (`OptiScaler/dlss5nr/cache/ComputeCache/zluda2.db`).
+- **The package itself, from you.** It bundles NVIDIA's leaked
+  `nvngx_dlssnr.dll`, so the installer does not download it: download
+  `dlss5-nr-amd-custom.zip` 1.1.0 from the project's releases yourself and run
+  `--amd-package=PATH` once. It is checked against its pinned SHA-256 (your
+  file is never deleted, only the copy) and kept in `~/.cache/dlss5-linux/`.
+- **About 1.2 GB of disk**: the 365 MB package, and ~820 MB unpacked into the
+  game folder, 347 MB of it the translation cache
+  (`OptiScaler/dlss5nr/cache/ComputeCache/zluda2.db`).
 
 The package's own `setup_linux.sh` is **not run** — nothing in the zip is
 executed by this script. What it does is done natively instead, into the same
@@ -822,8 +832,8 @@ The risks are larger than the other engines' and you should weigh them:
 These are for the NVIDIA engines; the amd engine's are
 [in its section](#amd-gpus---engineamd-experimental).
 
-- **RTX 40 series (Ada, compute capability 8.9).** The `nvngx_dlssnr.dll` the
-  installer downloads has been patched to `sm_89` cubins only — verified:
+- **RTX 40 series (Ada, compute capability 8.9).** The Ada-patched
+  `nvngx_dlssnr.dll` in circulation has `sm_89` cubins only — verified:
   15 fatbins, all `sm_89`, zero `sm_120`, zero PTX. It will not run on Blackwell
   or on RTX 20/30.
 - NVIDIA driver with the Wine NGX bridge: `/usr/lib64/nvidia/wine/{nvngx,_nvngx}.dll`
@@ -884,9 +894,12 @@ prints it again later.
 
 ## Caveats
 
-This repository holds no binaries. Every file the installer puts in your game
-folder is fetched at run time, over https, from somebody else's release page,
-unpacked, and copied in. There is no signature check, and only two downloads are
+This repository holds no third-party NVIDIA binaries. The only binaries in it
+are this project's own builds in `still/bin/` (sources in `still/native/`) and
+7-Zip's `7za.exe` under `../reshade/tools/`. Every file the installer puts in
+your game folder is either a file you supplied (`nvngx_dlssnr.dll`, the amd
+package) or fetched at run time, over https, from somebody else's release page,
+unpacked, and copied in. There is no signature check, and only two files are
 pinned by SHA-256 — Microsoft's `d3dcompiler_47.dll` (feeder engine) and the amd
 engine's package. For the rest there is no pinning beyond the literal URLs in
 `dlss5-linux.sh` — a release that is retagged or replaced upstream changes what
@@ -895,9 +908,9 @@ you install, and you would not be told.
 | Host | What comes from it |
 |---|---|
 | `github.com/Dagherbou/OptiScaler_DLSSNR` | the OptiScaler build carrying the neural pass — the default engine |
-| `github.com/yumlevi/renodx-dlss-installer` | `streamline.zip`, which is where `nvngx_dlssnr.dll` comes from, and the RenoDX `renodx-dlss5` add-on |
+| `github.com/yumlevi/renodx-dlss-installer` | `streamline.zip` — reshade and feeder engines only, for NVIDIA's released Streamline and DLSS DLLs; it also carries the leaked `nvngx_dlssnr.dll`, which is never taken out of it — and the RenoDX `renodx-dlss5` add-on |
 | `reshade.me` | the ReShade 6.8.0 add-on installer, unpacked for `ReShade64.dll` — reshade engine only |
-| `github.com/RedDukeDev/dlss5-nr-amd-custom` | the 1.1.0 release zip: OptiScaler with dlss5nr, NVIDIA's `nvngx_dlssnr.dll`, ZLUDA, the translation cache and the HIP bridge — amd engine only, pinned by hash |
+| `github.com/RedDukeDev/dlss5-nr-amd-custom` | **not downloaded**: you supply the 1.1.0 release zip (OptiScaler with dlss5nr, NVIDIA's leaked `nvngx_dlssnr.dll`, ZLUDA, the translation cache and the HIP bridge) with `--amd-package`; pinned by hash |
 | `github.com/GloriousEggroll/proton-ge-custom` | the GE-Proton tarball — `--install-proton` only |
 
 The exact URLs are the `readonly` constants under "Upstream sources" at the top
@@ -910,6 +923,38 @@ Expect a large frame-rate cost — roughly 39% has been reported on Ada, since t
 architecture genuinely lacks the throughput for the model.
 
 **Single-player only. Never with anti-cheat.**
+
+### NVIDIA's files are not this project's
+
+`nvngx_dlssnr.dll`, `nvngx_dlss.dll` and the rest of `streamline.zip` are
+NVIDIA's proprietary code under NVIDIA's own terms. This project does not
+distribute them, and does not grant, and cannot grant, any right to use them;
+whether you may use them is between you and NVIDIA.
+
+`nvngx_dlssnr.dll` is leaked, never-released NVIDIA code, so the installer
+does not download it at all: every engine uses the copy **you** supply, kept in
+`~/.local/share/dlss5-linux/own/` — and likewise the amd engine's package,
+which bundles one. Supply it once:
+
+```sh
+./dlss5-linux.sh --dlssnr-dll=/path/to/nvngx_dlssnr.dll          # optiscaler, reshade, feeder
+./dlss5-linux.sh --amd-package=/path/to/dlss5-nr-amd-custom.zip  # amd
+DLSS5_DLSSNR_DLL=/path/to/nvngx_dlssnr.dll ./dlss5-gui.py         # same, through the environment
+```
+
+The GUI asks for the file in the game panel before the first install, and the
+Images & video tab uses the same copy. The default engine, optiscaler, downloads
+no NVIDIA file at all; reshade and feeder still fetch `streamline.zip` for
+NVIDIA's released Streamline and DLSS DLLs, and that archive also happens to
+carry the leaked DLL, which the installer never extracts.
+
+### The 2D/3D classifier's training data
+
+`still/bin/kind.bin` was fitted on frames from 123 short clips, many of them
+excerpts of commercial films, series and games. No clip or frame is in this
+repository, and where the clips came from was not recorded.
+`still/native/TRAINING-DATA.md` says what is known and how to rebuild the
+weights from footage you are allowed to use.
 
 ## License
 

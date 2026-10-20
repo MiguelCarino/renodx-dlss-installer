@@ -232,10 +232,10 @@ def run_native(gui, mods, port, self_test):
         dialog.select_folder(state["window"], None, picked)
 
     def pick_dll():
-        # The still image view's setup takes nvngx_dlssnr.dll, or the
-        # installer's streamline.zip that holds it.
-        dialog = Gtk.FileDialog(title="Choose nvngx_dlssnr.dll or streamline.zip", modal=True)
-        wanted = Gtk.FileFilter(name="nvngx_dlssnr.dll or streamline.zip")
+        # Your own nvngx_dlssnr.dll (the installer and the still view take it), or
+        # a .zip: the amd engine's package, or a streamline.zip holding the DLL.
+        dialog = Gtk.FileDialog(title="Choose your nvngx_dlssnr.dll or package", modal=True)
+        wanted = Gtk.FileFilter(name="nvngx_dlssnr.dll or .zip")
         wanted.add_pattern("*.dll")
         wanted.add_pattern("*.zip")
         filters = Gio.ListStore.new(Gtk.FileFilter)

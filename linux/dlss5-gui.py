@@ -523,6 +523,7 @@ def preflight():
             "gpu": data.get("gpu"),
             "rocm": data.get("rocm"),
             "engines": data.get("engines"),
+            "own": data.get("own"),
         }
 
     try:
@@ -2186,9 +2187,19 @@ class Handler(BaseHTTPRequestHandler):
                 remove_folder(str_field(body, "path"))
                 self._json({"folders": read_folders()})
 
+            elif url.path == "/api/own":
+                # Your own nvngx_dlssnr.dll (.dll) or amd package (.zip): the
+                # installer downloads neither, and keeps what it is handed here.
+                src = Path(str_field(body, "path")).expanduser()
+                if not src.is_file() or src.suffix.lower() not in (".dll", ".zip"):
+                    raise BadRequest("Choose nvngx_dlssnr.dll, or the dlss5-nr-amd-custom .zip.")
+                flag = "--dlssnr-dll=" if src.suffix.lower() == ".dll" else "--amd-package="
+                rc, out, err = run_script([flag + str(src)], timeout=300)
+                self._json({"ok": rc == 0, "message": (out + err).strip()})
+
             elif url.path == "/api/still/setup":
-                # A chosen nvngx_dlssnr.dll or streamline.zip, or none: then the
-                # runtime copies the DLL out of the installer's own cache.
+                # A chosen nvngx_dlssnr.dll, or none: then the runtime uses the
+                # one you gave the installer (~/.local/share/dlss5-linux/own).
                 source = str_field(body, "dll", "")
                 argv = [str(STILL_RUNTIME), "setup"]
                 if source:
@@ -2633,8 +2644,8 @@ PAGE = r"""<!doctype html>
 
     <div id="stSetup" class="grp" hidden>
       <div id="stSetupMsg"></div>
-      <label class="f">nvngx_dlssnr.dll or streamline.zip (optional)
-        <input id="stDll" type="text" spellcheck="false" placeholder="Empty: copy it from the installer cache"></label>
+      <label class="f">nvngx_dlssnr.dll (optional)
+        <input id="stDll" type="text" spellcheck="false" placeholder="Empty: the one you gave the installer"></label>
       <div class="btns">
         <button id="stSetupBtn" class="primary">Set up</button>
         <button id="stBrowse" hidden>Browse&hellip;</button>
@@ -3349,6 +3360,31 @@ function renderDetail() {
   // is a 365 MB download of closed binaries and a leaked NVIDIA DLL, and the
   // note under the buttons says so before the first click.
   const engineNote = el("div", { className: "note", id: "enginenote" });
+  // The NVIDIA files nothing downloads (see dlss5-linux.sh --dlssnr-dll): a row
+  // to hand yours over, shown only while the chosen engine still lacks it.
+  const ownInput = el("input", { type: "text", spellcheck: false });
+  const ownUse = el("button", { textContent: "Use" });
+  const ownBrowse = el("button", { textContent: "Browse\u2026",
+    hidden: !window.webkit?.messageHandlers?.dlss5 });
+  const ownMsg = el("div", { className: "note" });
+  const ownLabel = el("span");
+  const ownRow = el("div", { className: "grp", hidden: true }, [
+    el("label", { className: "f" }, [ownLabel, ownInput]),
+    el("div", { className: "btns" }, [ownUse, ownBrowse]), ownMsg]);
+  ownBrowse.onclick = () => {
+    window.dlss5PickTarget = ownInput;
+    window.webkit.messageHandlers.dlss5.postMessage({ op: "pickdll" });
+  };
+  ownUse.onclick = async () => {
+    const path = ownInput.value.trim();
+    if (!path) return;
+    ownUse.disabled = true;
+    ownMsg.textContent = "Checking\u2026";
+    const res = await api("/api/own", { path });
+    ownUse.disabled = false;
+    ownMsg.textContent = res.error || res.message || "";
+    if (res.ok) await loadPreflight();      // re-renders this panel with the file in place
+  };
   const wireInstall = () => {
     const engine = engineSel.value;
     // The installed engine stays selectable to show what is there, but this
@@ -3365,15 +3401,28 @@ function renderDetail() {
     engineNote.textContent = why
       ? (noEngine ? "No engine supports this GPU. " : "") + why
       : engine === "amd"
-        ? "Experimental, untested by this installer on real AMD hardware. Downloads 365 MB "
-          + "(once, then cached) and unpacks ~820 MB into the game folder. It bundles "
-          + "NVIDIA's leaked nvngx_dlssnr.dll, ZLUDA and other closed binaries from a new "
-          + "GitHub account (RedDukeDev). Direct3D 12, single-player only. Needs ROCm 7. "
+        ? "Experimental, untested by this installer on real AMD hardware. Uses the "
+          + "dlss5-nr-amd-custom package you supply (365 MB) and unpacks ~820 MB into the "
+          + "game folder. It bundles NVIDIA's leaked nvngx_dlssnr.dll, ZLUDA and other closed "
+          + "binaries. Direct3D 12, single-player only. Needs ROCm 7. "
           + "Click " + (installed ? "Reinstall" : "Install") + " twice."
         : "";
+    // Your own file, which this installer never downloads, comes before any install.
+    const own = PREFLIGHT?.own;
+    const missing = own && !why && !blocked
+      && (engine === "amd" ? !own.amd_package : !own.dll);
+    ownRow.hidden = !missing;
+    if (missing) {
+      ownLabel.textContent = engine === "amd"
+        ? "Your dlss5-nr-amd-custom package (.zip) \u2014 not downloaded by this installer"
+        : "Your nvngx_dlssnr.dll \u2014 not downloaded by this installer";
+      ownInput.placeholder = engine === "amd" ? "/path/to/dlss5-nr-amd-custom.zip" : "/path/to/nvngx_dlssnr.dll";
+      bInstall.disabled = true;
+      bInstall.title = "Supply your own " + (engine === "amd" ? "package" : "nvngx_dlssnr.dll") + " first.";
+    }
     if (bInstall.disabled) return;
     if (engine === "amd") {
-      bInstall.title = "Installs 365 MB of closed binaries, including a leaked NVIDIA DLL. "
+      bInstall.title = "Installs 820 MB of closed binaries, including a leaked NVIDIA DLL. "
                      + "Click twice to " + (installed ? "reinstall." : "install.");
       armable(bInstall, "install:amd:" + g.appid,
               installed ? "Confirm reinstall" : "Confirm install", doInstall);
@@ -3519,6 +3568,7 @@ function renderDetail() {
       el("div", { className: "btngrid" }, [bProbe, bInstall, bRemove, bLaunch, bClose, bFolder]),
       el("div", { className: "btngrid" }, [bOpenLog, bCaptures]),
       engineNote,
+      ownRow,
 
     el("div", { className: "controls" }, [
       el("label", { className: "f", style: "flex-direction:row;align-items:center;gap:6px;font-size:13px;color:var(--ink)" },
@@ -4122,7 +4172,13 @@ function nativeBridge() {
   const dllBtn = document.getElementById("stBrowse");
   dllBtn.hidden = false;
   dllBtn.onclick = () => native.postMessage({ op: "pickdll" });
-  window.dlss5PickedDll = path => { if (path) document.getElementById("stDll").value = path; };
+  // Whichever field last asked for a file gets it: the still view's, or a
+  // game panel's "your own file" row (which sets dlss5PickTarget first).
+  window.dlss5PickedDll = path => {
+    const target = window.dlss5PickTarget || document.getElementById("stDll");
+    window.dlss5PickTarget = null;
+    if (path && target) { target.value = path; target.dispatchEvent(new Event("change")); }
+  };
   // The app calls this with the folder the user picked; it then takes exactly
   // the path a typed entry would, so validation stays in one place.
   window.dlss5Picked = path => {

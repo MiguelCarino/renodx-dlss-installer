@@ -23,9 +23,10 @@
 #               GPUs through ZLUDA and ROCm. Experimental, and the only engine
 #               an AMD GPU can use - the other three need NVIDIA's NGX driver.
 #
-# nvngx_dlssnr.dll is not distributed with this script; it is downloaded at run
-# time from a third-party GitHub release. It is leaked pre-release NVIDIA code.
-# Single-player only, never with anti-cheat.
+# nvngx_dlssnr.dll is leaked pre-release NVIDIA code. This script neither ships
+# nor downloads it: you supply your own copy once (--dlssnr-dll=PATH, or
+# --amd-package=PATH for the amd engine, whose package carries one) and it is
+# kept in $OWN_DIR for later installs. Single-player only, never with anti-cheat.
 
 set -euo pipefail
 
@@ -61,7 +62,6 @@ readonly GE_API="https://api.github.com/repos/GloriousEggroll/proton-ge-custom/r
 # cache and the Linux HIP bridge. Pinned by hash: the account publishing it is
 # new, and the binaries in it are closed and not ours to vouch for.
 readonly AMD_VERSION="1.1.0"
-readonly AMD_URL="https://github.com/RedDukeDev/dlss5-nr-amd-custom/releases/download/${AMD_VERSION}/dlss5-nr-amd-custom.zip"
 readonly AMD_SHA256="502624e01487b485d71b503e45205678ef65b65163160a90feed55ddc7718595"
 readonly AMD_ZIP="dlss5-nr-amd-custom-${AMD_VERSION}.zip"
 readonly AMD_TOP="dlss5-nr-amd-custom"      # the zip's one top-level folder
@@ -80,6 +80,12 @@ ENGINE="optiscaler"
 ENGINE_SET=0
 GAME_DIR=""
 HOOK_DLL="dxgi.dll"
+# The files you supply yourself (see the header), kept outside the cache so
+# clearing it does not lose them. --dlssnr-dll / --amd-package fill it.
+OWN_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dlss5-linux/own"
+OWN_DLL="$OWN_DIR/nvngx_dlssnr.dll"
+DLSSNR_DLL="${DLSS5_DLSSNR_DLL:-}"
+AMD_PACKAGE=""
 DO_UNINSTALL=0
 DO_INSTALL_PROTON=0
 DRY_RUN=0
@@ -158,6 +164,12 @@ Options:
                       games only (RedDukeDev/dlss5-nr-amd-custom, 365 MB)
   --hook=NAME         DLL name to masquerade as: dxgi.dll (default), d3d12.dll,
                       version.dll, winmm.dll, dbghelp.dll, wininet.dll, winhttp.dll
+  --dlssnr-dll=PATH   Your own nvngx_dlssnr.dll, required by optiscaler,
+                      reshade and feeder; nothing downloads it. Kept for later
+                      installs (also: DLSS5_DLSSNR_DLL). Alone, it only stores.
+  --amd-package=PATH  The dlss5-nr-amd-custom zip you downloaded yourself,
+                      required by --engine=amd; checked against its pinned
+                      SHA-256 and kept for later installs. Alone, it only stores.
   --install-proton    Fetch the latest GE-Proton into compatibilitytools.d
   --uninstall         Remove everything this script installed from --game-dir
   --probe             Report whether a game qualifies. Reads only, changes
@@ -206,6 +218,8 @@ for arg in "$@"; do
         --game-dir=*)     GAME_DIR="${arg#*=}" ;;
         --engine=*)       ENGINE="${arg#*=}"; ENGINE_SET=1 ;;
         --hook=*)         HOOK_DLL="${arg#*=}" ;;
+        --dlssnr-dll=*)   DLSSNR_DLL="${arg#*=}" ;;
+        --amd-package=*)  AMD_PACKAGE="${arg#*=}" ;;
         --install-proton) DO_INSTALL_PROTON=1 ;;
         --uninstall)      DO_UNINSTALL=1 ;;
         --probe)          DO_PROBE=1 ;;
@@ -233,6 +247,7 @@ case "$ENGINE" in
     optiscaler|reshade|feeder|amd) ;;
     *) die "--engine must be 'optiscaler', 'reshade', 'feeder' or 'amd', got '$ENGINE'" ;;
 esac
+
 
 # on/off is what a user types; true/false is what OptiScaler.ini wants.
 case "$NR_SET" in
@@ -1023,6 +1038,37 @@ check_game_amd() {
     fi
 }
 
+# --- nvngx_dlssnr.dll -----------------------------------------------------------
+
+# The DLL is never downloaded: it is the copy you supplied, kept in $OWN_DLL.
+require_own_dll() {
+    [[ -f "$OWN_DLL" ]] && return 0
+    die "No nvngx_dlssnr.dll of your own yet.
+
+     The $ENGINE engine needs NVIDIA's nvngx_dlssnr.dll, which this installer
+     does not download. Supply your copy once and it is kept for later installs:
+       $(basename "$0") --dlssnr-dll=/path/to/nvngx_dlssnr.dll"
+}
+
+# The amd package is never downloaded either: it carries the leaked DLL.
+require_amd_package() {
+    [[ -s "$CACHE_DIR/$AMD_ZIP" ]] && return 0
+    die "No dlss5-nr-amd-custom package of your own yet.
+
+     The amd engine's package bundles NVIDIA's leaked nvngx_dlssnr.dll, so this
+     installer does not download it. Download dlss5-nr-amd-custom.zip $AMD_VERSION
+     yourself and hand it over once; it is checked and kept for later installs:
+       $(basename "$0") --amd-package=/path/to/dlss5-nr-amd-custom.zip"
+}
+
+# Put your nvngx_dlssnr.dll into $1.
+place_dlssnr() {
+    local dir="$1"
+    require_own_dll
+    log "Using your nvngx_dlssnr.dll ($OWN_DLL)"
+    run cp -f "$OWN_DLL" "$dir/nvngx_dlssnr.dll"
+}
+
 # --- Engine: OptiScaler -------------------------------------------------------
 
 install_optiscaler() {
@@ -1030,15 +1076,12 @@ install_optiscaler() {
     step "Installing OptiScaler_DLSSNR into $dir"
 
     fetch "$OPTI_URL" "$CACHE_DIR/optiscaler-dlssnr.zip"
-    fetch "$STREAMLINE_URL" "$CACHE_DIR/streamline.zip"
-
 
     log "Extracting OptiScaler package ..."
     # The archive uses backslash separators; unzip warns but extracts correctly.
     run unzip -o -q "$CACHE_DIR/optiscaler-dlssnr.zip" -d "$dir" || true
 
-    log "Extracting Ada-patched nvngx_dlssnr.dll ..."
-    run unzip -o -j -q "$CACHE_DIR/streamline.zip" 'streamline/nvngx_dlssnr.dll' -d "$dir"
+    place_dlssnr "$dir"
 
     if (( ! DRY_RUN )); then
         verify_dlssnr "$dir/nvngx_dlssnr.dll"
@@ -1086,7 +1129,9 @@ install_reshade() {
     run cp "$CACHE_DIR/renodx-dlss5-v2.5.addon64" "$dir/renodx-dlss5.addon64"
 
     log "Extracting Streamline / DLSS DLL set ..."
-    run unzip -o -j -q "$CACHE_DIR/streamline.zip" 'streamline/*' -d "$dir"
+    # Everything but the leaked nvngx_dlssnr.dll it also carries: that is yours.
+    run unzip -o -j -q "$CACHE_DIR/streamline.zip" 'streamline/*' -x 'streamline/nvngx_dlssnr.dll' -d "$dir"
+    place_dlssnr "$dir"
 
     if (( ! DRY_RUN )); then
         verify_dlssnr "$dir/nvngx_dlssnr.dll"
@@ -1114,6 +1159,8 @@ install_feeder() {
     fetch "$LUMENITE_URL" "$CACHE_DIR/LumeniteFX-${LUMENITE_REF:0:12}.zip"
     fetch "$RESHADE_URL" "$CACHE_DIR/ReShade_Setup_6.8.0_Addon.exe"
     fetch "$OPTI_URL" "$CACHE_DIR/optiscaler-dlssnr.zip"
+    # For the nvngx_dlss.dll runtime fed below. It also carries the leaked
+    # nvngx_dlssnr.dll, which is never taken out of it: that one is yours.
     fetch "$STREAMLINE_URL" "$CACHE_DIR/streamline.zip"
     local h
     for h in ReShade.fxh ReShadeUI.fxh DrawText.fxh; do
@@ -1184,7 +1231,7 @@ install_feeder() {
     unzip -o -q "$CACHE_DIR/optiscaler-dlssnr.zip" -d "$dir" || true
     mv -f "$dir/OptiScaler.dll" "$dir/$opti"
     rm -f "$dir/!! EXTRACT ALL FILES TO GAME FOLDER !!" "$dir/setup_windows.bat"
-    unzip -o -j -q "$CACHE_DIR/streamline.zip" 'streamline/nvngx_dlssnr.dll' -d "$dir"
+    place_dlssnr "$dir"
     verify_dlssnr "$dir/nvngx_dlssnr.dll"
 
     # A DLSS runtime for the feeder's request. These games ship none; one
@@ -1302,9 +1349,9 @@ INI
 confirm_amd() {
     step "dlss5-nr-amd-custom $AMD_VERSION (experimental, AMD)"
     warn "Experimental, and untested by this script on real AMD hardware."
-    warn "Downloads 365 MB and unpacks ~820 MB into the game folder (347 MB of it a translation cache)."
-    warn "It bundles NVIDIA's leaked nvngx_dlssnr.dll 310.8.0.0, ZLUDA and other closed"
-    warn "binaries, published by a new GitHub account (RedDukeDev). Pinned by SHA-256."
+    warn "Unpacks ~820 MB into the game folder (347 MB of it a translation cache) from the"
+    warn "package you supplied, which bundles NVIDIA's leaked nvngx_dlssnr.dll 310.8.0.0,"
+    warn "ZLUDA and other closed binaries. Checked against its pinned SHA-256."
     warn "Single-player only, never with anti-cheat."
     if (( ! DRY_RUN )); then
         confirm "Download and install it?" || die "Cancelled."
@@ -1342,7 +1389,7 @@ install_amd() {
         fi
     fi
 
-    fetch "$AMD_URL" "$CACHE_DIR/$AMD_ZIP"
+    require_amd_package
     if (( ! DRY_RUN )); then
         check_sha256 "$CACHE_DIR/$AMD_ZIP" "$AMD_SHA256"
         stat -c '%s %Y' "$CACHE_DIR/$AMD_ZIP" > "$CACHE_DIR/$AMD_ZIP.sha256-ok" 2>/dev/null || true
@@ -2155,9 +2202,9 @@ installed_by_us() {
     (( owned )) && return 0
 
     # At the top level, only the names the installed engine actually drops
-    # there. The two engines differ: install_optiscaler takes nvngx_dlssnr.dll
-    # out of streamline.zip and leaves the rest of it, while install_reshade
-    # unpacks the whole set. Treating nvngx_dlss.dll as ours either way is what
+    # there. The two engines differ: install_optiscaler adds only your
+    # nvngx_dlssnr.dll, while install_reshade adds it and unpacks the rest of
+    # streamline.zip. Treating nvngx_dlss.dll as ours either way is what
     # made Control - which ships its own, and was installed with the optiscaler
     # engine - report "no upscaler runtime found" and probe as unsupported.
     engine=$(grep '^engine=' "$dir/$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
@@ -2553,8 +2600,9 @@ check_json() {
     done
     local seen=0
     [[ -n "$ROCM_LIB" ]] && ! rocm_hidden_in_container "$ROCM_LIB" && seen=1
+    OWN_DLL_OK=$([[ -f "$OWN_DLL" ]] && echo 1) AMD_PKG_OK=$([[ -s "$CACHE_DIR/$AMD_ZIP" ]] && echo 1) \
     python3 - "$rc" "$VERSION" "$(gpu_json)" "$GPU_VENDOR" "$ROCM_LIB" "$seen" "$out" "${refusals[@]}" <<'PY'
-import json, sys
+import json, os, sys
 rc, version, gpu, vendor, rocm, rocm_seen, out = sys.argv[1:8]
 pairs = sys.argv[8:]
 lines = []
@@ -2581,6 +2629,9 @@ print(json.dumps({
                if vendor == "amd" else None,
     "engines": {pairs[i]: {"ok": not pairs[i + 1], "reason": pairs[i + 1] or None}
                 for i in range(0, len(pairs), 2)},
+    # The files you supply yourself: nothing downloads them (see --dlssnr-dll).
+    "own":     {"dll": bool(os.environ.get("OWN_DLL_OK")),
+                "amd_package": bool(os.environ.get("AMD_PKG_OK"))},
     "lines":   lines,
 }, indent=2))
 PY
@@ -2605,9 +2656,34 @@ gate_engine_gpu() {
      Override with --force only if the GPU detection is wrong."
 }
 
+# --dlssnr-dll / --amd-package: keep what you supplied for this and later installs.
+store_own_files() {
+    if [[ -n "$DLSSNR_DLL" ]]; then
+        [[ -f "$DLSSNR_DLL" ]] || die "--dlssnr-dll: no such file: $DLSSNR_DLL"
+        # cmp first: set in the environment, this runs on every call, probes included.
+        if ! cmp -s "$DLSSNR_DLL" "$OWN_DLL"; then
+            mkdir -p "$OWN_DIR" && install -m644 "$DLSSNR_DLL" "$OWN_DLL" || die "Could not keep $DLSSNR_DLL in $OWN_DIR"
+            (( JSON_OUT )) || ok "Your nvngx_dlssnr.dll is kept in $OWN_DLL"
+        fi
+    fi
+    if [[ -n "$AMD_PACKAGE" ]]; then
+        [[ -f "$AMD_PACKAGE" ]] || die "--amd-package: no such file: $AMD_PACKAGE"
+        mkdir -p "$CACHE_DIR"
+        # check_sha256 deletes a mismatch, so it checks the copy, never your file.
+        [[ "$(realpath "$AMD_PACKAGE")" == "$CACHE_DIR/$AMD_ZIP" ]] || cp -f "$AMD_PACKAGE" "$CACHE_DIR/$AMD_ZIP"
+        check_sha256 "$CACHE_DIR/$AMD_ZIP" "$AMD_SHA256"
+        stat -c '%s %Y' "$CACHE_DIR/$AMD_ZIP" > "$CACHE_DIR/$AMD_ZIP.sha256-ok" 2>/dev/null || true
+    fi
+    # Storing a file is a complete run on its own.
+    if [[ -n "$DLSSNR_DLL$AMD_PACKAGE" && -z "$GAME_DIR" ]] && (( ! DO_PROBE && ! CHECK_ONLY && ! DO_LAUNCH_OPTS )); then
+        exit 0
+    fi
+}
+
 # --- Main ---------------------------------------------------------------------
 
 main() {
+    store_own_files
     # Probe short-circuits everything: it reads only, needs no preflight, and in
     # --json mode must emit nothing but JSON.
     if (( DO_PROBE )); then
@@ -2694,7 +2770,8 @@ main() {
 
     check_game_preconditions "$GAME_DIR"
 
-    [[ "$ENGINE" == amd ]] && confirm_amd
+    # Before any question or download: a missing file should stop the install, not end it.
+    if [[ "$ENGINE" == amd ]]; then require_amd_package; confirm_amd; else require_own_dll; fi
 
     snapshot_settings "$GAME_DIR"
 
