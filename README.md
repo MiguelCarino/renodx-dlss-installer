@@ -1,5 +1,7 @@
 # RenoDX DLSS Installer
 
+**[DLSS 5 for Linux →](https://dlss.carino.systems/)** — the Linux/Proton port, downloads and docs.
+
 A customized [ReShade](https://github.com/crosire/reshade) setup that installs, in one click:
 
 - ReShade 6.8.0 with full add-on support (official binaries)
