@@ -9,7 +9,7 @@
   <meta name="description" content="DLSS 5 for Linux puts NVIDIA&#x27;s DLSS 5 neural rendering into Steam games running under Proton, and runs the same model over your pictures and videos. Free software for Fedora and any recent Linux.">
   <link rel="canonical" href="https://dlss.carino.systems/">
   <meta property="og:type" content="website">
-  <meta property="og:site_name" content="Carino Systems">
+  <meta property="og:site_name" content="DLSS 5 for Linux">
   <meta property="og:title" content="DLSS 5 for Linux">
   <meta property="og:description" content="DLSS 5 for Linux puts NVIDIA&#x27;s DLSS 5 neural rendering into Steam games running under Proton, and runs the same model over your pictures and videos. Free software for Fedora and any recent Linux.">
   <meta property="og:url" content="https://dlss.carino.systems/">
@@ -18,7 +18,7 @@
   <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="DLSS 5 for Linux">
   <meta name="twitter:card" content="summary_large_image">
-  <script type="application/ld+json">{"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "DLSS 5 for Linux", "url": "https://dlss.carino.systems/", "description": "DLSS 5 for Linux puts NVIDIA's DLSS 5 neural rendering into Steam games running under Proton, and runs the same model over your pictures and videos. Free software for Fedora and any recent Linux.", "operatingSystem": "Linux", "isAccessibleForFree": true, "author": {"@type": "Person", "name": "Miguel Cariño", "url": "https://carino.systems/"}}</script>
+  <script type="application/ld+json">{"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "DLSS 5 for Linux", "url": "https://dlss.carino.systems/", "description": "DLSS 5 for Linux puts NVIDIA's DLSS 5 neural rendering into Steam games running under Proton, and runs the same model over your pictures and videos. Free software for Fedora and any recent Linux.", "operatingSystem": "Linux", "isAccessibleForFree": true, "author": {"@type": "Person", "name": "Miguel Cariño"}}</script>
   <!-- /carino:head -->
   <meta name="theme-color" content="#050505">
   <link rel="icon" type="image/svg+xml" href="web/dlss5.svg">
@@ -71,7 +71,11 @@
       <p class="dl-manual"><button class="btn ghost" type="button" id="installBtn"
          aria-haspopup="dialog" aria-controls="fedoraDialog">⌨ Install in one command</button></p>
       <p class="dl-all"><a id="allLink" href="https://github.com/MiguelCarino/renodx-dlss-installer/releases">All versions and release notes →</a></p>
+      <!-- Shown on every system, Linux included: it is also the credit to the
+           project this one is a port of. -->
       <p class="dl-note" id="osNote">Linux only. On Windows, use the original <a href="https://github.com/yumlevi/renodx-dlss-installer/releases/tag/latest">RenoDX DLSS installer</a> this project is a port of.</p>
+      <!-- Literally true: the one request this page makes is the release lookup in app.js. -->
+      <p class="privacy">This page runs in your browser and sends nothing anywhere. It asks api.github.com for the latest release.</p>
     </div>
   </header>
 
@@ -79,7 +83,10 @@
     <span id="foot-version">DLSS 5 for Linux 0.0.6</span> · GPL-3.0 ·
     <a href="https://github.com/MiguelCarino/renodx-dlss-installer/tree/linux-port/linux">Source</a> ·
     <a href="https://github.com/MiguelCarino/renodx-dlss-installer/blob/linux-port/linux/README.md">Documentation</a> ·
+    <a href="https://github.com/MiguelCarino/renodx-dlss-installer/releases">Changelog</a> ·
+    <a href="https://github.com/MiguelCarino/renodx-dlss-installer/blob/linux-port/linux/README.md#license">Third-party notices</a> ·
     <a href="https://carino.systems/legal.html">Legal &amp; privacy</a>
+    <br><span class="legal">A Linux port of <a href="https://github.com/yumlevi/renodx-dlss-installer">yumlevi's RenoDX DLSS installer</a>. It installs parts it does not ship, each under its own licence: <a href="https://github.com/clshortfuse/renodx">RenoDX</a>, <a href="https://github.com/crosire/reshade">ReShade</a> (BSD-3-Clause), <a href="https://github.com/Dagherbou/OptiScaler_DLSSNR">OptiScaler</a>, and NVIDIA's DLSS and Streamline files and model, which are NVIDIA's proprietary software under NVIDIA's licence.</span>
     <br><span class="legal">Not affiliated with or endorsed by NVIDIA. DLSS is a trademark of NVIDIA Corporation.</span>
   </footer>
 
@@ -91,7 +98,7 @@
     </div>
     <div class="modal-body">
       <p>One command; dnf downloads the package from the release and what it needs from Fedora:</p>
-      <div class="code"><pre><code id="cmd">sudo dnf install https://github.com/MiguelCarino/renodx-dlss-installer/releases/download/v0.0.6/dlss5-linux-0.0.6-1.fc44.noarch.rpm</code></pre><button type="button" class="copy" data-src="cmd">Copy</button></div>
+      <div class="terminal-wrapper"><div class="terminal"><code><span class="prompt">$</span> <span class="cmd" id="cmd">sudo dnf install https://github.com/MiguelCarino/renodx-dlss-installer/releases/download/v0.0.6/dlss5-linux-0.0.6-1.fc44.noarch.rpm</span></code></div><button type="button" class="copy-btn term-copy" data-src="cmd" aria-label="Copy the install command">Copy</button></div>
       <p>Then open <strong>DLSS 5 for Linux</strong> from your application menu, or run <code>dlss5-linux-gui</code>. The command line is <code>dlss5-linux --help</code>.</p>
       <p class="small">The package has no architecture of its own and installs on current Fedora releases. It also recommends GTK 4, libadwaita and WebKitGTK for the app's own window; without them it opens in your browser. Check the download against <a class="sums" href="https://github.com/MiguelCarino/renodx-dlss-installer/releases/download/v0.0.6/SHA256SUMS">SHA256SUMS</a>.</p>
     </div>
@@ -105,10 +112,10 @@
     </div>
     <div class="modal-body">
       <p><strong>1. Make it runnable and start it</strong>, from the folder you downloaded it to:</p>
-      <div class="code"><pre><code id="appcmd">chmod +x DLSS5_for_Linux-0.0.6-x86_64.AppImage
-./DLSS5_for_Linux-0.0.6-x86_64.AppImage</code></pre><button type="button" class="copy" data-src="appcmd">Copy</button></div>
+      <div class="terminal-wrapper"><div class="terminal"><code><span class="prompt">$</span> <span class="cmd" id="appcmd">chmod +x DLSS5_for_Linux-0.0.6-x86_64.AppImage
+./DLSS5_for_Linux-0.0.6-x86_64.AppImage</span></code></div><button type="button" class="copy-btn term-copy" data-src="appcmd" aria-label="Copy the AppImage commands">Copy</button></div>
       <p><strong>2. Have the usual tools installed.</strong> FFmpeg is inside; the rest comes from your system: <code>python3</code>, <code>curl</code>, <code>unzip</code>, <code>binutils</code>, 7-Zip and <code>xdg-utils</code>. On Debian or Ubuntu:</p>
-      <div class="code"><pre><code id="debcmd">sudo apt install python3 curl unzip binutils p7zip-full xdg-utils</code></pre><button type="button" class="copy" data-src="debcmd">Copy</button></div>
+      <div class="terminal-wrapper"><div class="terminal"><code><span class="prompt">$</span> <span class="cmd" id="debcmd">sudo apt install python3 curl unzip binutils p7zip-full xdg-utils</span></code></div><button type="button" class="copy-btn term-copy" data-src="debcmd" aria-label="Copy the apt command">Copy</button></div>
       <p><strong>3. Pick a game</strong> in the app, press Install, and set the launch options it shows in Steam. It opens in its own window when PyGObject with GTK 4, libadwaita and WebKitGTK 6 is installed, and in your browser otherwise.</p>
       <p class="small">No FUSE on your system? Add <code>--appimage-extract-and-run</code> after the file name. The command line is the same file followed by <code>cli --help</code>. <a class="sums" href="https://github.com/MiguelCarino/renodx-dlss-installer/releases/download/v0.0.6/SHA256SUMS">SHA256SUMS</a></p>
     </div>

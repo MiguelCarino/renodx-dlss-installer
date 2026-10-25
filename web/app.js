@@ -25,7 +25,7 @@ function detect() {
 }
 const os = detect();
 for (const c of chips) if (c.dataset.kind === os) c.classList.add('recommended');
-if (os) $('osNote').hidden = true;
+// #osNote stays visible on every system: it is also the upstream credit.
 
 // ---------------------------------------------------------------- the sheets
 chips.forEach((c) => c.addEventListener('click', () => dialogs[c.dataset.kind].showModal()));
@@ -51,7 +51,7 @@ async function copyFrom(button) {
   button.classList.add('done');
   setTimeout(() => { button.textContent = 'Copy'; button.classList.remove('done'); }, 1600);
 }
-document.querySelectorAll('.copy').forEach((b) => b.addEventListener('click', () => copyFrom(b)));
+document.querySelectorAll('.term-copy').forEach((b) => b.addEventListener('click', () => copyFrom(b)));
 
 // ---------------------------------------------------------------- latest release
 function apply(tag, assets) {
