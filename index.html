@@ -74,6 +74,12 @@
       <!-- Shown on every system, Linux included: it is also the credit to the
            project this one is a port of. -->
       <p class="dl-note" id="osNote">Linux only. On Windows, use the original <a href="https://github.com/yumlevi/renodx-dlss-installer/releases/tag/latest">RenoDX DLSS installer</a> this project is a port of.</p>
+      <!-- The dialog chips: what it is, what it does, where the docs are. -->
+      <p class="info-chips">
+        <button class="chip" type="button" data-dialog="aboutDialog" aria-haspopup="dialog" aria-controls="aboutDialog">What it is (and is not)</button>
+        <button class="chip" type="button" data-dialog="featuresDialog" aria-haspopup="dialog" aria-controls="featuresDialog">Features</button>
+        <button class="chip" type="button" data-dialog="docsDialog" aria-haspopup="dialog" aria-controls="docsDialog">Docs</button>
+      </p>
       <!-- Literally true: the one request this page makes is the release lookup in app.js. -->
       <p class="privacy">This page runs in your browser and sends nothing anywhere. It asks api.github.com for the latest release.</p>
     </div>
@@ -118,6 +124,63 @@
       <div class="terminal-wrapper"><div class="terminal"><code><span class="prompt">$</span> <span class="cmd" id="debcmd">sudo apt install python3 curl unzip binutils p7zip-full xdg-utils</span></code></div><button type="button" class="copy-btn term-copy" data-src="debcmd" aria-label="Copy the apt command">Copy</button></div>
       <p><strong>3. Pick a game</strong> in the app, press Install, and set the launch options it shows in Steam. It opens in its own window when PyGObject with GTK 4, libadwaita and WebKitGTK 6 is installed, and in your browser otherwise.</p>
       <p class="small">No FUSE on your system? Add <code>--appimage-extract-and-run</code> after the file name. The command line is the same file followed by <code>cli --help</code>. <a class="sums" href="https://github.com/MiguelCarino/renodx-dlss-installer/releases/download/v0.0.6/SHA256SUMS">SHA256SUMS</a></p>
+    </div>
+  </dialog>
+
+  <!-- What it is, its features, its docs: the chips under the install block open these.
+       Every line here can be checked in linux/README.md. -->
+  <dialog class="modal" id="aboutDialog" aria-labelledby="aboutTitle">
+    <div class="modal-head">
+      <h2 class="modal-title" id="aboutTitle">What it is (and is not)</h2>
+      <form method="dialog"><button class="modal-x" aria-label="Close">✕</button></form>
+    </div>
+    <div class="modal-body">
+      <p>DLSS 5 for Linux installs NVIDIA's DLSS 5 neural rendering pass into Windows games that run on Linux under Proton, and gives you the launch options they need.</p>
+      <p>It is for people who play single-player games on Linux. Before it copies anything, a probe reads the game's folder and says whether the pass can work there; it refuses to install where it finds anti-cheat.</p>
+      <p>It is a Linux port of yumlevi's RenoDX DLSS installer for Windows. It is not made by, affiliated with or endorsed by NVIDIA, and it does not ship NVIDIA's files: the other parts are downloaded from other projects' release pages when you install, and you supply <code>nvngx_dlssnr.dll</code> yourself.</p>
+      <p>It does not upload anything. Its window is a local page on <code>127.0.0.1</code>, and pictures and videos are processed on your computer and saved to <code>~/Pictures/DLSS 5/</code> and <code>~/Videos/DLSS 5/</code>.</p>
+      <p>It needs an NVIDIA RTX 40 card with NVIDIA's driver, and Proton 9 or GE-Proton. AMD RX 6000, 7000 and 9000 are experimental; RTX 20, 30 and 50 are not supported yet. Expect a large frame-rate cost: about 39% has been reported on RTX 40.</p>
+    </div>
+  </dialog>
+
+  <dialog class="modal" id="featuresDialog" aria-labelledby="featuresTitle">
+    <div class="modal-head">
+      <h2 class="modal-title" id="featuresTitle">Features</h2>
+      <form method="dialog"><button class="modal-x" aria-label="Close">✕</button></form>
+    </div>
+    <div class="modal-body">
+      <ul class="list">
+        <li><strong>Finds your games</strong> in every Steam library, and takes GOG, Heroic, Epic or other Wine game folders you add by hand.</li>
+        <li><strong>A probe</strong> rates each game supported, feeder, amd, partial, unsupported, blocked or unknown before anything is installed.</li>
+        <li><strong>Four engines:</strong> OptiScaler (the default), ReShade with RenoDX, a feeder for games with no DLSS of their own, and an experimental one for AMD GPUs.</li>
+        <li><strong>Install, uninstall and launch</strong> from the app. A reinstall keeps the settings you changed.</li>
+        <li><strong>Says whether it ran:</strong> the app reads the injector's log and tells you if the neural pass was actually dispatched.</li>
+        <li><strong>F9 in game</strong> turns the neural pass on and off.</li>
+        <li><strong>Images &amp; video</strong> (experimental): run the same model on a picture or a video, sound kept, and see whether it is 2D animation, where the model changes little.</li>
+        <li><strong>A command line</strong>, <code>dlss5-linux</code>, with <code>--dry-run</code> to print every change before it happens and <code>--install-proton</code> to fetch the latest GE-Proton.</li>
+      </ul>
+    </div>
+  </dialog>
+
+  <dialog class="modal" id="docsDialog" aria-labelledby="docsTitle">
+    <div class="modal-head">
+      <h2 class="modal-title" id="docsTitle">Docs</h2>
+      <form method="dialog"><button class="modal-x" aria-label="Close">✕</button></form>
+    </div>
+    <div class="modal-body">
+      <ul class="list docs">
+        <li><a href="https://github.com/MiguelCarino/renodx-dlss-installer/blob/linux-port/linux/README.md#quick-start">Quick start</a>: the app and the commands for a first install.</li>
+        <li><a href="https://github.com/MiguelCarino/renodx-dlss-installer/blob/linux-port/linux/README.md#supported-gpus">Supported GPUs</a>: NVIDIA, AMD and Intel, and why.</li>
+        <li><a href="https://github.com/MiguelCarino/renodx-dlss-installer/blob/linux-port/linux/README.md#requirements">Requirements</a>: the driver, Proton and the game.</li>
+        <li><a href="https://github.com/MiguelCarino/renodx-dlss-installer/blob/linux-port/linux/README.md#desktop-app-and-packages">Desktop app and packages</a>: the RPM and the AppImage.</li>
+        <li><a href="https://github.com/MiguelCarino/renodx-dlss-installer/blob/linux-port/linux/README.md#web-gui">Using the app</a>: scanning, installing, launching and the F9 key.</li>
+        <li><a href="https://github.com/MiguelCarino/renodx-dlss-installer/blob/linux-port/linux/README.md#probe">Probe</a>: what each verdict means.</li>
+        <li><a href="https://github.com/MiguelCarino/renodx-dlss-installer/blob/linux-port/linux/README.md#engines">Engines</a>: OptiScaler, ReShade, feeder and AMD.</li>
+        <li><a href="https://github.com/MiguelCarino/renodx-dlss-installer/blob/linux-port/linux/README.md#images--video-experimental">Images &amp; video</a>: the settings and what the model changes.</li>
+        <li><a href="https://github.com/MiguelCarino/renodx-dlss-installer/blob/linux-port/linux/README.md#launch-options">Launch options</a>: what to put in Steam.</li>
+        <li><a href="https://github.com/MiguelCarino/renodx-dlss-installer/blob/linux-port/linux/README.md#caveats">Caveats</a>: where every downloaded file comes from, and NVIDIA's files.</li>
+        <li><a href="https://github.com/MiguelCarino/renodx-dlss-installer/blob/linux-port/linux/README.md#license">Licence</a>: what the GPL-3.0 covers and what it does not.</li>
+      </ul>
     </div>
   </dialog>
 
